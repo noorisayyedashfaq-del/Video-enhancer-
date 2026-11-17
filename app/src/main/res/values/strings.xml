@@ -1,0 +1,18 @@
+<resources>
+    <string name="app_name">LuminaSR</string>
+    <string name="studio_subtitle">Offline AI Video Mastering</string>
+    <string name="action_select_video">Select Video</string>
+    <string name="action_change_video">Change Video</string>
+    <string name="action_start_enhancement">Start Enhancement</string>
+    <string name="action_cancel_processing">Cancel</string>
+    <string name="action_save_video">Save Enhanced Video</string>
+    <string name="action_play">Play</string>
+    <string name="action_pause">Pause</string>
+    <string name="label_original_preview">Original Video Preview</string>
+    <string name="label_enhancement_mode">Enhancement Mode</string>
+    <string name="label_processing_progress">Processing Progress</string>
+    <string name="label_before_after">Before / After Comparison</string>
+    <string name="label_before">ORIGINAL</string>
+    <string name="label_after">ENHANCED</string>
+    <string name="empty_video_prompt">Select a video from your device to analyze quality, enhance details, and upscale 100% offline.</string>
+</resources>

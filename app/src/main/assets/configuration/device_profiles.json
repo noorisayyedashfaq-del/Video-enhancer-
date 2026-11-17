@@ -1,0 +1,57 @@
+{
+  "version": "1.0",
+  "tiers": [
+    {
+      "name": "LOW_4GB",
+      "minRamMb": 0,
+      "maxRamMb": 4608,
+      "tileSize": 96,
+      "tileOverlap": 8,
+      "maxBatchFrames": 1,
+      "maxInferenceThreads": 2,
+      "preferHardwareAcceleration": false,
+      "minRequiredFreeStorageMb": 350,
+      "throttleDelayMsOnWarm": 45,
+      "throttleDelayMsOnHot": 140
+    },
+    {
+      "name": "MID_6GB",
+      "minRamMb": 4608,
+      "maxRamMb": 6656,
+      "tileSize": 128,
+      "tileOverlap": 12,
+      "maxBatchFrames": 2,
+      "maxInferenceThreads": 4,
+      "preferHardwareAcceleration": true,
+      "minRequiredFreeStorageMb": 450,
+      "throttleDelayMsOnWarm": 30,
+      "throttleDelayMsOnHot": 110
+    },
+    {
+      "name": "HIGH_8GB",
+      "minRamMb": 6656,
+      "maxRamMb": 10240,
+      "tileSize": 192,
+      "tileOverlap": 16,
+      "maxBatchFrames": 4,
+      "maxInferenceThreads": 4,
+      "preferHardwareAcceleration": true,
+      "minRequiredFreeStorageMb": 600,
+      "throttleDelayMsOnWarm": 20,
+      "throttleDelayMsOnHot": 90
+    },
+    {
+      "name": "ULTRA_12GB_PLUS",
+      "minRamMb": 10240,
+      "maxRamMb": 999999,
+      "tileSize": 256,
+      "tileOverlap": 16,
+      "maxBatchFrames": 6,
+      "maxInferenceThreads": 6,
+      "preferHardwareAcceleration": true,
+      "minRequiredFreeStorageMb": 750,
+      "throttleDelayMsOnWarm": 10,
+      "throttleDelayMsOnHot": 75
+    }
+  ]
+}
