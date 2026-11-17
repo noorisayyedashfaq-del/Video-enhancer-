@@ -627,11 +627,23 @@ private fun ProcessingProgressSection(progress: ProcessingProgress) {
                     style = MaterialTheme.typography.titleMedium,
                     color = CyanMaster
                 )
-                Text(
-                    text = "${(progress.overallProgress * 100).toInt()}%",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.onSurface
-                )
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    if (progress.processingSpeedLabel.isNotBlank()) {
+                        Text(
+                            text = progress.processingSpeedLabel,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = AmberFourK
+                        )
+                    }
+                    Text(
+                        text = "${(progress.overallProgress * 100).toInt()}%",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                }
             }
 
             LinearProgressIndicator(
@@ -649,8 +661,14 @@ private fun ProcessingProgressSection(progress: ProcessingProgress) {
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
+                val detailText = buildString {
+                    append(progress.statusDetail.ifBlank { "Working offline..." })
+                    if (progress.tileProgressLabel.isNotBlank()) {
+                        append(" • ${progress.tileProgressLabel}")
+                    }
+                }
                 Text(
-                    text = progress.statusDetail.ifBlank { "Working offline..." },
+                    text = detailText,
                     style = MaterialTheme.typography.bodySmall,
                     color = MutedSteel,
                     modifier = Modifier.weight(1f),
@@ -668,7 +686,7 @@ private fun ProcessingProgressSection(progress: ProcessingProgress) {
                 }
             }
 
-            if (progress.activeAcceleration.isNotBlank()) {
+            if (progress.activeAcceleration.isNotBlank() || progress.memoryUsageMb > 0L) {
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(6.dp)
@@ -684,10 +702,22 @@ private fun ProcessingProgressSection(progress: ProcessingProgress) {
                         ThermalState.WARM -> StatusWarning
                         ThermalState.THROTTLING, ThermalState.CRITICAL -> StatusError
                     }
+                    val telemetryLine = buildString {
+                        if (progress.activeAcceleration.isNotBlank()) {
+                            append(progress.activeAcceleration)
+                            append(" • ")
+                        }
+                        if (progress.memoryUsageMb > 0L) {
+                            append("${progress.memoryUsageMb}MB RAM • ")
+                        }
+                        append("Thermal: ${progress.thermalState.label}")
+                    }
                     Text(
-                        text = "${progress.activeAcceleration} • Thermal: ${progress.thermalState.label}",
+                        text = telemetryLine,
                         style = MaterialTheme.typography.labelSmall,
-                        color = thermalColor
+                        color = thermalColor,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
                     )
                 }
             }
@@ -727,14 +757,33 @@ private fun EnhancementReportCard(result: EnhancementResult) {
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurface
             )
+            val appliedLine = buildString {
+                append("Applied: ${result.appliedParams.adjustmentSummary}")
+                if (result.usedAiSuperResolution) append(" • Real-ESRGAN 4x")
+                if (result.usedAiDenoise) append(" • DnCNN Denoise")
+                if (result.facesEnhancedCount > 0) append(" • Face Detail (${result.facesEnhancedCount})")
+            }
             Text(
-                text = "Applied: ${result.appliedParams.adjustmentSummary}" +
-                    if (result.usedAiSuperResolution) " • Real-ESRGAN 4x" else "" +
-                    if (result.usedAiDenoise) " • DnCNN Denoise" else "" +
-                    if (result.facesEnhancedCount > 0) " • Face Detail (${result.facesEnhancedCount})" else "",
+                text = appliedLine,
                 style = MaterialTheme.typography.bodySmall,
                 color = MutedSteel
             )
+            result.diagnostics?.let { diag ->
+                Text(
+                    text = "Engine: ${diag.executionProvider} • Tile ${diag.finalTileSize}px • " +
+                        "Analysis ${diag.analysisMs}ms${if (diag.analysisReusedFromCache) " (cached)" else ""} • " +
+                        "AI ${diag.aiInferenceMs / 1000}s • Encode ${diag.encodingMs / 1000}s • Peak ${diag.peakMemoryMb}MB",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = SubtleSteel
+                )
+                if (diag.warnings.isNotEmpty()) {
+                    Text(
+                        text = "Notices: ${diag.warnings.joinToString(" | ")}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = StatusWarning
+                    )
+                }
+            }
         }
     }
 }

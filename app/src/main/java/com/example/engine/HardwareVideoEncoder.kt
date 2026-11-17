@@ -66,6 +66,8 @@ class HardwareVideoEncoder(
     }
 
     private var outputFrameCounter: Long = 0L
+    var totalEncodeTimeMs: Long = 0L
+        private set
 
     private fun tryConfigure(mime: String, requireHardware: Boolean): Boolean {
         val codecInfo = findMatchingEncoder(mime, requireHardware) ?: return false
@@ -93,10 +95,12 @@ class HardwareVideoEncoder(
         videoTrackIndex = -1
         muxerStarted = false
         outputFrameCounter = 0L
+        totalEncodeTimeMs = 0L
         return true
     }
 
     fun encodeFrame(bitmap: Bitmap, frameIndex: Int) {
+        val t0 = System.currentTimeMillis()
         val surface = inputSurface ?: throw IllegalStateException("Encoder surface not initialized")
         val canvas = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             surface.lockHardwareCanvas()
@@ -109,14 +113,20 @@ class HardwareVideoEncoder(
             surface.unlockCanvasAndPost(canvas)
         }
         drainEncoder(endOfStream = false)
+        totalEncodeTimeMs += (System.currentTimeMillis() - t0)
     }
 
     fun finish() {
+        val t0 = System.currentTimeMillis()
         val codec = mediaCodec ?: return
         try {
             codec.signalEndOfInputStream()
             drainEncoder(endOfStream = true)
+            if (outputFrameCounter == 0L) {
+                throw IllegalStateException("Encoder produced 0 output frames for ${width}x${height} ($activeCodecLabel)")
+            }
         } finally {
+            totalEncodeTimeMs += (System.currentTimeMillis() - t0)
             releaseInternal()
         }
     }
@@ -131,14 +141,21 @@ class HardwareVideoEncoder(
     private fun drainEncoder(endOfStream: Boolean) {
         val codec = mediaCodec ?: return
         val muxer = mediaMuxer ?: return
-        val timeoutUs = if (endOfStream) 15_000L else 5_000L
+        val timeoutUs = if (endOfStream) 10_000L else 5_000L
         val safeFps = fps.coerceIn(10.0, 120.0)
+        val eosDeadlineNs = if (endOfStream) System.nanoTime() + 10_000_000_000L else Long.MAX_VALUE
+        var eosTryAgainCount = 0
 
         while (true) {
             val outIndex = codec.dequeueOutputBuffer(bufferInfo, timeoutUs)
             when {
                 outIndex == MediaCodec.INFO_TRY_AGAIN_LATER -> {
                     if (!endOfStream) break
+                    eosTryAgainCount++
+                    if (eosTryAgainCount > 300 || System.nanoTime() > eosDeadlineNs) {
+                        // Guard against hardware MediaCodec EOS deadlocks on some devices
+                        break
+                    }
                 }
                 outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
                     if (muxerStarted) throw IllegalStateException("Format changed twice")

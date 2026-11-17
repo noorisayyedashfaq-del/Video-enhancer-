@@ -202,12 +202,14 @@ data class AdaptiveAdjustmentParams(
 
 enum class ProcessingStage(val title: String) {
     IDLE("Ready"),
-    IMPORTING("Preparing Video"),
-    ANALYZING("Analyzing Video Quality"),
-    EXTRACTING("Extracting Frames (FFmpeg)"),
-    ENHANCING("AI & OpenCV Enhancement"),
-    ENCODING("Encoding Video Stream"),
-    MUXING_AUDIO("Synchronizing Audio (FFmpeg)"),
+    IMPORTING("Reading Video Metadata"),
+    ANALYZING("Analyzing Video"),
+    LOADING_MODEL("Loading AI Model"),
+    EXTRACTING("Extracting Frames"),
+    ENHANCING("AI Enhancement"),
+    UPSCALING("Upscaling"),
+    ENCODING("Video Encoding"),
+    FINALIZING("Finalizing"),
     COMPLETED("Enhancement Complete"),
     CANCELLED("Cancelled"),
     ERROR("Processing Failed")
@@ -221,7 +223,31 @@ data class ProcessingProgress(
     val etaSeconds: Long? = null,
     val statusDetail: String = "",
     val thermalState: ThermalState = ThermalState.NORMAL,
-    val activeAcceleration: String = ""
+    val activeAcceleration: String = "",
+    val processingSpeedLabel: String = "",
+    val memoryUsageMb: Long = 0L,
+    val tileProgressLabel: String = ""
+)
+
+data class EngineDiagnosticsReport(
+    val modelInitMs: Long,
+    val analysisMs: Long,
+    val extractionMs: Long,
+    val aiInferenceMs: Long,
+    val enhancementMs: Long,
+    val encodingMs: Long,
+    val muxingMs: Long,
+    val totalMs: Long,
+    val peakMemoryMb: Long,
+    val executionProvider: String,
+    val benchmarkSummary: String,
+    val codecUsed: String,
+    val initialTileSize: Int,
+    val finalTileSize: Int,
+    val framesProcessed: Int,
+    val recoveredFrames: Int,
+    val analysisReusedFromCache: Boolean,
+    val warnings: List<String> = emptyList()
 )
 
 data class EnhancementResult(
@@ -236,7 +262,8 @@ data class EnhancementResult(
     val facesEnhancedCount: Int,
     val usedAiSuperResolution: Boolean,
     val usedAiDenoise: Boolean,
-    val savedGalleryUri: Uri? = null
+    val savedGalleryUri: Uri? = null,
+    val diagnostics: EngineDiagnosticsReport? = null
 )
 
 data class EngineHealthStatus(

@@ -31,6 +31,7 @@ class OpenCvFrameProcessor(
     private var faceDetector: FaceDetectorYN? = null
     private var prevDenoisedFrame: Mat? = null
     private var prevLumaMean: Double? = null
+    private var reusableRgbaMat: Mat? = null
 
     val isOpenCvReady: Boolean get() = openCvInitialized
     val isFaceDetectorReady: Boolean get() = faceDetectorPath != null
@@ -66,6 +67,8 @@ class OpenCvFrameProcessor(
         prevDenoisedFrame?.release()
         prevDenoisedFrame = null
         prevLumaMean = null
+        reusableRgbaMat?.release()
+        reusableRgbaMat = null
     }
 
     /**
@@ -79,7 +82,10 @@ class OpenCvFrameProcessor(
         params: AdaptiveAdjustmentParams,
         capabilities: DeviceCapabilities,
         reusableOutBitmap: Bitmap,
-        isCancelled: () -> Boolean
+        tileSizeOverride: Int? = null,
+        logger: EngineDiagnosticsLogger? = null,
+        isCancelled: () -> Boolean,
+        onUpscaleTileProgress: (done: Int, total: Int, tileSize: Int) -> Unit = { _, _, _ -> }
     ): Int {
         var workMat = srcBgr.clone()
         var facesEnhanced = 0
@@ -89,10 +95,12 @@ class OpenCvFrameProcessor(
                 applyAdaptiveDeblocking(workMat, params.deblockingStrength)
             }
 
-            // 2. Temporal + Spatial / AI Denoising
+            // 2. Denoising (Temporal Motion-Stabilized + Spatial / AI DnCNN)
             applyTemporalMotionStabilizedDenoise(workMat, params.denoiseStrength)
             if (params.useAiDenoise && onnxEngine.isDncnnReady) {
-                applyAiLumaDenoising(workMat, params.denoiseStrength, isCancelled)
+                val tAi0 = System.currentTimeMillis()
+                applyAiLumaDenoising(workMat, params.denoiseStrength, isCancelled, logger)
+                logger?.aiInferenceMs?.addAndGet(System.currentTimeMillis() - tAi0)
             } else if (params.denoiseStrength > 0.12f) {
                 val filtered = Mat()
                 val sigma = 14.0 + params.denoiseStrength * 28.0
@@ -101,40 +109,36 @@ class OpenCvFrameProcessor(
                 filtered.release()
             }
 
-            // 3. Dehazing (subtle dark-channel atmospheric veil reduction)
+            // 3. Color Correction (Dehazing + Brightness/Contrast/Gamma + White Balance + Saturation + Flicker)
             if (params.dehazingStrength > 0.02f) {
                 applySubtleDehaze(workMat, params.dehazingStrength)
             }
-
-            // 4. Brightness, Exposure Roll-off, Contrast & Gamma Correction
             applyToneContrastAndGamma(workMat, params)
-
-            // 5. White Balance
             applyWhiteBalance(workMat, params)
-
-            // 6. Saturation & Color Correction
             if (abs(params.saturationGain - 1f) > 0.015f) {
                 applySaturationBoost(workMat, params.saturationGain)
             }
-
-            // 7. Flicker Reduction (temporal luma stability across consecutive frames)
             if (params.flickerReductionAlpha > 0.01f) {
                 applyFlickerReduction(workMat, params.flickerReductionAlpha)
             }
 
-            // 8. AI Super-Resolution (HD+, 2K, 4K when upscaling is needed)
+            // 4. AI Super-Resolution (HD+, 2K, 4K when upscaling is needed)
             if (outDims.needsAiSuperResolution && onnxEngine.isRealEsrganReady) {
                 if (outDims.needsMultiStageUpscaling) {
-                    // Stage 1 pre-conditioning micro-sharpen so low-res edges reconstruct cleanly
                     applyEdgeMaskedSharpening(workMat, 0.14f, 0.10f)
                 }
+                val tAi0 = System.currentTimeMillis()
                 val upscaled = onnxEngine.upscaleBgrTiled(
                     srcBgr = workMat,
                     targetW = outDims.width,
                     targetH = outDims.height,
+                    tileSizeOverride = tileSizeOverride,
                     capabilities = capabilities,
-                    isCancelled = isCancelled
+                    isCancelled = isCancelled,
+                    logger = logger,
+                    onTileProgress = onUpscaleTileProgress
                 )
+                logger?.aiInferenceMs?.addAndGet(System.currentTimeMillis() - tAi0)
                 workMat.release()
                 workMat = upscaled
             } else if (workMat.cols() != outDims.width || workMat.rows() != outDims.height) {
@@ -145,21 +149,24 @@ class OpenCvFrameProcessor(
                 workMat = resized
             }
 
-            // 9. Controlled Edge-Masked Sharpening & Edge Enhancement
+            // 5. Controlled Edge-Masked Sharpening & Edge Enhancement
             if (params.sharpnessAmount > 0.03f || params.edgeEnhancementAmount > 0.03f) {
                 applyEdgeMaskedSharpening(workMat, params.sharpnessAmount, params.edgeEnhancementAmount)
             }
 
-            // 10. Optional Face Enhancement (YuNet detection + feathered texture-preserving detail enhancement)
+            // 6. Optional Face Enhancement (YuNet detection + feathered texture-preserving detail enhancement)
             if (params.faceEnhanceStrength > 0.05f && faceDetectorPath != null) {
                 facesEnhanced = enhanceDetectedFaces(workMat, params.faceEnhanceStrength)
             }
 
-            // Convert BGR Mat -> RGBA Bitmap for HardwareVideoEncoder
-            val rgbaMat = Mat()
+            // Reuse single RGBA Mat for Bitmap transfer
+            val rgbaMat = reusableRgbaMat?.takeIf { it.cols() == workMat.cols() && it.rows() == workMat.rows() }
+                ?: Mat(workMat.rows(), workMat.cols(), CvType.CV_8UC4).also {
+                    reusableRgbaMat?.release()
+                    reusableRgbaMat = it
+                }
             Imgproc.cvtColor(workMat, rgbaMat, Imgproc.COLOR_BGR2RGBA)
             Utils.matToBitmap(rgbaMat, reusableOutBitmap)
-            rgbaMat.release()
         } finally {
             workMat.release()
         }
@@ -172,7 +179,6 @@ class OpenCvFrameProcessor(
         if (w < 16 || h < 16) return
         val smooth = Mat()
         Imgproc.bilateralFilter(bgr, smooth, 5, 18.0 + strength * 22.0, 6.0)
-        // Blend primarily along 8x8 macroblock borders via fast row/col pass on Mat bytes
         val origBytes = ByteArray(w * h * 3)
         val smoothBytes = ByteArray(w * h * 3)
         bgr.get(0, 0, origBytes)
@@ -180,18 +186,29 @@ class OpenCvFrameProcessor(
         smooth.release()
 
         val alpha = (strength * 0.65f).coerceIn(0.1f, 0.65f)
+        val invAlpha = 1f - alpha
         for (y in 1 until h - 1) {
             val isRowBorder = (y % 8 == 0 || y % 8 == 7)
             val rowOff = y * w
-            for (x in 1 until w - 1) {
-                val isColBorder = (x % 8 == 0 || x % 8 == 7)
-                if (isRowBorder || isColBorder) {
+            if (isRowBorder) {
+                for (x in 1 until w - 1) {
                     val idx = (rowOff + x) * 3
-                    for (c in 0..2) {
-                        val o = origBytes[idx + c].toInt() and 0xFF
-                        val s = smoothBytes[idx + c].toInt() and 0xFF
-                        origBytes[idx + c] = (o * (1f - alpha) + s * alpha).roundToInt().coerceIn(0, 255).toByte()
+                    origBytes[idx] = ((origBytes[idx].toInt() and 0xFF) * invAlpha + (smoothBytes[idx].toInt() and 0xFF) * alpha).roundToInt().coerceIn(0, 255).toByte()
+                    origBytes[idx + 1] = ((origBytes[idx + 1].toInt() and 0xFF) * invAlpha + (smoothBytes[idx + 1].toInt() and 0xFF) * alpha).roundToInt().coerceIn(0, 255).toByte()
+                    origBytes[idx + 2] = ((origBytes[idx + 2].toInt() and 0xFF) * invAlpha + (smoothBytes[idx + 2].toInt() and 0xFF) * alpha).roundToInt().coerceIn(0, 255).toByte()
+                }
+            } else {
+                var x = 7
+                while (x < w - 1) {
+                    for (bx in x..(x + 1)) {
+                        if (bx in 1 until (w - 1)) {
+                            val idx = (rowOff + bx) * 3
+                            origBytes[idx] = ((origBytes[idx].toInt() and 0xFF) * invAlpha + (smoothBytes[idx].toInt() and 0xFF) * alpha).roundToInt().coerceIn(0, 255).toByte()
+                            origBytes[idx + 1] = ((origBytes[idx + 1].toInt() and 0xFF) * invAlpha + (smoothBytes[idx + 1].toInt() and 0xFF) * alpha).roundToInt().coerceIn(0, 255).toByte()
+                            origBytes[idx + 2] = ((origBytes[idx + 2].toInt() and 0xFF) * invAlpha + (smoothBytes[idx + 2].toInt() and 0xFF) * alpha).roundToInt().coerceIn(0, 255).toByte()
+                        }
                     }
+                    x += 8
                 }
             }
         }
@@ -206,7 +223,6 @@ class OpenCvFrameProcessor(
             return
         }
 
-        // Motion mask: only temporally blend low-motion pixels to eliminate temporal noise without ghosting
         val diff = Mat()
         val grayDiff = Mat()
         val staticMask = Mat()
@@ -232,20 +248,20 @@ class OpenCvFrameProcessor(
     private fun applyAiLumaDenoising(
         bgr: Mat,
         denoiseStrength: Float,
-        isCancelled: () -> Boolean
+        isCancelled: () -> Boolean,
+        logger: EngineDiagnosticsLogger?
     ) {
         val ycrcb = Mat()
         val channels = ArrayList<Mat>(3)
         try {
             Imgproc.cvtColor(bgr, ycrcb, Imgproc.COLOR_BGR2YCrCb)
             Core.split(ycrcb, channels)
-            // Run real ONNX DnCNN on Y channel
             onnxEngine.denoiseLumaChannel(
                 yChannel = channels[0],
                 blendAlpha = (denoiseStrength * 0.78f).coerceIn(0.18f, 0.78f),
-                isCancelled = isCancelled
+                isCancelled = isCancelled,
+                logger = logger
             )
-            // Gentle chroma smoothing on Cr/Cb removes color blotches cleanly
             Imgproc.GaussianBlur(channels[1], channels[1], Size(3.0, 3.0), 0.7)
             Imgproc.GaussianBlur(channels[2], channels[2], Size(3.0, 3.0), 0.7)
             Core.merge(channels, ycrcb)
