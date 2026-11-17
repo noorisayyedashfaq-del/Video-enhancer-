@@ -32,10 +32,10 @@ object ResolutionCalculator {
                 (if (profile.aiTileSize > 0) profile.aiTileSize else 512) to
                     (if (profile.targetTilesPerFrame > 0) profile.targetTilesPerFrame else 6)
             EnhancementMode.QHD_2K ->
-                (if (profile.aiTileSize > 0) profile.aiTileSize else 384) to
+                (if (profile.aiTileSize > 0) profile.aiTileSize else 512) to
                     (if (profile.targetTilesPerFrame > 0) profile.targetTilesPerFrame else 12)
             EnhancementMode.UHD_4K ->
-                (if (profile.aiTileSize > 0) profile.aiTileSize else 256) to
+                (if (profile.aiTileSize > 0) profile.aiTileSize else 512) to
                     (if (profile.targetTilesPerFrame > 0) profile.targetTilesPerFrame else 25)
         }
 

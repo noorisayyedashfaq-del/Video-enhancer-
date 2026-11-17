@@ -25,13 +25,13 @@ enum class EnhancementMode(
     QHD_2K(
         id = "QHD_2K",
         label = "2K",
-        shortBadge = "384px • 12 tiles",
+        shortBadge = "512px • 12 tiles",
         subtitle = "AI 12 Tiles • Original Res"
     ),
     UHD_4K(
         id = "UHD_4K",
         label = "4K",
-        shortBadge = "256px • 25 tiles",
+        shortBadge = "512px • 25 tiles",
         subtitle = "AI 25 Tiles • Original Res"
     )
 }

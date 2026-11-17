@@ -52,8 +52,8 @@ class EnhancementLogicUnitTest {
     private fun profileFor(mode: EnhancementMode) = when (mode) {
         EnhancementMode.HD -> EnhancementProfile("HD", "HD", "", 0, 0, true, false, false, false, 0, 0, true, 3f, 8f, 15f, 10f, 5f, 1.03f, "Automatic", "Automatic", "Low", 5f, 10f, "Automatic", "H264", 0.16f)
         EnhancementMode.HD_PLUS -> EnhancementProfile("HD_PLUS", "HD+", "", 0, 0, true, true, false, true, 512, 6, true, 3f, 10f, 20f, 15f, 6f, 1.04f, "Automatic", "Automatic", "Medium", 8f, 15f, "Automatic", "H264", 0.17f)
-        EnhancementMode.QHD_2K -> EnhancementProfile("QHD_2K", "2K", "", 0, 0, true, true, false, true, 384, 12, true, 3f, 12f, 25f, 20f, 7f, 1.05f, "Automatic", "Automatic", "Medium", 10f, 20f, "Automatic", "H265", 0.16f)
-        EnhancementMode.UHD_4K -> EnhancementProfile("UHD_4K", "4K", "", 0, 0, true, true, false, true, 256, 25, true, 3f, 12f, 25f, 20f, 7f, 1.05f, "Automatic", "Automatic", "Medium", 10f, 20f, "Automatic", "H265", 0.16f)
+        EnhancementMode.QHD_2K -> EnhancementProfile("QHD_2K", "2K", "", 0, 0, true, true, false, true, 512, 12, true, 3f, 12f, 25f, 20f, 7f, 1.05f, "Automatic", "Automatic", "Medium", 10f, 20f, "Automatic", "H265", 0.16f)
+        EnhancementMode.UHD_4K -> EnhancementProfile("UHD_4K", "4K", "", 0, 0, true, true, false, true, 512, 25, true, 3f, 12f, 25f, 20f, 7f, 1.05f, "Automatic", "Automatic", "Medium", 10f, 20f, "Automatic", "H265", 0.16f)
     }
 
     @Test
@@ -76,14 +76,14 @@ class EnhancementLogicUnitTest {
         assertEquals(1920, qhd2k.width)
         assertEquals(1080, qhd2k.height)
         assertTrue(qhd2k.needsAiSuperResolution)
-        assertEquals(384, qhd2k.aiTileSize)
+        assertEquals(512, qhd2k.aiTileSize)
         assertEquals(12, qhd2k.tilesPerFrame)
 
         val uhd4k = ResolutionCalculator.calculate(sampleMetadataLandscape, EnhancementMode.UHD_4K, profileFor(EnhancementMode.UHD_4K), null)
         assertEquals(1920, uhd4k.width)
         assertEquals(1080, uhd4k.height)
         assertTrue(uhd4k.needsAiSuperResolution)
-        assertEquals(256, uhd4k.aiTileSize)
+        assertEquals(512, uhd4k.aiTileSize)
         assertEquals(25, uhd4k.tilesPerFrame)
     }
 
@@ -140,6 +140,14 @@ class EnhancementLogicUnitTest {
                 }
             }
         }
+
+        // Verify linear feathering prevents hard tile edges at interior overlaps while keeping 1.0f at outer boundaries
+        assertEquals(1.0f, AiTilingMath.featherWeight(0, 100, isFirst = true, isLast = false, feather = 20), 0.001f)
+        assertEquals(1.0f, AiTilingMath.featherWeight(99, 100, isFirst = false, isLast = true, feather = 20), 0.001f)
+        val interiorStart = AiTilingMath.featherWeight(0, 100, isFirst = false, isLast = false, feather = 20)
+        val interiorMid = AiTilingMath.featherWeight(50, 100, isFirst = false, isLast = false, feather = 20)
+        assertTrue(interiorStart < interiorMid)
+        assertEquals(1.0f, interiorMid, 0.001f)
     }
 
     @Test
@@ -186,8 +194,8 @@ class EnhancementLogicUnitTest {
             executionProvider = "CPU XNNPACK (4T)",
             benchmarkSummary = "NNAPI=45ms vs CPU=22ms",
             codecUsed = "H.265 (Hardware)",
-            initialTileSize = 384,
-            finalTileSize = 384,
+            initialTileSize = 512,
+            finalTileSize = 512,
             framesProcessed = 120,
             recoveredFrames = 0,
             analysisReusedFromCache = true
@@ -196,7 +204,7 @@ class EnhancementLogicUnitTest {
         assertEquals(210L, report.modelInitMs)
         assertEquals(140L, report.analysisMs)
         assertEquals(3200L, report.aiInferenceMs)
-        assertEquals(384, report.finalTileSize)
+        assertEquals(512, report.finalTileSize)
         assertTrue(report.analysisReusedFromCache)
         assertEquals(1, report.warnings.size)
         assertEquals("AI Enhancement", ProcessingStage.ENHANCING.title)

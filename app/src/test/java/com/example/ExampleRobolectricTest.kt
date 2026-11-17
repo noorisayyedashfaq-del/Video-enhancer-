@@ -53,13 +53,13 @@ class ExampleRobolectricTest {
         val qhd2k = profiles.getValue(EnhancementMode.QHD_2K)
         assertTrue(qhd2k.preserveOriginalResolution)
         assertTrue(qhd2k.useTiledInference)
-        assertEquals(384, qhd2k.aiTileSize)
+        assertEquals(512, qhd2k.aiTileSize)
         assertEquals(12, qhd2k.targetTilesPerFrame)
 
         val uhd4k = profiles.getValue(EnhancementMode.UHD_4K)
         assertTrue(uhd4k.preserveOriginalResolution)
         assertTrue(uhd4k.useTiledInference)
-        assertEquals(256, uhd4k.aiTileSize)
+        assertEquals(512, uhd4k.aiTileSize)
         assertEquals(25, uhd4k.targetTilesPerFrame)
     }
 }
