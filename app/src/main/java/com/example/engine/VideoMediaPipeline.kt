@@ -189,24 +189,24 @@ class VideoMediaPipeline(
                 // 3. Generate Adaptive Adjustment Parameters
                 val adaptiveParams = smartAdjuster.computeAdaptiveAdjustments(profile, qualityAnalysis)
 
-                // 4. Initialize & Benchmark AI Models Once
-                onProgress(
-                    ProcessingProgress(
-                        stage = ProcessingStage.LOADING_MODEL,
-                        totalFrames = metadata.estimatedFrameCount,
-                        overallProgress = 0.12f,
-                        statusDetail = if (outDims.needsAiSuperResolution) {
-                            "Initializing & benchmarking Real-ESRGAN..."
-                        } else {
-                            "Preparing OpenCV mastering pipeline..."
-                        },
-                        thermalState = capabilities.thermalState,
-                        activeAcceleration = onnxEngine.providerLabel,
-                        memoryUsageMb = logger.sampleHeapUsedMb()
+                // 4. Initialize & Benchmark AI Model Once (skipped when HD preset runs without AI tiles)
+                if (outDims.needsAiSuperResolution) {
+                    onProgress(
+                        ProcessingProgress(
+                            stage = ProcessingStage.LOADING_MODEL,
+                            totalFrames = metadata.estimatedFrameCount,
+                            overallProgress = 0.12f,
+                            statusDetail = "Loading AI engine (${outDims.aiTileSize}px × ${outDims.tilesPerFrame} tiles)...",
+                            thermalState = capabilities.thermalState,
+                            activeAcceleration = onnxEngine.providerLabel,
+                            memoryUsageMb = logger.sampleHeapUsedMb()
+                        )
                     )
-                )
-                onnxEngine.initialize(capabilities, logger)
-                logger.modelInitMs = onnxEngine.initDurationMs
+                    onnxEngine.initialize(capabilities, logger)
+                    logger.modelInitMs = onnxEngine.initDurationMs
+                } else {
+                    logger.modelInitMs = 0L
+                }
 
                 val safeFps = metadata.fps.coerceIn(10.0, 120.0)
                 val activeEncoder = HardwareVideoEncoder(
@@ -271,8 +271,7 @@ class VideoMediaPipeline(
                     }
                 )
 
-                val initialTileSize = capabilities.adaptiveTileSize.coerceIn(64, 256)
-                var currentTileSize = initialTileSize
+                val presetTileSize = outDims.aiTileSize
                 val channelCap = capabilities.batchSize.coerceIn(2, 6) * 2
                 val frameChannel = Channel<ExtractedFrame>(capacity = channelCap)
 
@@ -377,21 +376,8 @@ class VideoMediaPipeline(
                                 delay(50L)
                                 val postGcRam = capabilityDetector.currentAvailableRamMb()
                                 if (postGcRam < 190L) {
-                                    throw IllegalStateException("Low device memory (${postGcRam}MB free) during ${outDims.label} enhancement.")
+                                    throw IllegalStateException("Low device memory (${postGcRam}MB free) during ${mode.label} enhancement.")
                                 }
-                            }
-                            if (freeRamMb < 650L && currentTileSize > 96) {
-                                val nextTile = when {
-                                    currentTileSize > 192 -> 192
-                                    currentTileSize > 128 -> 128
-                                    else -> 96
-                                }
-                                logger.warn("Low available RAM (${freeRamMb}MB): reducing AI tile size $currentTileSize -> $nextTile")
-                                currentTileSize = nextTile
-                            }
-                            if (currentThermalState >= ThermalState.THROTTLING && currentTileSize > 128) {
-                                logger.warn("Thermal throttling (${String.format(Locale.US, "%.1f", currentTempC)}°C): reducing tile size $currentTileSize -> 128")
-                                currentTileSize = 128
                             }
                         }
 
@@ -438,7 +424,7 @@ class VideoMediaPipeline(
                                 params = adaptiveParams,
                                 capabilities = capabilities,
                                 reusableOutBitmap = outputBitmap,
-                                tileSizeOverride = currentTileSize,
+                                tileSizeOverride = if (presetTileSize > 0) presetTileSize else null,
                                 logger = logger,
                                 isCancelled = { cancelled.get() },
                                 onUpscaleTileProgress = { tileDone, totalTiles, usedTile ->
@@ -446,11 +432,11 @@ class VideoMediaPipeline(
                                     val tileOverall = baseFrameProgress + frac * frameSlice
                                     onProgress(
                                         ProcessingProgress(
-                                            stage = ProcessingStage.UPSCALING,
+                                            stage = ProcessingStage.ENHANCING,
                                             processedFrames = frameIndex,
                                             totalFrames = dynamicTotal,
                                             overallProgress = tileOverall.coerceIn(0.20f, 0.90f),
-                                            statusDetail = "Upscaling frame ${frameIndex + 1}/$dynamicTotal → ${outDims.label}",
+                                            statusDetail = "${mode.label} • Frame ${frameIndex + 1}/$dynamicTotal (${outDims.label})",
                                             thermalState = currentThermalState,
                                             activeAcceleration = onnxEngine.providerLabel,
                                             memoryUsageMb = logger.sampleHeapUsedMb(),
@@ -491,7 +477,7 @@ class VideoMediaPipeline(
 
                         onProgress(
                             ProcessingProgress(
-                                stage = if (outDims.needsAiSuperResolution) ProcessingStage.UPSCALING else ProcessingStage.ENHANCING,
+                                stage = ProcessingStage.ENHANCING,
                                 processedFrames = processedCount,
                                 totalFrames = dynamicTotal,
                                 overallProgress = doneProgress.coerceIn(0.20f, 0.90f),
@@ -568,8 +554,8 @@ class VideoMediaPipeline(
                     executionProvider = onnxEngine.providerLabel,
                     benchmarkSummary = onnxEngine.benchmarkSummary,
                     codecUsed = usedCodecLabel,
-                    initialTileSize = initialTileSize,
-                    finalTileSize = currentTileSize,
+                    initialTileSize = presetTileSize,
+                    finalTileSize = presetTileSize,
                     framesProcessed = processedCount,
                     recoveredFrames = recoveredFrames,
                     analysisReusedFromCache = analysisOutcome.reusedFromCache

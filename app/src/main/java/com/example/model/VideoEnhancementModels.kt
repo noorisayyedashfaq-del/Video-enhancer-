@@ -13,26 +13,26 @@ enum class EnhancementMode(
     HD(
         id = "HD",
         label = "HD",
-        shortBadge = "ORIG",
-        subtitle = "Enhance Original"
+        shortBadge = "No AI Tiles",
+        subtitle = "Fast OpenCV • Original Res"
     ),
     HD_PLUS(
         id = "HD_PLUS",
         label = "HD+",
-        shortBadge = "720p",
-        subtitle = "AI Upscale 720p"
+        shortBadge = "512px • 6 tiles",
+        subtitle = "AI 6 Tiles • Original Res"
     ),
     QHD_2K(
         id = "QHD_2K",
         label = "2K",
-        shortBadge = "1440p",
-        subtitle = "AI Upscale 1440p"
+        shortBadge = "384px • 12 tiles",
+        subtitle = "AI 12 Tiles • Original Res"
     ),
     UHD_4K(
         id = "UHD_4K",
         label = "4K",
-        shortBadge = "2160p",
-        subtitle = "AI Upscale 2160p"
+        shortBadge = "256px • 25 tiles",
+        subtitle = "AI 25 Tiles • Original Res"
     )
 }
 
@@ -47,6 +47,8 @@ data class EnhancementProfile(
     val useAiSuperResolution: Boolean,
     val useMultiStageUpscaling: Boolean,
     val useTiledInference: Boolean,
+    val aiTileSize: Int = 0,
+    val targetTilesPerFrame: Int = 0,
     val temporalConsistency: Boolean,
     val brightnessPercent: Float,
     val contrastPercent: Float,
@@ -157,7 +159,9 @@ data class OutputDimensions(
     val needsMultiStageUpscaling: Boolean,
     val preserveOriginalResolution: Boolean,
     val targetBitrateBps: Int,
-    val useH265: Boolean
+    val useH265: Boolean,
+    val aiTileSize: Int = 0,
+    val tilesPerFrame: Int = 0
 ) {
     val label: String get() = "${width}x${height}"
 }

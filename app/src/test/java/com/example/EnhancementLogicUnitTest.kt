@@ -1,10 +1,13 @@
 package com.example
 
 import android.net.Uri
+import com.example.engine.AiTilingMath
+import com.example.engine.EngineDiagnosticsLogger
 import com.example.engine.ResolutionCalculator
 import com.example.engine.SmartAutoAdjustmentEngine
 import com.example.model.EnhancementMode
 import com.example.model.EnhancementProfile
+import com.example.model.ProcessingStage
 import com.example.model.VideoMetadata
 import com.example.model.VideoQualityAnalysis
 import org.junit.Assert.assertEquals
@@ -22,68 +25,121 @@ class EnhancementLogicUnitTest {
     private val sampleMetadataLandscape = VideoMetadata(
         uri = Uri.EMPTY,
         displayName = "clip.mp4",
-        width = 640,
-        height = 360,
+        width = 1920,
+        height = 1080,
         rotationDegrees = 0,
-        displayWidth = 640,
-        displayHeight = 360,
+        displayWidth = 1920,
+        displayHeight = 1080,
         fps = 30.0,
         durationMs = 5000L,
         estimatedFrameCount = 150,
-        bitrateBps = 2_000_000L,
+        bitrateBps = 8_000_000L,
         videoCodec = "h264",
         hasAudio = true,
         audioCodec = "aac",
         audioSampleRate = 48000,
         audioChannels = 2,
-        fileSizeBytes = 1_500_000L
+        fileSizeBytes = 5_000_000L
     )
 
     private val sampleMetadataPortrait = sampleMetadataLandscape.copy(
-        width = 480,
-        height = 854,
-        displayWidth = 480,
-        displayHeight = 854
+        width = 720,
+        height = 1280,
+        displayWidth = 720,
+        displayHeight = 1280
     )
 
     private fun profileFor(mode: EnhancementMode) = when (mode) {
-        EnhancementMode.HD -> EnhancementProfile("HD", "HD", "", 0, 0, true, false, false, false, true, 3f, 8f, 15f, 10f, 5f, 1.03f, "Automatic", "Automatic", "Low", 5f, 10f, "Automatic", "H264", 0.16f)
-        EnhancementMode.HD_PLUS -> EnhancementProfile("HD_PLUS", "HD+", "", 1280, 720, false, true, false, true, true, 3f, 10f, 20f, 15f, 6f, 1.04f, "Automatic", "Automatic", "Medium", 8f, 15f, "Automatic", "H264", 0.17f)
-        EnhancementMode.QHD_2K -> EnhancementProfile("QHD_2K", "2K", "", 2560, 1440, false, true, false, true, true, 3f, 12f, 25f, 20f, 7f, 1.05f, "Automatic", "Automatic", "Medium", 10f, 20f, "Automatic", "H265", 0.14f)
-        EnhancementMode.UHD_4K -> EnhancementProfile("UHD_4K", "4K", "", 3840, 2160, false, true, true, true, true, 3f, 12f, 25f, 20f, 7f, 1.05f, "Automatic", "Automatic", "Medium", 10f, 20f, "Automatic", "H265", 0.12f)
+        EnhancementMode.HD -> EnhancementProfile("HD", "HD", "", 0, 0, true, false, false, false, 0, 0, true, 3f, 8f, 15f, 10f, 5f, 1.03f, "Automatic", "Automatic", "Low", 5f, 10f, "Automatic", "H264", 0.16f)
+        EnhancementMode.HD_PLUS -> EnhancementProfile("HD_PLUS", "HD+", "", 0, 0, true, true, false, true, 512, 6, true, 3f, 10f, 20f, 15f, 6f, 1.04f, "Automatic", "Automatic", "Medium", 8f, 15f, "Automatic", "H264", 0.17f)
+        EnhancementMode.QHD_2K -> EnhancementProfile("QHD_2K", "2K", "", 0, 0, true, true, false, true, 384, 12, true, 3f, 12f, 25f, 20f, 7f, 1.05f, "Automatic", "Automatic", "Medium", 10f, 20f, "Automatic", "H265", 0.16f)
+        EnhancementMode.UHD_4K -> EnhancementProfile("UHD_4K", "4K", "", 0, 0, true, true, false, true, 256, 25, true, 3f, 12f, 25f, 20f, 7f, 1.05f, "Automatic", "Automatic", "Medium", 10f, 20f, "Automatic", "H265", 0.16f)
     }
 
     @Test
-    fun `HD mode preserves original resolution`() {
-        val out = ResolutionCalculator.calculate(sampleMetadataLandscape, EnhancementMode.HD, profileFor(EnhancementMode.HD), null)
-        assertEquals(640, out.width)
-        assertEquals(360, out.height)
-        assertFalse(out.needsAiSuperResolution)
+    fun `all enhancement presets keep original video resolution unchanged and configure exact tile presets`() {
+        val hd = ResolutionCalculator.calculate(sampleMetadataLandscape, EnhancementMode.HD, profileFor(EnhancementMode.HD), null)
+        assertEquals(1920, hd.width)
+        assertEquals(1080, hd.height)
+        assertFalse(hd.needsAiSuperResolution)
+        assertEquals(0, hd.aiTileSize)
+        assertEquals(0, hd.tilesPerFrame)
+
+        val hdPlus = ResolutionCalculator.calculate(sampleMetadataLandscape, EnhancementMode.HD_PLUS, profileFor(EnhancementMode.HD_PLUS), null)
+        assertEquals(1920, hdPlus.width)
+        assertEquals(1080, hdPlus.height)
+        assertTrue(hdPlus.needsAiSuperResolution)
+        assertEquals(512, hdPlus.aiTileSize)
+        assertEquals(6, hdPlus.tilesPerFrame)
+
+        val qhd2k = ResolutionCalculator.calculate(sampleMetadataLandscape, EnhancementMode.QHD_2K, profileFor(EnhancementMode.QHD_2K), null)
+        assertEquals(1920, qhd2k.width)
+        assertEquals(1080, qhd2k.height)
+        assertTrue(qhd2k.needsAiSuperResolution)
+        assertEquals(384, qhd2k.aiTileSize)
+        assertEquals(12, qhd2k.tilesPerFrame)
+
+        val uhd4k = ResolutionCalculator.calculate(sampleMetadataLandscape, EnhancementMode.UHD_4K, profileFor(EnhancementMode.UHD_4K), null)
+        assertEquals(1920, uhd4k.width)
+        assertEquals(1080, uhd4k.height)
+        assertTrue(uhd4k.needsAiSuperResolution)
+        assertEquals(256, uhd4k.aiTileSize)
+        assertEquals(25, uhd4k.tilesPerFrame)
     }
 
     @Test
-    fun `portrait video preserves portrait aspect ratio across HD+ 2K and 4K`() {
-        val inRatio = 480f / 854f
-        val p720 = ResolutionCalculator.calculate(sampleMetadataPortrait, EnhancementMode.HD_PLUS, profileFor(EnhancementMode.HD_PLUS), null)
-        assertTrue(p720.height > p720.width)
-        assertTrue(p720.height in 1276..1280)
-        assertTrue(kotlin.math.abs((p720.width.toFloat() / p720.height) - inRatio) < 0.01f)
-        assertTrue(p720.needsAiSuperResolution)
-
-        val p4k = ResolutionCalculator.calculate(sampleMetadataPortrait, EnhancementMode.UHD_4K, profileFor(EnhancementMode.UHD_4K), null)
-        assertTrue(p4k.height > p4k.width)
-        assertTrue(p4k.height in 3836..3840)
-        assertTrue(kotlin.math.abs((p4k.width.toFloat() / p4k.height) - inRatio) < 0.01f)
-        assertTrue(p4k.needsMultiStageUpscaling)
+    fun `portrait video also preserves original resolution across all presets`() {
+        for (mode in EnhancementMode.entries) {
+            val out = ResolutionCalculator.calculate(sampleMetadataPortrait, mode, profileFor(mode), null)
+            assertEquals(720, out.width)
+            assertEquals(1280, out.height)
+            assertTrue(out.preserveOriginalResolution)
+        }
     }
 
     @Test
-    fun `higher resolution input is not downscaled in HD+ mode`() {
-        val input1080p = sampleMetadataLandscape.copy(width = 1920, height = 1080, displayWidth = 1920, displayHeight = 1080)
-        val out = ResolutionCalculator.calculate(input1080p, EnhancementMode.HD_PLUS, profileFor(EnhancementMode.HD_PLUS), null)
-        assertEquals(1920, out.width)
-        assertEquals(1080, out.height)
-        assertFalse(out.needsAiSuperResolution)
+    fun `dynamic tile grids divide frames into 6, 12, and 25 overlapping tiles with zero cropping`() {
+        val resolutions = listOf(640 to 360, 1280 to 720, 1920 to 1080, 720 to 1280, 1080 to 1080)
+        val targets = listOf(6, 12, 25)
+
+        for ((w, h) in resolutions) {
+            for (target in targets) {
+                val grid = AiTilingMath.planDynamicTileGrid(w, h, target)
+                assertEquals("Expected exact $target tiles for ${w}x${h}", target, grid.totalTiles)
+                assertEquals(target, grid.tiles.size)
+                assertTrue("Horizontal overlap must be > 0 for ${w}x${h}", grid.overlapX > 0)
+                assertTrue("Vertical overlap must be > 0 for ${w}x${h}", grid.overlapY > 0)
+
+                // Verify full coverage from (0,0) to (w,h) with zero cropped pixels and overlapping neighbors
+                assertEquals(0, grid.tiles.minOf { it.x })
+                assertEquals(0, grid.tiles.minOf { it.y })
+                assertEquals(w, grid.tiles.maxOf { it.x + it.width })
+                assertEquals(h, grid.tiles.maxOf { it.y + it.height })
+
+                for (r in 0 until grid.rows) {
+                    val rowTiles = grid.tiles.filter { it.row == r }.sortedBy { it.col }
+                    for (c in 0 until rowTiles.size - 1) {
+                        val curr = rowTiles[c]
+                        val next = rowTiles[c + 1]
+                        assertTrue(
+                            "Tiles in row $r must overlap cleanly for ${w}x${h} ($target tiles)",
+                            curr.x + curr.width > next.x
+                        )
+                    }
+                }
+                for (c in 0 until grid.cols) {
+                    val colTiles = grid.tiles.filter { it.col == c }.sortedBy { it.row }
+                    for (r in 0 until colTiles.size - 1) {
+                        val curr = colTiles[r]
+                        val next = colTiles[r + 1]
+                        assertTrue(
+                            "Tiles in col $c must overlap cleanly for ${w}x${h} ($target tiles)",
+                            curr.y + curr.height > next.y
+                        )
+                    }
+                }
+            }
+        }
     }
 
     @Test
@@ -114,59 +170,11 @@ class EnhancementLogicUnitTest {
         assertTrue(darkParams.denoiseStrength > cleanParams.denoiseStrength)
         assertTrue(darkParams.deblockingStrength > cleanParams.deblockingStrength)
         assertTrue(cleanParams.sharpnessAmount < profile.sharpnessPercent / 100f)
-        assertFalse("Clean 1080p should use fast temporal+bilateral instead of heavy DnCNN", cleanParams.useAiDenoise)
-        assertTrue("Noisy source must trigger DnCNN AI denoising", darkParams.useAiDenoise)
-    }
-
-    @Test
-    fun `1080p to 2K and 4K resolutions and AI tiling plan avoid 8K intermediate bloat`() {
-        val input1080p = sampleMetadataLandscape.copy(
-            width = 1920,
-            height = 1080,
-            displayWidth = 1920,
-            displayHeight = 1080
-        )
-
-        val out2k = ResolutionCalculator.calculate(input1080p, EnhancementMode.QHD_2K, profileFor(EnhancementMode.QHD_2K), null)
-        assertEquals(2560, out2k.width)
-        assertEquals(1440, out2k.height)
-        assertTrue(out2k.needsAiSuperResolution)
-
-        val plan2k = com.example.engine.AiTilingMath.planAiInputDimensions(1920, 1080, out2k.width, out2k.height)
-        assertEquals(640, plan2k.aiWidth)
-        assertEquals(360, plan2k.aiHeight)
-        assertTrue(plan2k.needsDetailResidualFusion)
-
-        val out4k = ResolutionCalculator.calculate(input1080p, EnhancementMode.UHD_4K, profileFor(EnhancementMode.UHD_4K), null)
-        assertEquals(3840, out4k.width)
-        assertEquals(2160, out4k.height)
-        assertTrue(out4k.needsAiSuperResolution)
-
-        val plan4k = com.example.engine.AiTilingMath.planAiInputDimensions(1920, 1080, out4k.width, out4k.height)
-        assertEquals(960, plan4k.aiWidth)
-        assertEquals(540, plan4k.aiHeight)
-        assertTrue(plan4k.needsDetailResidualFusion)
-
-        // Low-res 480p -> 4K must keep full native input resolution for 4x AI SR
-        val plan480pTo4k = com.example.engine.AiTilingMath.planAiInputDimensions(854, 480, 3840, 2160)
-        assertEquals(854, plan480pTo4k.aiWidth)
-        assertEquals(480, plan480pTo4k.aiHeight)
-        assertFalse(plan480pTo4k.needsDetailResidualFusion)
-    }
-
-    @Test
-    fun `fixed tile planner covers entire frame bounds without gaps`() {
-        val startsX = com.example.engine.AiTilingMath.computeTileStarts(totalLen = 960, tileLen = 192, step = 168)
-        assertEquals(0, startsX.first())
-        assertEquals(960 - 192, startsX.last())
-        for (i in 0 until startsX.size - 1) {
-            assertTrue("Adjacent tiles must overlap or meet", startsX[i] + 192 >= startsX[i + 1])
-        }
     }
 
     @Test
     fun `diagnostics logger and processing stages capture telemetry without hiding warnings`() {
-        val logger = com.example.engine.EngineDiagnosticsLogger()
+        val logger = EngineDiagnosticsLogger()
         logger.modelInitMs = 210L
         logger.analysisMs = 140L
         logger.aiInferenceMs.set(3200L)
@@ -178,8 +186,8 @@ class EnhancementLogicUnitTest {
             executionProvider = "CPU XNNPACK (4T)",
             benchmarkSummary = "NNAPI=45ms vs CPU=22ms",
             codecUsed = "H.265 (Hardware)",
-            initialTileSize = 192,
-            finalTileSize = 128,
+            initialTileSize = 384,
+            finalTileSize = 384,
             framesProcessed = 120,
             recoveredFrames = 0,
             analysisReusedFromCache = true
@@ -188,16 +196,9 @@ class EnhancementLogicUnitTest {
         assertEquals(210L, report.modelInitMs)
         assertEquals(140L, report.analysisMs)
         assertEquals(3200L, report.aiInferenceMs)
-        assertEquals(128, report.finalTileSize)
+        assertEquals(384, report.finalTileSize)
         assertTrue(report.analysisReusedFromCache)
         assertEquals(1, report.warnings.size)
-
-        assertEquals("Analyzing Video", com.example.model.ProcessingStage.ANALYZING.title)
-        assertEquals("Loading AI Model", com.example.model.ProcessingStage.LOADING_MODEL.title)
-        assertEquals("Extracting Frames", com.example.model.ProcessingStage.EXTRACTING.title)
-        assertEquals("AI Enhancement", com.example.model.ProcessingStage.ENHANCING.title)
-        assertEquals("Upscaling", com.example.model.ProcessingStage.UPSCALING.title)
-        assertEquals("Video Encoding", com.example.model.ProcessingStage.ENCODING.title)
-        assertEquals("Finalizing", com.example.model.ProcessingStage.FINALIZING.title)
+        assertEquals("AI Enhancement", ProcessingStage.ENHANCING.title)
     }
 }

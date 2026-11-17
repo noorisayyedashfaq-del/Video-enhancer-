@@ -539,7 +539,7 @@ private fun EnhancementModesSection(
                             color = if (isSelected) accentColor else MaterialTheme.colorScheme.onSurface
                         )
                         Text(
-                            text = dims?.label ?: mode.shortBadge,
+                            text = mode.shortBadge,
                             style = MaterialTheme.typography.labelSmall,
                             color = if (isSelected) MaterialTheme.colorScheme.onSurface else SubtleSteel,
                             maxLines = 1
@@ -596,7 +596,10 @@ private fun StartEnhancementSection(
         ) {
             Icon(imageVector = Icons.Default.AutoAwesome, contentDescription = null)
             Spacer(modifier = Modifier.width(8.dp))
-            val targetInfo = outputDims?.let { " (${it.label})" } ?: ""
+            val targetInfo = outputDims?.let {
+                if (it.tilesPerFrame > 0) " (${it.aiTileSize}px × ${it.tilesPerFrame} • ${it.label})"
+                else " (No AI Tiles • ${it.label})"
+            } ?: ""
             Text(
                 text = "${stringResource(R.string.action_start_enhancement)} • ${selectedMode.label}$targetInfo",
                 style = MaterialTheme.typography.labelLarge
@@ -759,9 +762,11 @@ private fun EnhancementReportCard(result: EnhancementResult) {
             )
             val appliedLine = buildString {
                 append("Applied: ${result.appliedParams.adjustmentSummary}")
-                if (result.usedAiSuperResolution) append(" • Real-ESRGAN 4x")
-                if (result.usedAiDenoise) append(" • DnCNN Denoise")
-                if (result.facesEnhancedCount > 0) append(" • Face Detail (${result.facesEnhancedCount})")
+                if (result.outputDimensions.tilesPerFrame > 0) {
+                    append(" • AI Preset ${result.outputDimensions.aiTileSize}px × ${result.outputDimensions.tilesPerFrame} tiles")
+                } else {
+                    append(" • Fast OpenCV (No AI Tiles)")
+                }
             }
             Text(
                 text = appliedLine,
@@ -769,8 +774,9 @@ private fun EnhancementReportCard(result: EnhancementResult) {
                 color = MutedSteel
             )
             result.diagnostics?.let { diag ->
+                val tileLabel = if (diag.finalTileSize > 0) "${diag.finalTileSize}px × ${result.outputDimensions.tilesPerFrame}" else "No AI tiles"
                 Text(
-                    text = "Engine: ${diag.executionProvider} • Tile ${diag.finalTileSize}px • " +
+                    text = "Engine: ${diag.executionProvider} • $tileLabel • " +
                         "Analysis ${diag.analysisMs}ms${if (diag.analysisReusedFromCache) " (cached)" else ""} • " +
                         "AI ${diag.aiInferenceMs / 1000}s • Encode ${diag.encodingMs / 1000}s • Peak ${diag.peakMemoryMb}MB",
                     style = MaterialTheme.typography.labelSmall,
