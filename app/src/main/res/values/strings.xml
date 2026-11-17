@@ -15,4 +15,7 @@
     <string name="label_before">ORIGINAL</string>
     <string name="label_after">ENHANCED</string>
     <string name="empty_video_prompt">Select a video from your device to analyze quality, enhance details, and upscale 100% offline.</string>
+    <string name="notification_channel_processing">LuminaSR Video Processing</string>
+    <string name="notification_title_processing">LuminaSR Video Processing</string>
+    <string name="notification_action_cancel">Cancel</string>
 </resources>

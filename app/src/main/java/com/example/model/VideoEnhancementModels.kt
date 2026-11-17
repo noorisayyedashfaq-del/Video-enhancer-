@@ -230,7 +230,8 @@ data class ProcessingProgress(
     val activeAcceleration: String = "",
     val processingSpeedLabel: String = "",
     val memoryUsageMb: Long = 0L,
-    val tileProgressLabel: String = ""
+    val tileProgressLabel: String = "",
+    val speedFallbackActive: Boolean = false
 )
 
 data class EngineDiagnosticsReport(
@@ -251,6 +252,9 @@ data class EngineDiagnosticsReport(
     val framesProcessed: Int,
     val recoveredFrames: Int,
     val analysisReusedFromCache: Boolean,
+    val speedFallbackEngaged: Boolean = false,
+    val speedFallbackReason: String? = null,
+    val decoderBackend: String = "MediaCodec Zero-Copy",
     val warnings: List<String> = emptyList()
 )
 

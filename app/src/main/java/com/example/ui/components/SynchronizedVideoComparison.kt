@@ -60,6 +60,9 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
@@ -103,7 +106,8 @@ fun OriginalVideoPreviewPlayer(
     var positionMs by remember { mutableLongStateOf(0L) }
     var durationMs by remember { mutableLongStateOf(1L) }
 
-    DisposableEffect(player) {
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(player, lifecycleOwner) {
         val listener = object : Player.Listener {
             override fun onIsPlayingChanged(playing: Boolean) {
                 isPlaying = playing
@@ -112,8 +116,15 @@ fun OriginalVideoPreviewPlayer(
                 if (player.duration > 0) durationMs = player.duration
             }
         }
+        val lifecycleObserver = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_PAUSE || event == Lifecycle.Event.ON_STOP) {
+                player.pause()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(lifecycleObserver)
         player.addListener(listener)
         onDispose {
+            lifecycleOwner.lifecycle.removeObserver(lifecycleObserver)
             player.removeListener(listener)
             player.release()
         }
@@ -215,7 +226,8 @@ fun SynchronizedVideoComparison(
     var positionMs by remember { mutableLongStateOf(0L) }
     var durationMs by remember { mutableLongStateOf(1L) }
 
-    DisposableEffect(originalPlayer, enhancedPlayer) {
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(originalPlayer, enhancedPlayer, lifecycleOwner) {
         val listener = object : Player.Listener {
             override fun onIsPlayingChanged(playing: Boolean) {
                 isPlaying = playing
@@ -224,8 +236,16 @@ fun SynchronizedVideoComparison(
                 if (enhancedPlayer.duration > 0) durationMs = enhancedPlayer.duration
             }
         }
+        val lifecycleObserver = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_PAUSE || event == Lifecycle.Event.ON_STOP) {
+                enhancedPlayer.pause()
+                originalPlayer.pause()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(lifecycleObserver)
         enhancedPlayer.addListener(listener)
         onDispose {
+            lifecycleOwner.lifecycle.removeObserver(lifecycleObserver)
             enhancedPlayer.removeListener(listener)
             originalPlayer.release()
             enhancedPlayer.release()

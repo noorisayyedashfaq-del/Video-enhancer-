@@ -91,10 +91,10 @@ class DeviceCapabilityDetector(private val context: Context) {
         }
 
         val optimalThreads = when (thermalState) {
-            ThermalState.CRITICAL -> 1
-            ThermalState.THROTTLING -> (cpuCores / 2).coerceIn(1, 2)
+            ThermalState.CRITICAL -> 2
+            ThermalState.THROTTLING -> (cpuCores / 2).coerceIn(2, 4)
             ThermalState.WARM -> (cpuCores / 2).coerceIn(2, baseTier.maxInferenceThreads)
-            ThermalState.NORMAL -> (cpuCores - 1).coerceIn(2, baseTier.maxInferenceThreads)
+            ThermalState.NORMAL -> cpuCores.coerceIn(2, baseTier.maxInferenceThreads)
         }
 
         val batchSize = when {
@@ -197,11 +197,23 @@ class DeviceCapabilityDetector(private val context: Context) {
             json.decodeFromString<DeviceProfilesRoot>(raw).tiers
         } catch (_: Exception) {
             listOf(
-                DeviceProfileTier("LOW_4GB", 0, 4608, 96, 8, 1, 2, false, 350, 45, 140),
-                DeviceProfileTier("MID_6GB", 4608, 6656, 128, 12, 2, 4, true, 450, 30, 110),
-                DeviceProfileTier("HIGH_8GB", 6656, 10240, 192, 16, 4, 4, true, 600, 20, 90),
-                DeviceProfileTier("ULTRA_12GB_PLUS", 10240, 999999, 256, 16, 6, 6, true, 750, 10, 75)
+                DeviceProfileTier("LOW_4GB", 0, 4608, 96, 8, 1, 4, true, 350, 45, 140),
+                DeviceProfileTier("MID_6GB", 4608, 6656, 128, 12, 2, 6, true, 450, 30, 110),
+                DeviceProfileTier("HIGH_8GB", 6656, 10240, 192, 16, 4, 8, true, 600, 20, 90),
+                DeviceProfileTier("ULTRA_12GB_PLUS", 10240, 999999, 256, 16, 6, 8, true, 750, 10, 75)
             )
+        }
+    }
+
+    companion object {
+        /**
+         * Returns candidate thread counts for XNNPACK benchmarking (4, 6, 8 where supported by CPU cores).
+         */
+        fun benchmarkThreadCandidates(cpuCores: Int, maxTierThreads: Int): List<Int> {
+            val safeCores = cpuCores.coerceAtLeast(2)
+            val ceiling = minOf(safeCores, maxTierThreads.coerceAtLeast(4))
+            val base = listOf(4, 6, 8).filter { it <= ceiling }
+            return base.ifEmpty { listOf(safeCores.coerceIn(2, 4)) }
         }
     }
 }

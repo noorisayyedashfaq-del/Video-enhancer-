@@ -1,0 +1,438 @@
+package com.example.service
+
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.os.Build
+import androidx.core.content.ContextCompat
+import com.example.engine.DeviceCapabilityDetector
+import com.example.engine.EnhancementProfileRepository
+import com.example.engine.GallerySaver
+import com.example.engine.OnnxAiInferenceEngine
+import com.example.engine.OpenCvFrameProcessor
+import com.example.engine.ResolutionCalculator
+import com.example.engine.SmartAutoAdjustmentEngine
+import com.example.engine.VideoMediaPipeline
+import com.example.model.EnhancementMode
+import com.example.model.EnhancementResult
+import com.example.model.MainUiState
+import com.example.model.ProcessingProgress
+import com.example.model.ProcessingStage
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+import java.util.concurrent.atomic.AtomicBoolean
+
+/**
+ * Process-scoped coordinator preserving selected video, enhancement preset,
+ * active pipeline execution, and live UI progress across Activity lifecycle events,
+ * app minimization, screen lock, and notification resumes.
+ */
+class EnhancementSessionCoordinator private constructor(
+    private val appContext: Context
+) {
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val prefs = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+    val capabilityDetector = DeviceCapabilityDetector(appContext)
+    val profileRepository = EnhancementProfileRepository(appContext)
+    val onnxEngine = OnnxAiInferenceEngine(appContext)
+    val frameProcessor = OpenCvFrameProcessor(appContext, onnxEngine)
+    val smartAdjuster = SmartAutoAdjustmentEngine()
+    val pipeline = VideoMediaPipeline(
+        context = appContext,
+        capabilityDetector = capabilityDetector,
+        onnxEngine = onnxEngine,
+        frameProcessor = frameProcessor,
+        smartAdjuster = smartAdjuster
+    )
+
+    private val _uiState = MutableStateFlow(MainUiState())
+    val uiState: StateFlow<MainUiState> = _uiState.asStateFlow()
+
+    private val jobRunningLock = AtomicBoolean(false)
+    private val enginesInitialized = AtomicBoolean(false)
+
+    val isJobLockedRunning: Boolean get() = jobRunningLock.get()
+
+    init {
+        restorePersistedModeAndNotice()
+        ensureEnginesInitializedAsync()
+    }
+
+    fun ensureEnginesInitializedAsync() {
+        if (!enginesInitialized.compareAndSet(false, true)) return
+        scope.launch {
+            val caps = capabilityDetector.detect()
+            val profiles = profileRepository.loadProfiles()
+            val health = pipeline.initializeAndCheckHealth(caps)
+            _uiState.update {
+                it.copy(
+                    deviceCapabilities = caps,
+                    profiles = profiles,
+                    engineHealth = health
+                )
+            }
+            restorePersistedVideoIfUnset()
+        }
+    }
+
+    private fun restorePersistedModeAndNotice() {
+        val savedModeId = prefs.getString(KEY_SELECTED_MODE, null)
+        val restoredMode = EnhancementMode.entries.firstOrNull { it.id == savedModeId } ?: EnhancementMode.HD_PLUS
+        val interruptedNotice = prefs.getString(KEY_INTERRUPTED_NOTICE, null)
+        _uiState.update {
+            it.copy(
+                selectedMode = restoredMode,
+                errorMessage = interruptedNotice
+            )
+        }
+    }
+
+    private suspend fun restorePersistedVideoIfUnset() {
+        if (_uiState.value.selectedVideo != null || _uiState.value.isProcessing) return
+        val savedUriStr = prefs.getString(KEY_SELECTED_VIDEO_URI, null) ?: return
+        val uri = runCatching { Uri.parse(savedUriStr) }.getOrNull() ?: return
+        val result = pipeline.importAndProbeVideo(uri)
+        result.onSuccess { metadata ->
+            val caps = _uiState.value.deviceCapabilities ?: capabilityDetector.detect()
+            val profiles = _uiState.value.profiles.ifEmpty { profileRepository.loadProfiles() }
+            val dimsMap = EnhancementMode.entries.associateWith { mode ->
+                ResolutionCalculator.calculate(metadata, mode, profiles.getValue(mode), caps)
+            }
+            _uiState.update { state ->
+                if (state.selectedVideo != null) state else state.copy(
+                    selectedVideo = metadata,
+                    computedOutputDimensions = dimsMap
+                )
+            }
+        }
+    }
+
+    fun selectVideo(uri: Uri) {
+        if (_uiState.value.isProcessing || jobRunningLock.get()) return
+        scope.launch {
+            _uiState.update {
+                it.copy(
+                    errorMessage = null,
+                    saveSuccessMessage = null,
+                    enhancementResult = null,
+                    progress = ProcessingProgress(stage = ProcessingStage.IMPORTING, statusDetail = "Reading video metadata...")
+                )
+            }
+            clearInterruptedNotice()
+            val caps = capabilityDetector.detect()
+            val result = pipeline.importAndProbeVideo(uri)
+            result.fold(
+                onSuccess = { metadata ->
+                    prefs.edit().putString(KEY_SELECTED_VIDEO_URI, uri.toString()).apply()
+                    val profiles = _uiState.value.profiles.ifEmpty { profileRepository.loadProfiles() }
+                    val dimsMap = EnhancementMode.entries.associateWith { mode ->
+                        ResolutionCalculator.calculate(metadata, mode, profiles.getValue(mode), caps)
+                    }
+                    _uiState.update {
+                        it.copy(
+                            deviceCapabilities = caps,
+                            profiles = profiles,
+                            selectedVideo = metadata,
+                            computedOutputDimensions = dimsMap,
+                            progress = ProcessingProgress(stage = ProcessingStage.IDLE),
+                            errorMessage = null
+                        )
+                    }
+                },
+                onFailure = { err ->
+                    _uiState.update {
+                        it.copy(
+                            progress = ProcessingProgress(stage = ProcessingStage.ERROR),
+                            errorMessage = err.message ?: "Unable to open selected video."
+                        )
+                    }
+                }
+            )
+        }
+    }
+
+    fun selectMode(mode: EnhancementMode) {
+        if (_uiState.value.isProcessing || jobRunningLock.get()) return
+        prefs.edit().putString(KEY_SELECTED_MODE, mode.id).apply()
+        _uiState.update { it.copy(selectedMode = mode, errorMessage = null) }
+    }
+
+    /**
+     * Launches the foreground service safely. Prevents duplicate concurrent jobs.
+     */
+    fun startEnhancementViaForegroundService(context: Context = appContext): Boolean {
+        val current = _uiState.value
+        if (current.selectedVideo == null) {
+            _uiState.update { it.copy(errorMessage = "Please select a video first.") }
+            return false
+        }
+        if (current.isProcessing || jobRunningLock.get()) {
+            return false
+        }
+
+        clearInterruptedNotice()
+        val intent = Intent(context, VideoEnhancementForegroundService::class.java).apply {
+            action = VideoEnhancementForegroundService.ACTION_START_ENHANCEMENT
+        }
+        ContextCompat.startForegroundService(context, intent)
+        return true
+    }
+
+    fun requestCancelEnhancement(context: Context = appContext) {
+        pipeline.cancel()
+        val intent = Intent(context, VideoEnhancementForegroundService::class.java).apply {
+            action = VideoEnhancementForegroundService.ACTION_CANCEL_ENHANCEMENT
+        }
+        try {
+            context.startService(intent)
+        } catch (_: Throwable) {
+            // If service isn't currently running, still ensure state reflects cancellation cleanly
+            if (!jobRunningLock.get()) {
+                _uiState.update {
+                    it.copy(
+                        isProcessing = false,
+                        progress = ProcessingProgress(stage = ProcessingStage.CANCELLED, statusDetail = "Cancelled by user")
+                    )
+                }
+            }
+        }
+    }
+
+    fun tryAcquireJobLock(): Boolean = jobRunningLock.compareAndSet(false, true)
+
+    fun releaseJobLock() {
+        jobRunningLock.set(false)
+    }
+
+    /**
+     * Executed by [VideoEnhancementForegroundService] in background-protected foreground execution.
+     */
+    suspend fun executeCurrentJob(
+        onProgressUpdate: (ProcessingProgress) -> Unit
+    ): Result<EnhancementResult> {
+        val current = _uiState.value
+        val metadata = current.selectedVideo
+            ?: return Result.failure(IllegalStateException("No video selected."))
+
+        val mode = current.selectedMode
+        val profiles = current.profiles.ifEmpty { profileRepository.loadProfiles() }
+        val profile = profiles.getValue(mode)
+        val caps = capabilityDetector.detect()
+
+        val initialProgress = ProcessingProgress(
+            stage = ProcessingStage.IMPORTING,
+            overallProgress = 0.02f,
+            statusDetail = "Initializing ${mode.label} background pipeline...",
+            thermalState = caps.thermalState,
+            activeAcceleration = onnxEngine.providerLabel
+        )
+        persistRunningSnapshot(mode, initialProgress)
+
+        _uiState.update {
+            it.copy(
+                deviceCapabilities = caps,
+                profiles = profiles,
+                isProcessing = true,
+                enhancementResult = null,
+                saveSuccessMessage = null,
+                errorMessage = null,
+                progress = initialProgress
+            )
+        }
+        onProgressUpdate(initialProgress)
+
+        return try {
+            val res = pipeline.processVideo(
+                metadata = metadata,
+                mode = mode,
+                profile = profile,
+                capabilities = caps,
+                onProgress = { progress ->
+                    _uiState.update { state -> state.copy(progress = progress) }
+                    persistRunningSnapshot(mode, progress)
+                    onProgressUpdate(progress)
+                }
+            )
+            res.fold(
+                onSuccess = { enhancementResult ->
+                    clearRunningSnapshot()
+                    _uiState.update {
+                        it.copy(
+                            isProcessing = false,
+                            enhancementResult = enhancementResult,
+                            errorMessage = null
+                        )
+                    }
+                    Result.success(enhancementResult)
+                },
+                onFailure = { err ->
+                    clearRunningSnapshot()
+                    val isCancelled = err is CancellationException || err is InterruptedException
+                    val msg = if (isCancelled) "Processing cancelled." else (err.message ?: "Video processing failed.")
+                    val stage = if (isCancelled) ProcessingStage.CANCELLED else ProcessingStage.ERROR
+                    _uiState.update {
+                        it.copy(
+                            isProcessing = false,
+                            progress = ProcessingProgress(stage = stage, statusDetail = msg),
+                            errorMessage = if (stage == ProcessingStage.ERROR) msg else null
+                        )
+                    }
+                    Result.failure(err)
+                }
+            )
+        } catch (cancelled: CancellationException) {
+            clearRunningSnapshot()
+            _uiState.update {
+                it.copy(
+                    isProcessing = false,
+                    progress = ProcessingProgress(stage = ProcessingStage.CANCELLED, statusDetail = "Processing cancelled.")
+                )
+            }
+            Result.failure(cancelled)
+        } catch (t: Throwable) {
+            clearRunningSnapshot()
+            _uiState.update {
+                it.copy(
+                    isProcessing = false,
+                    progress = ProcessingProgress(stage = ProcessingStage.ERROR, statusDetail = t.message ?: "Error"),
+                    errorMessage = t.message ?: "Unexpected processing error."
+                )
+            }
+            Result.failure(t)
+        }
+    }
+
+    fun markServiceTimeoutInterruption(reason: String) {
+        pipeline.cancel()
+        prefs.edit()
+            .putBoolean(KEY_WAS_ACTIVE, false)
+            .putString(KEY_INTERRUPTED_NOTICE, reason)
+            .apply()
+        _uiState.update {
+            it.copy(
+                isProcessing = false,
+                progress = ProcessingProgress(stage = ProcessingStage.ERROR, statusDetail = reason),
+                errorMessage = reason
+            )
+        }
+    }
+
+    fun saveToGallery() {
+        val result = _uiState.value.enhancementResult ?: return
+        if (_uiState.value.isSavingToGallery) return
+
+        scope.launch {
+            _uiState.update { it.copy(isSavingToGallery = true, errorMessage = null, saveSuccessMessage = null) }
+            val name = "${result.originalMetadata.displayName.substringBeforeLast('.')}_${result.mode.label}"
+            val saveRes = GallerySaver.saveToMoviesGallery(appContext, result.outputFile, name)
+            saveRes.fold(
+                onSuccess = { savedUri ->
+                    _uiState.update {
+                        it.copy(
+                            isSavingToGallery = false,
+                            enhancementResult = result.copy(savedGalleryUri = savedUri),
+                            saveSuccessMessage = "Saved to Movies/LuminaSR (${result.outputDimensions.label})"
+                        )
+                    }
+                },
+                onFailure = { err ->
+                    _uiState.update {
+                        it.copy(
+                            isSavingToGallery = false,
+                            errorMessage = err.message ?: "Failed to save video to gallery."
+                        )
+                    }
+                }
+            )
+        }
+    }
+
+    fun saveToDocumentUri(destUri: Uri) {
+        val result = _uiState.value.enhancementResult ?: return
+        scope.launch {
+            _uiState.update { it.copy(isSavingToGallery = true, errorMessage = null, saveSuccessMessage = null) }
+            val copyRes = GallerySaver.copyToUri(appContext, result.outputFile, destUri)
+            copyRes.fold(
+                onSuccess = {
+                    _uiState.update {
+                        it.copy(
+                            isSavingToGallery = false,
+                            enhancementResult = result.copy(savedGalleryUri = destUri),
+                            saveSuccessMessage = "Enhanced video exported successfully."
+                        )
+                    }
+                },
+                onFailure = { err ->
+                    _uiState.update {
+                        it.copy(
+                            isSavingToGallery = false,
+                            errorMessage = err.message ?: "Failed to export video."
+                        )
+                    }
+                }
+            )
+        }
+    }
+
+    fun clearError() {
+        clearInterruptedNotice()
+        _uiState.update { it.copy(errorMessage = null) }
+    }
+
+    fun onTrimMemory() {
+        if (!jobRunningLock.get()) {
+            onnxEngine.releaseWorkBuffers()
+            frameProcessor.resetTemporalState()
+        }
+    }
+
+    private fun persistRunningSnapshot(mode: EnhancementMode, progress: ProcessingProgress) {
+        prefs.edit()
+            .putBoolean(KEY_WAS_ACTIVE, true)
+            .putString(KEY_SELECTED_MODE, mode.id)
+            .putFloat(KEY_LAST_PROGRESS, progress.overallProgress)
+            .putString(KEY_LAST_STAGE, progress.stage.title)
+            .apply()
+    }
+
+    private fun clearRunningSnapshot() {
+        prefs.edit()
+            .putBoolean(KEY_WAS_ACTIVE, false)
+            .remove(KEY_LAST_PROGRESS)
+            .remove(KEY_LAST_STAGE)
+            .apply()
+    }
+
+    private fun clearInterruptedNotice() {
+        prefs.edit().remove(KEY_INTERRUPTED_NOTICE).apply()
+    }
+
+    companion object {
+        private const val PREFS_NAME = "luminasr_session_state"
+        private const val KEY_SELECTED_VIDEO_URI = "selected_video_uri"
+        private const val KEY_SELECTED_MODE = "selected_mode"
+        private const val KEY_WAS_ACTIVE = "was_active"
+        private const val KEY_LAST_PROGRESS = "last_progress"
+        private const val KEY_LAST_STAGE = "last_stage"
+        private const val KEY_INTERRUPTED_NOTICE = "interrupted_notice"
+
+        @Volatile
+        private var INSTANCE: EnhancementSessionCoordinator? = null
+
+        fun getInstance(context: Context): EnhancementSessionCoordinator {
+            return INSTANCE ?: synchronized(this) {
+                INSTANCE ?: EnhancementSessionCoordinator(context.applicationContext).also {
+                    INSTANCE = it
+                }
+            }
+        }
+    }
+}

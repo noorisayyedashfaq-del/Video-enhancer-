@@ -1,10 +1,14 @@
 package com.example.ui
 
+import android.Manifest
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
@@ -106,11 +110,20 @@ fun VideoEnhancerScreen(
     onSaveToDocumentUri: (Uri) -> Unit,
     onDismissError: () -> Unit
 ) {
+    val context = LocalContext.current
+
     // Zero-permission Photo Picker for video selection (Google Play compliant)
     val photoPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.PickVisualMedia()
     ) { uri ->
         uri?.let(onVideoSelected)
+    }
+
+    // Android 13+ notification permission launcher (starts foreground service regardless of grant)
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { _ ->
+        onStartEnhancement()
     }
 
     // SAF CreateDocument launcher for Android < 10 fallback or custom Export As
@@ -185,7 +198,15 @@ fun VideoEnhancerScreen(
                     isProcessing = uiState.isProcessing,
                     selectedMode = uiState.selectedMode,
                     outputDims = uiState.computedOutputDimensions[uiState.selectedMode],
-                    onStart = onStartEnhancement,
+                    onStart = {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                            ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+                        ) {
+                            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                        } else {
+                            onStartEnhancement()
+                        }
+                    },
                     onCancel = onCancelEnhancement
                 )
 
@@ -713,13 +734,17 @@ private fun ProcessingProgressSection(progress: ProcessingProgress) {
                         if (progress.memoryUsageMb > 0L) {
                             append("${progress.memoryUsageMb}MB RAM • ")
                         }
-                        append("Thermal: ${progress.thermalState.label}")
+                        append("Background Service Active")
+                        if (progress.speedFallbackActive) {
+                            append(" • Fast Mode")
+                        }
+                        append(" • ${progress.thermalState.label}")
                     }
                     Text(
                         text = telemetryLine,
                         style = MaterialTheme.typography.labelSmall,
                         color = thermalColor,
-                        maxLines = 1,
+                        maxLines = 2,
                         overflow = TextOverflow.Ellipsis
                     )
                 }
@@ -774,9 +799,13 @@ private fun EnhancementReportCard(result: EnhancementResult) {
                 color = MutedSteel
             )
             result.diagnostics?.let { diag ->
-                val tileLabel = if (diag.finalTileSize > 0) "${diag.finalTileSize}px × ${result.outputDimensions.tilesPerFrame}" else "No AI tiles"
+                val tileLabel = when {
+                    diag.speedFallbackEngaged -> "GPU/SIMD Speed Fallback"
+                    diag.finalTileSize > 0 -> "${diag.finalTileSize}px × ${result.outputDimensions.tilesPerFrame}"
+                    else -> "No AI tiles"
+                }
                 Text(
-                    text = "Engine: ${diag.executionProvider} • $tileLabel • " +
+                    text = "Engine: ${diag.executionProvider} • ${diag.decoderBackend} • $tileLabel • " +
                         "Analysis ${diag.analysisMs}ms${if (diag.analysisReusedFromCache) " (cached)" else ""} • " +
                         "AI ${diag.aiInferenceMs / 1000}s • Encode ${diag.encodingMs / 1000}s • Peak ${diag.peakMemoryMb}MB",
                     style = MaterialTheme.typography.labelSmall,

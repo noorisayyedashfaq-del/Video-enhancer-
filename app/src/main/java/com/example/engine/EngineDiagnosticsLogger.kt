@@ -23,6 +23,9 @@ class EngineDiagnosticsLogger(
     val enhancementMs = AtomicLong(0L)
     val encodingMs = AtomicLong(0L)
     var muxingMs: Long = 0L
+    var speedFallbackEngaged: Boolean = false
+    var speedFallbackReason: String? = null
+    var decoderBackend: String = "MediaCodec Zero-Copy"
     private var peakMemMb: Long = 0L
 
     fun info(message: String) {
@@ -99,6 +102,9 @@ class EngineDiagnosticsLogger(
             framesProcessed = framesProcessed,
             recoveredFrames = recoveredFrames,
             analysisReusedFromCache = analysisReusedFromCache,
+            speedFallbackEngaged = speedFallbackEngaged,
+            speedFallbackReason = speedFallbackReason,
+            decoderBackend = decoderBackend,
             warnings = warnings.toList()
         )
     }
