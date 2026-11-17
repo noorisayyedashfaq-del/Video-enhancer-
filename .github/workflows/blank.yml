@@ -20,7 +20,7 @@ jobs:
 
     - name: Create Dummy google-services.json
       run: |
-        echo '{"project_info":{"project_number":"123456789","project_id":"video-enhancer-dummy","storage_bucket":"video-enhancer-dummy.appspot.com"},"client":[{"client_info":{"mobilesdk_app_id":"1:123456789:android:abcdef","android_client_info":{"package_name":"com.example.videoenhancer"}},"api_key":[{"current_key":"dummy"}],"services":{"appinvite_service":{"other_platform_oauth_client":[]}}}]}' > app/google-services.json
+        echo '{"project_info":{"project_number":"123456789","project_id":"video-enhancer-dummy","storage_bucket":"video-enhancer-dummy.appspot.com"},"client":[{"client_info":{"mobilesdk_app_id":"1:123456789:android:abcdef","android_client_info":{"package_name":"com.aistudio.luminasr.k7m4x"}},"api_key":[{"current_key":"dummy"}],"services":{"appinvite_service":{"other_platform_oauth_client":[]}}}]}' > app/google-services.json
 
     - name: Build APK
       run: gradle assembleDebug
