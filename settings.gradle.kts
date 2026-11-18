@@ -22,6 +22,6 @@ dependencyResolutionManagement {
   }
 }
 
-rootProject.name = "LuminaSR"
+rootProject.name = "ClearKit"
 
 include(":app")

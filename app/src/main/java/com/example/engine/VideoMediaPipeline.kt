@@ -123,7 +123,7 @@ class VideoMediaPipeline(
         val inputCopy = File(workDir, "source_input.mp4")
         val framesDir = File(workDir, "frames").apply { mkdirs() }
         val rawVideoMp4 = File(workDir, "raw_enhanced.mp4")
-        val finalMp4 = File(outputDir, "LuminaSR_${mode.label}_$sessionId.mp4")
+        val finalMp4 = File(outputDir, "ClearKit_${mode.label}_$sessionId.mp4")
 
         var encoder: HardwareVideoEncoder? = null
         var reusableBitmap: Bitmap? = null

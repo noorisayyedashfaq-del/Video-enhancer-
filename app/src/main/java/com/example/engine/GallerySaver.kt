@@ -25,7 +25,7 @@ object GallerySaver {
                 .substringBeforeLast('.')
                 .replace(Regex("[^A-Za-z0-9_-]"), "_")
                 .take(40)
-                .ifBlank { "LuminaSR_Video" } + ".mp4"
+                .ifBlank { "ClearKit_Video" } + ".mp4"
 
             val resolver = context.contentResolver
             val collection = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -38,7 +38,7 @@ object GallerySaver {
                 put(MediaStore.Video.Media.DISPLAY_NAME, safeName)
                 put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    put(MediaStore.Video.Media.RELATIVE_PATH, "${Environment.DIRECTORY_MOVIES}/LuminaSR")
+                    put(MediaStore.Video.Media.RELATIVE_PATH, "${Environment.DIRECTORY_MOVIES}/ClearKit")
                     put(MediaStore.Video.Media.IS_PENDING, 1)
                 }
             }

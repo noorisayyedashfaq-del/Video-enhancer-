@@ -45,6 +45,7 @@ ffmpegKit = "6.1.5"
 onnxruntime = "1.20.0"
 media3 = "1.6.1"
 kotlinxSerializationJson = "1.8.0"
+playServicesAds = "25.5.0"
 
 
 [libraries]
@@ -106,6 +107,7 @@ androidx-media3-exoplayer = { group = "androidx.media3", name = "media3-exoplaye
 androidx-media3-ui = { group = "androidx.media3", name = "media3-ui", version.ref = "media3" }
 androidx-media3-common = { group = "androidx.media3", name = "media3-common", version.ref = "media3" }
 kotlinx-serialization-json = { group = "org.jetbrains.kotlinx", name = "kotlinx-serialization-json", version.ref = "kotlinxSerializationJson" }
+play-services-ads = { group = "com.google.android.gms", name = "play-services-ads", version.ref = "playServicesAds" }
 
 
 [plugins]

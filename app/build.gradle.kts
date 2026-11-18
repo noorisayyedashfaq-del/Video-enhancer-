@@ -138,6 +138,9 @@ dependencies {
   implementation(libs.androidx.media3.ui)
   implementation(libs.androidx.media3.common)
 
+  // AdMob Interstitial Ads SDK
+  implementation(libs.play.services.ads)
+
   testImplementation(libs.androidx.compose.ui.test.junit4)
   testImplementation(libs.androidx.core)
   testImplementation(libs.androidx.junit)

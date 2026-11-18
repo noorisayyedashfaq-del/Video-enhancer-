@@ -1,14 +1,9 @@
 package com.example.ui
 
-import android.Manifest
-import android.content.pm.PackageManager
 import android.net.Uri
-import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.core.content.ContextCompat
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
@@ -103,34 +98,15 @@ import com.example.ui.theme.SubtleSteel
 fun VideoEnhancerScreen(
     uiState: MainUiState,
     onVideoSelected: (Uri) -> Unit,
-    onSelectMode: (EnhancementMode) -> Unit,
-    onStartEnhancement: () -> Unit,
+    onStartWithAd: (String) -> Unit,
     onCancelEnhancement: () -> Unit,
-    onSaveToGallery: () -> Unit,
-    onSaveToDocumentUri: (Uri) -> Unit,
     onDismissError: () -> Unit
 ) {
-    val context = LocalContext.current
-
     // Zero-permission Photo Picker for video selection (Google Play compliant)
     val photoPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.PickVisualMedia()
     ) { uri ->
         uri?.let(onVideoSelected)
-    }
-
-    // Android 13+ notification permission launcher (starts foreground service regardless of grant)
-    val notificationPermissionLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.RequestPermission()
-    ) { _ ->
-        onStartEnhancement()
-    }
-
-    // SAF CreateDocument launcher for Android < 10 fallback or custom Export As
-    val createDocumentLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.CreateDocument("video/mp4")
-    ) { uri ->
-        uri?.let(onSaveToDocumentUri)
     }
 
     Scaffold(
@@ -184,29 +160,21 @@ fun VideoEnhancerScreen(
                     enhancementResult = uiState.enhancementResult
                 )
 
-                // 3. Four Enhancement Buttons: HD, HD+, 2K, 4K
+                // 3. Four Enhancement Buttons: HD, HD+, 2K, 4K (all wired to startWithAd)
                 EnhancementModesSection(
                     selectedMode = uiState.selectedMode,
                     computedDimensions = uiState.computedOutputDimensions,
                     isProcessing = uiState.isProcessing,
-                    onSelectMode = onSelectMode
+                    onSelectMode = { mode -> onStartWithAd(mode.label) }
                 )
 
-                // 4. Start Enhancement / Cancel
+                // 4. Start Enhancement / Cancel (wired to startWithAd)
                 StartEnhancementSection(
                     canStart = uiState.selectedVideo != null && !uiState.isProcessing,
                     isProcessing = uiState.isProcessing,
                     selectedMode = uiState.selectedMode,
                     outputDims = uiState.computedOutputDimensions[uiState.selectedMode],
-                    onStart = {
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-                            ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
-                        ) {
-                            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
-                        } else {
-                            onStartEnhancement()
-                        }
-                    },
+                    onStart = { onStartWithAd("ENHANCE") },
                     onCancel = onCancelEnhancement
                 )
 
@@ -218,7 +186,7 @@ fun VideoEnhancerScreen(
                     ProcessingProgressSection(progress = uiState.progress)
                 }
 
-                // Quality Analysis Summary & 7. Save Enhanced Video
+                // Quality Analysis Summary & 7. Save Enhanced Video (wired to startWithAd)
                 AnimatedVisibility(visible = uiState.enhancementResult != null) {
                     uiState.enhancementResult?.let { result ->
                         Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -227,18 +195,8 @@ fun VideoEnhancerScreen(
                                 result = result,
                                 isSaving = uiState.isSavingToGallery,
                                 saveMessage = uiState.saveSuccessMessage,
-                                onSaveToGallery = {
-                                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                                        onSaveToGallery()
-                                    } else {
-                                        val suggested = "LuminaSR_${result.mode.label}_${System.currentTimeMillis()}.mp4"
-                                        createDocumentLauncher.launch(suggested)
-                                    }
-                                },
-                                onExportAs = {
-                                    val suggested = "LuminaSR_${result.mode.label}_${System.currentTimeMillis()}.mp4"
-                                    createDocumentLauncher.launch(suggested)
-                                }
+                                onSaveToGallery = { onStartWithAd("DOWNLOAD") },
+                                onExportAs = { onStartWithAd("EXPORT") }
                             )
                         }
                     }
@@ -265,8 +223,8 @@ private fun StudioHeader(
             horizontalArrangement = Arrangement.spacedBy(10.dp)
         ) {
             Image(
-                painter = painterResource(id = R.drawable.img_luminasr_icon),
-                contentDescription = "LuminaSR logo",
+                painter = painterResource(id = R.drawable.img_clearkit_logo),
+                contentDescription = "ClearKit logo",
                 modifier = Modifier
                     .size(40.dp)
                     .clip(RoundedCornerShape(10.dp))

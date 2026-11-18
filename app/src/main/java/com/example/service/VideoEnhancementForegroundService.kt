@@ -95,7 +95,7 @@ class VideoEnhancementForegroundService : Service() {
                 result.fold(
                     onSuccess = { res ->
                         postCompletionNotification(
-                            title = "LuminaSR • Enhancement Complete",
+                            title = "ClearKit • Enhancement Complete",
                             body = "${res.mode.label} (${res.outputDimensions.label}) ready in ${res.processingDurationMs / 1000}s • Tap to preview & save"
                         )
                     },
@@ -103,7 +103,7 @@ class VideoEnhancementForegroundService : Service() {
                         val isCancelled = err is CancellationException || err is InterruptedException
                         if (!isCancelled) {
                             postCompletionNotification(
-                                title = "LuminaSR • Processing Failed",
+                                title = "ClearKit • Processing Failed",
                                 body = err.message ?: "Video enhancement encountered an error."
                             )
                         }
@@ -129,7 +129,7 @@ class VideoEnhancementForegroundService : Service() {
 
     override fun onTimeout(startId: Int, fgsType: Int) {
         coordinator.markServiceTimeoutInterruption(
-            "Background media processing time limit reached by system. Reopen LuminaSR to retry."
+            "Background media processing time limit reached by system. Reopen ClearKit to retry."
         )
         activeServiceJob?.cancel()
         coordinator.releaseJobLock()

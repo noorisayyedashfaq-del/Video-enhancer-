@@ -339,7 +339,7 @@ class EnhancementSessionCoordinator private constructor(
                         it.copy(
                             isSavingToGallery = false,
                             enhancementResult = result.copy(savedGalleryUri = savedUri),
-                            saveSuccessMessage = "Saved to Movies/LuminaSR (${result.outputDimensions.label})"
+                            saveSuccessMessage = "Saved to Movies/ClearKit (${result.outputDimensions.label})"
                         )
                     }
                 },

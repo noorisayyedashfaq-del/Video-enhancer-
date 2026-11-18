@@ -1,6 +1,6 @@
 <resources>
-    <string name="app_name">LuminaSR</string>
-    <string name="studio_subtitle">Offline AI Video Mastering</string>
+    <string name="app_name">ClearKit</string>
+    <string name="studio_subtitle">AI Video Enhancer Studio</string>
     <string name="action_select_video">Select Video</string>
     <string name="action_change_video">Change Video</string>
     <string name="action_start_enhancement">Start Enhancement</string>
@@ -15,7 +15,14 @@
     <string name="label_before">ORIGINAL</string>
     <string name="label_after">ENHANCED</string>
     <string name="empty_video_prompt">Select a video from your device to analyze quality, enhance details, and upscale 100% offline.</string>
-    <string name="notification_channel_processing">LuminaSR Video Processing</string>
-    <string name="notification_title_processing">LuminaSR Video Processing</string>
+    <string name="notification_channel_processing">ClearKit Video Processing</string>
+    <string name="notification_title_processing">ClearKit Video Processing</string>
     <string name="notification_action_cancel">Cancel</string>
+    <string name="ad_notice_line_1">An Ad will display while your task being processed</string>
+    <string name="ad_notice_line_2">First watch the Ad, then processing will start</string>
+    <string name="ad_loading_toast">Ad is loading, please tap again</string>
+    <string name="internet_required_title">Internet Required</string>
+    <string name="internet_required_message">To enhance video you need to watch a small Ad first. Please turn on Internet.</string>
+    <string name="action_turn_on_internet">Turn On Internet</string>
+    <string name="action_cancel_dialog">Cancel</string>
 </resources>

@@ -43,7 +43,8 @@ class ForegroundServiceAndSpeedTest {
         assertTrue(perms.contains(android.Manifest.permission.FOREGROUND_SERVICE_MEDIA_PROCESSING))
         assertTrue(perms.contains(android.Manifest.permission.POST_NOTIFICATIONS))
         assertTrue(perms.contains(android.Manifest.permission.WAKE_LOCK))
-        assertFalse("100% offline app must never request INTERNET", perms.contains(android.Manifest.permission.INTERNET))
+        assertTrue("AdMob SDK requires INTERNET permission", perms.contains(android.Manifest.permission.INTERNET))
+        assertTrue("AdMob network gate requires ACCESS_NETWORK_STATE permission", perms.contains(android.Manifest.permission.ACCESS_NETWORK_STATE))
 
         val mainAct = pkgInfo.activities?.firstOrNull { it.name.endsWith("MainActivity") }
         assertNotNull(mainAct)
@@ -111,7 +112,7 @@ class ForegroundServiceAndSpeedTest {
         val notification = service.buildProgressNotification(progress, EnhancementMode.QHD_2K)
 
         val extras = notification.extras
-        assertEquals("LuminaSR Video Processing", extras.getCharSequence(NotificationCompat.EXTRA_TITLE)?.toString())
+        assertEquals("ClearKit Video Processing", extras.getCharSequence(NotificationCompat.EXTRA_TITLE)?.toString())
         val text = extras.getCharSequence(NotificationCompat.EXTRA_TEXT)?.toString().orEmpty()
         assertTrue("Expected stage title in notification text: $text", text.contains("AI Enhancement"))
         assertTrue("Expected percentage in notification text: $text", text.contains("62%"))
