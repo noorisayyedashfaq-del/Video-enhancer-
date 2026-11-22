@@ -76,6 +76,10 @@ class HardwareVideoEncoder(
             setInteger(MediaFormat.KEY_BIT_RATE, bitrateBps)
             setInteger(MediaFormat.KEY_FRAME_RATE, fps.roundToInt().coerceIn(15, 60))
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+            val caps = runCatching { codecInfo.getCapabilitiesForType(mime).encoderCapabilities }.getOrNull()
+            if (caps?.isBitrateModeSupported(MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR) == true) {
+                setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
+            }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
             }

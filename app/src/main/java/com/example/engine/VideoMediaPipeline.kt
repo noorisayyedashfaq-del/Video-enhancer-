@@ -244,6 +244,7 @@ class VideoMediaPipeline(
                 val frameChannel = Channel<DecodedFrame>(capacity = channelCap)
 
                 var totalFacesEnhanced = 0
+                var usedAiDenoiseAny = false
                 var recoveredFrames = 0
                 var processedCount = 0
                 var lightweightFallbackActive = false
@@ -422,6 +423,9 @@ class VideoMediaPipeline(
                                     }
                                 )
                                 totalFacesEnhanced += frameResult.facesEnhanced
+                                if (frameResult.usedAiDenoise) usedAiDenoiseAny = true
+                                if (frameResult.dncnnInferenceMs > 0L) logger.dncnnInferenceMs.addAndGet(frameResult.dncnnInferenceMs)
+                                if (frameResult.faceAiMs > 0L) logger.faceAiMs.addAndGet(frameResult.faceAiMs)
                                 if (frameResult.lightweightFallbackTriggered && !lightweightFallbackActive) {
                                     lightweightFallbackActive = true
                                     logger.speedFallbackEngaged = true
@@ -544,6 +548,7 @@ class VideoMediaPipeline(
                 }
 
                 val totalElapsed = System.currentTimeMillis() - startWallMs
+                val scaleLabel = String.format(Locale.US, "%.1fx", outDims.targetScaleFactor)
                 val diagnostics = logger.buildReport(
                     totalMs = totalElapsed,
                     executionProvider = activeAccelLabel,
@@ -553,13 +558,15 @@ class VideoMediaPipeline(
                     finalTileSize = if (lightweightFallbackActive) 0 else presetTileSize,
                     framesProcessed = processedCount,
                     recoveredFrames = recoveredFrames,
-                    analysisReusedFromCache = analysisOutcome.reusedFromCache
+                    analysisReusedFromCache = analysisOutcome.reusedFromCache,
+                    upscaleScaleLabel = scaleLabel
                 )
 
                 logger.info(
                     "Job completed in ${totalElapsed}ms • frames=$processedCount • " +
-                        "decoder=${logger.decoderBackend} • init=${diagnostics.modelInitMs}ms • " +
-                        "ai=${diagnostics.aiInferenceMs}ms • encode=${diagnostics.encodingMs}ms • " +
+                        "scale=$scaleLabel (${outDims.label}) • faces=$totalFacesEnhanced • " +
+                        "dncnn=${diagnostics.dncnnInferenceMs}ms • faceAi=${diagnostics.faceAiMs}ms • " +
+                        "sr=${diagnostics.aiInferenceMs}ms • encode=${diagnostics.encodingMs}ms • " +
                         "peakMem=${diagnostics.peakMemoryMb}MB • provider=${diagnostics.executionProvider}"
                 )
 
@@ -589,7 +596,7 @@ class VideoMediaPipeline(
                     appliedParams = adaptiveParams,
                     facesEnhancedCount = totalFacesEnhanced,
                     usedAiSuperResolution = outDims.needsAiSuperResolution && !lightweightFallbackActive && onnxEngine.isRealEsrganReady,
-                    usedAiDenoise = adaptiveParams.useAiDenoise && onnxEngine.isDncnnReady,
+                    usedAiDenoise = usedAiDenoiseAny,
                     diagnostics = diagnostics
                 )
             } catch (interrupted: InterruptedException) {

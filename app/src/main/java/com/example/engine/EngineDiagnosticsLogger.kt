@@ -20,6 +20,8 @@ class EngineDiagnosticsLogger(
     var analysisMs: Long = 0L
     var extractionMs: Long = 0L
     val aiInferenceMs = AtomicLong(0L)
+    val dncnnInferenceMs = AtomicLong(0L)
+    val faceAiMs = AtomicLong(0L)
     val enhancementMs = AtomicLong(0L)
     val encodingMs = AtomicLong(0L)
     var muxingMs: Long = 0L
@@ -82,7 +84,8 @@ class EngineDiagnosticsLogger(
         finalTileSize: Int,
         framesProcessed: Int,
         recoveredFrames: Int,
-        analysisReusedFromCache: Boolean
+        analysisReusedFromCache: Boolean,
+        upscaleScaleLabel: String = "1.0x"
     ): EngineDiagnosticsReport {
         return EngineDiagnosticsReport(
             modelInitMs = modelInitMs,
@@ -105,6 +108,9 @@ class EngineDiagnosticsLogger(
             speedFallbackEngaged = speedFallbackEngaged,
             speedFallbackReason = speedFallbackReason,
             decoderBackend = decoderBackend,
+            dncnnInferenceMs = dncnnInferenceMs.get(),
+            faceAiMs = faceAiMs.get(),
+            upscaleScaleLabel = upscaleScaleLabel,
             warnings = warnings.toList()
         )
     }

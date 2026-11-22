@@ -67,30 +67,30 @@ class ForegroundServiceAndSpeedTest {
     }
 
     @Test
-    fun `AiSpeedPolicy triggers automatic lightweight fallback only when AI latency exceeds speed threshold`() {
-        // Fast GPU/NNAPI 2K (12 tiles x 30ms = 360ms/frame) -> stays on AI model
+    fun `AiSpeedPolicy preserves real ONNX AI for normal CPU latencies and only falls back on catastrophic stalls`() {
+        // Real CPU ONNX execution (e.g., 250ms/tile x 4 tiles = 1000ms/frame) -> MUST keep real AI active!
         assertFalse(
             AiSpeedPolicy.shouldEngageLightweightFallback(
-                measuredTileMs = 30L,
-                tilesPerFrame = 12,
+                measuredTileMs = 250L,
+                tilesPerFrame = 4,
                 estimatedFrameCount = 150
             )
         )
 
-        // Slow CPU 4K (25 tiles x 120ms = 3000ms/frame) -> triggers automatic lightweight speed fallback
-        assertTrue(
+        // Normal 12-tile Real-ESRGAN CPU execution (220ms/tile) -> MUST stay on real ONNX AI
+        assertFalse(
             AiSpeedPolicy.shouldEngageLightweightFallback(
-                measuredTileMs = 120L,
-                tilesPerFrame = 25,
-                estimatedFrameCount = 150
+                measuredTileMs = 220L,
+                tilesPerFrame = 12,
+                estimatedFrameCount = 120
             )
         )
 
-        // Heavy 2K tile > 220ms on multi-second clip -> triggers fast fallback
+        // Catastrophic hang > 3000ms per single tile -> emergency fallback protects device
         assertTrue(
             AiSpeedPolicy.shouldEngageLightweightFallback(
-                measuredTileMs = 240L,
-                tilesPerFrame = 12,
+                measuredTileMs = 3500L,
+                tilesPerFrame = 4,
                 estimatedFrameCount = 120
             )
         )

@@ -5,12 +5,14 @@ import com.example.model.EnhancementMode
 import com.example.model.EnhancementProfile
 import com.example.model.OutputDimensions
 import com.example.model.VideoMetadata
+import kotlin.math.ceil
+import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.roundToInt
 
 /**
- * Resolves output video configuration for the 4 Clarity levels (1x, 2x, 3x, 4x).
- * All presets keep original video resolution unchanged while configuring
- * 512px max tile size and 4 / 6 / 12 / 25 tiles per frame.
+ * Resolves progressive AI super-resolution output dimensions, smart aspect-preserving
+ * tile counts, target bitrate, and codec selection across Clarity 1x - 4x.
  */
 object ResolutionCalculator {
 
@@ -26,32 +28,101 @@ object ResolutionCalculator {
         val preferH265 = profile.preferredCodec.equals("H265", ignoreCase = true) &&
             (capabilities?.hardwareH265Supported == true)
 
-        val defaultTiles = when (mode) {
-            EnhancementMode.CLARITY_1X -> 4
-            EnhancementMode.CLARITY_2X -> 6
-            EnhancementMode.CLARITY_3X -> 12
-            EnhancementMode.CLARITY_4X -> 25
+        val rawScale = when {
+            profile.preserveOriginalResolution -> 1.0f
+            profile.targetScaleFactor > 1.0f -> profile.targetScaleFactor
+            else -> when (mode) {
+                EnhancementMode.CLARITY_1X -> 1.0f
+                EnhancementMode.CLARITY_2X -> 2.0f
+                EnhancementMode.CLARITY_3X -> 3.0f
+                EnhancementMode.CLARITY_4X -> 4.0f
+            }
         }
 
-        val tileSize = (if (profile.aiTileSize > 0) profile.aiTileSize else 512).coerceIn(128, 512)
-        val tilesPerFrame = if (profile.targetTilesPerFrame > 0) profile.targetTilesPerFrame else defaultTiles
-        val useAiTiles = tileSize > 0 && tilesPerFrame > 0
+        val hardwareMaxLongEdge = (capabilities?.maxEncodeLongEdge ?: 3840).coerceAtLeast(1920)
+        val profileMaxLongEdge = if (profile.maxOutputLongEdge > 0) {
+            min(profile.maxOutputLongEdge, hardwareMaxLongEdge)
+        } else {
+            hardwareMaxLongEdge
+        }
 
-        val bitrate = computeTargetBitrate(evenInW, evenInH, metadata.fps, profile.targetBpp, preferH265)
+        val inLongEdge = max(evenInW, evenInH)
+        val effectiveScale = if (profile.preserveOriginalResolution || rawScale <= 1.01f) {
+            1.0f
+        } else {
+            val maxAllowedScale = profileMaxLongEdge.toFloat() / inLongEdge.toFloat()
+            min(rawScale, maxAllowedScale).coerceAtLeast(1.0f)
+        }
+
+        val outW = if (effectiveScale <= 1.01f) {
+            evenInW
+        } else {
+            makeEven((evenInW * effectiveScale).roundToInt())
+        }
+        val outH = if (effectiveScale <= 1.01f) {
+            evenInH
+        } else {
+            makeEven((evenInH * effectiveScale).roundToInt())
+        }
+
+        val actualScaleX = outW.toFloat() / evenInW.toFloat()
+        val actualScaleY = outH.toFloat() / evenInH.toFloat()
+        val actualScale = (actualScaleX + actualScaleY) * 0.5f
+
+        val baseTileSize = (if (profile.aiTileSize > 0) profile.aiTileSize else {
+            when (mode) {
+                EnhancementMode.CLARITY_1X, EnhancementMode.CLARITY_2X -> 256
+                EnhancementMode.CLARITY_3X -> 320
+                EnhancementMode.CLARITY_4X -> 384
+            }
+        }).coerceIn(192, 512)
+
+        val tileBudgetCap = if (profile.targetTilesPerFrame > 0) profile.targetTilesPerFrame else 16
+        val neededTiles = computeSmartTileCount(
+            inW = evenInW,
+            inH = evenInH,
+            tileSize = baseTileSize,
+            maxTilesCap = tileBudgetCap
+        )
+
+        val bitrate = computeTargetBitrate(outW, outH, metadata.fps, profile.targetBpp, preferH265)
 
         return OutputDimensions(
-            width = evenInW,
-            height = evenInH,
-            scaleFactorX = 1f,
-            scaleFactorY = 1f,
-            needsAiSuperResolution = useAiTiles,
-            needsMultiStageUpscaling = false,
-            preserveOriginalResolution = true,
+            width = outW,
+            height = outH,
+            scaleFactorX = actualScaleX,
+            scaleFactorY = actualScaleY,
+            needsAiSuperResolution = profile.useAiSuperResolution && baseTileSize > 0 && neededTiles > 0,
+            needsMultiStageUpscaling = actualScale > 2.05f,
+            preserveOriginalResolution = effectiveScale <= 1.01f,
             targetBitrateBps = bitrate,
             useH265 = preferH265,
-            aiTileSize = tileSize,
-            tilesPerFrame = tilesPerFrame
+            aiTileSize = baseTileSize,
+            tilesPerFrame = neededTiles,
+            targetScaleFactor = actualScale
         )
+    }
+
+    /**
+     * Computes only the tiles actually needed to cover [inW] x [inH] cleanly near 1:1 native
+     * resolution with ~12% seam overlap, avoiding wasteful 25-tile splits on small videos.
+     */
+    fun computeSmartTileCount(
+        inW: Int,
+        inH: Int,
+        tileSize: Int,
+        maxTilesCap: Int
+    ): Int {
+        val safeW = inW.coerceAtLeast(2)
+        val safeH = inH.coerceAtLeast(2)
+        val safeTile = tileSize.coerceIn(128, 512)
+        val overlap = (safeTile * 0.12f).roundToInt().coerceIn(16, 48)
+        val step = (safeTile - overlap).coerceAtLeast(64)
+
+        val cols = if (safeW <= safeTile) 1 else ceil((safeW - overlap).toDouble() / step.toDouble()).toInt().coerceAtLeast(2)
+        val rows = if (safeH <= safeTile) 1 else ceil((safeH - overlap).toDouble() / step.toDouble()).toInt().coerceAtLeast(2)
+        val naturalTiles = (cols * rows).coerceAtLeast(1)
+        return naturalTiles.coerceAtMost(maxTilesCap.coerceAtLeast(naturalTiles))
     }
 
     private fun makeEven(value: Int): Int {
@@ -69,6 +140,6 @@ object ResolutionCalculator {
         val clampedFps = fps.coerceIn(15.0, 60.0)
         val codecEfficiency = if (useH265) 0.78 else 1.0
         val raw = (width.toDouble() * height.toDouble() * clampedFps * bpp * codecEfficiency).roundToInt()
-        return raw.coerceIn(2_500_000, 48_000_000)
+        return raw.coerceIn(3_000_000, 65_000_000)
     }
 }

@@ -15,29 +15,29 @@ enum class EnhancementMode(
         id = "CLARITY_1X",
         label = "1x",
         title = "Clarity 1x",
-        shortBadge = "Natural • 4 tiles",
-        subtitle = "Natural Enhancement"
+        shortBadge = "Natural AI • 1x",
+        subtitle = "Natural AI • Original Res"
     ),
     CLARITY_2X(
         id = "CLARITY_2X",
         label = "2x",
         title = "Clarity 2x",
-        shortBadge = "HD • 6 tiles",
-        subtitle = "HD Enhancement"
+        shortBadge = "HD AI • 2x",
+        subtitle = "HD AI • 2x Super-Res"
     ),
     CLARITY_3X(
         id = "CLARITY_3X",
         label = "3x",
         title = "Clarity 3x",
-        shortBadge = "Ultra • 12 tiles",
-        subtitle = "Ultra Enhancement"
+        shortBadge = "Ultra AI • 3x",
+        subtitle = "Ultra AI • 3x Super-Res"
     ),
     CLARITY_4X(
         id = "CLARITY_4X",
         label = "4x",
         title = "Clarity 4x",
-        shortBadge = "Max • 25 tiles",
-        subtitle = "Maximum Enhancement"
+        shortBadge = "Max AI • 4x",
+        subtitle = "Maximum AI • 4x Super-Res"
     )
 }
 
@@ -49,10 +49,12 @@ data class EnhancementProfile(
     val targetLongEdge: Int,
     val targetShortEdge: Int,
     val preserveOriginalResolution: Boolean,
+    val targetScaleFactor: Float = 1.0f,
+    val maxOutputLongEdge: Int = 3840,
     val useAiSuperResolution: Boolean,
     val useMultiStageUpscaling: Boolean,
     val useTiledInference: Boolean,
-    val aiTileSize: Int = 512,
+    val aiTileSize: Int = 256,
     val targetTilesPerFrame: Int = 4,
     val temporalConsistency: Boolean,
     val brightnessPercent: Float,
@@ -68,12 +70,14 @@ data class EnhancementProfile(
     val blacksPercent: Float = 0f,
     val temperatureShift: Float = 0f,
     val hueShift: Float = 0f,
-    val aiStrengthPercent: Float = 45f,
-    val detailRecoveryPercent: Float = 45f,
-    val noiseReductionPercent: Float = 40f,
-    val deblurPercent: Float = 40f,
-    val aiSharpeningPercent: Float = 30f,
-    val artifactReductionPercent: Float = 40f,
+    val aiStrengthPercent: Float = 65f,
+    val detailRecoveryPercent: Float = 65f,
+    val noiseReductionPercent: Float = 45f,
+    val deblurPercent: Float = 55f,
+    val aiSharpeningPercent: Float = 40f,
+    val artifactReductionPercent: Float = 45f,
+    val dncnnStrengthPercent: Float = 48f,
+    val faceEnhancePercent: Float = 58f,
     val gamma: Float,
     val whiteBalance: String,
     val colorCorrection: String,
@@ -132,6 +136,7 @@ data class DeviceCapabilities(
     val openGlEsMajor: Int,
     val hardwareH264Supported: Boolean,
     val hardwareH265Supported: Boolean,
+    val maxEncodeLongEdge: Int = 3840,
     val availableStorageMb: Long,
     val thermalState: ThermalState,
     val temperatureCelsius: Float,
@@ -180,7 +185,8 @@ data class OutputDimensions(
     val targetBitrateBps: Int,
     val useH265: Boolean,
     val aiTileSize: Int = 0,
-    val tilesPerFrame: Int = 0
+    val tilesPerFrame: Int = 0,
+    val targetScaleFactor: Float = 1f
 ) {
     val label: String get() = "${width}x${height}"
 }
@@ -225,10 +231,11 @@ data class AdaptiveAdjustmentParams(
     val shadowsLift: Float = 0f,      // 0..0.25 subtle shadow detail lift
     val whitesGain: Float = 0f,       // 0..0.20 crisp upper-midtone lift without clipping
     val blacksCrush: Float = 0f,      // 0..0.15 clean near-black anchor
-    val aiStrength: Float = 0.45f,    // 0.15..0.95 ONNX model output blend factor
-    val detailRecovery: Float = 0.45f,
-    val deblurStrength: Float = 0.40f,
-    val aiSharpening: Float = 0.30f,
+    val aiStrength: Float = 0.65f,    // 0.25..0.95 Real-ESRGAN ONNX blend factor
+    val detailRecovery: Float = 0.65f,
+    val deblurStrength: Float = 0.55f,
+    val aiSharpening: Float = 0.40f,
+    val dncnnStrength: Float = 0.48f, // 0.0..0.95 DnCNN neural luminance denoise blend
     val skinToneProtection: Boolean = true,
     val adjustmentSummary: String
 )
@@ -284,6 +291,9 @@ data class EngineDiagnosticsReport(
     val speedFallbackEngaged: Boolean = false,
     val speedFallbackReason: String? = null,
     val decoderBackend: String = "MediaCodec Zero-Copy",
+    val dncnnInferenceMs: Long = 0L,
+    val faceAiMs: Long = 0L,
+    val upscaleScaleLabel: String = "1.0x",
     val warnings: List<String> = emptyList()
 )
 

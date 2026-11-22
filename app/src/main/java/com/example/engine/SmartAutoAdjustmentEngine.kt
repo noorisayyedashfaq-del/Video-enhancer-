@@ -353,83 +353,93 @@ class SmartAutoAdjustmentEngine {
             claheLimit *= 0.65
         }
 
-        // 3. Noise Reduction & Artifact Reduction
-        var denoiseStrength = (profile.noiseReductionPercent / 100f) * 0.65f * qualityDampener
-        if (analysis.noiseLevel > 8.5f) {
-            val noiseExtra = ((analysis.noiseLevel - 8f) / 16f).coerceIn(0.08f, 0.35f)
-            denoiseStrength = (denoiseStrength + noiseExtra).coerceIn(0.12f, 0.85f)
-            notes.add("Applied noise reduction")
-        } else if (analysis.noiseLevel < 4.0f) {
-            denoiseStrength *= 0.60f
+        // 3. Neural DnCNN Denoise + Temporal/Artifact Cleanup
+        var denoiseStrength = (profile.noiseReductionPercent / 100f) * 0.55f * qualityDampener
+        val baseDncnn = (profile.dncnnStrengthPercent / 100f).coerceIn(0.18f, 0.94f)
+        var dncnnBoostFactor = 0f
+        if (analysis.noiseLevel > 7.5f) {
+            val noiseExtra = ((analysis.noiseLevel - 7f) / 14f).coerceIn(0.06f, 0.28f)
+            denoiseStrength = (denoiseStrength + noiseExtra).coerceIn(0.15f, 0.85f)
+            dncnnBoostFactor += ((analysis.noiseLevel - 7f) / 14f).coerceIn(0.08f, 0.32f)
+            notes.add("DnCNN neural denoise")
+        } else if (analysis.noiseLevel < 3.5f) {
+            denoiseStrength *= 0.65f
         }
-        val useAiDenoise = analysis.noiseLevel >= 7.5f || (denoiseStrength >= 0.38f && analysis.noiseLevel >= 5.5f)
 
-        val baseDeblock = (profile.artifactReductionPercent / 100f) * 0.60f * qualityDampener
-        val deblockingStrength = if (analysis.compressionArtifactScore > 1.20f) {
-            val extra = ((analysis.compressionArtifactScore - 1.15f) * 0.70f).coerceIn(0.08f, 0.32f)
-            notes.add("Reduced compression blocks")
-            (baseDeblock + extra).coerceIn(0.10f, 0.80f)
+        val baseDeblock = (profile.artifactReductionPercent / 100f) * 0.50f * qualityDampener
+        val deblockingStrength = if (analysis.compressionArtifactScore > 1.18f) {
+            val extra = ((analysis.compressionArtifactScore - 1.12f) * 0.65f).coerceIn(0.06f, 0.28f)
+            dncnnBoostFactor += ((analysis.compressionArtifactScore - 1.12f) * 0.35f).coerceIn(0.05f, 0.16f)
+            notes.add("Deblocked artifacts")
+            (baseDeblock + extra).coerceIn(0.10f, 0.78f)
         } else {
-            baseDeblock.coerceIn(0.08f, 0.65f)
+            baseDeblock.coerceIn(0.08f, 0.62f)
         }
 
-        // 4. Unified Clarity / Fallback Sharpness (AI modes skip separate unsharp when ONNX runs to avoid double sharpening)
-        var sharpnessAmount = (profile.sharpnessPercent / 100f) * 0.85f * qualityDampener
-        var edgeEnhancement = (profile.edgeEnhancementPercent / 100f) * 0.80f * qualityDampener
+        val clampedBoost = dncnnBoostFactor.coerceIn(0f, 0.45f)
+        var dncnnStrength = baseDncnn + clampedBoost * (0.96f - baseDncnn)
+        if (analysis.noiseLevel < 3.5f && analysis.compressionArtifactScore < 1.15f) {
+            dncnnStrength *= 0.85f
+        }
+        val useAiDenoise = dncnnStrength >= 0.18f
+
+        // 4. Restrained Fallback Sharpness (ONNX Real-ESRGAN + Face SR handle real detail reconstruction)
+        var sharpnessAmount = (profile.sharpnessPercent / 100f) * 0.65f * qualityDampener
+        var edgeEnhancement = (profile.edgeEnhancementPercent / 100f) * 0.60f * qualityDampener
         if (analysis.blurVariance > 400f) {
             sharpnessAmount *= 0.55f
             edgeEnhancement *= 0.55f
-        } else if (analysis.blurVariance < 100f && analysis.noiseLevel < 9f) {
-            sharpnessAmount = (sharpnessAmount + 0.08f).coerceAtMost(0.55f)
-            notes.add("Enhanced edge clarity")
+        } else if (analysis.blurVariance < 110f && analysis.noiseLevel < 10f) {
+            notes.add("AI deblur & texture recovery")
         }
         if (analysis.noiseLevel > 11f) {
-            sharpnessAmount *= 0.65f
+            sharpnessAmount *= 0.60f
         }
 
-        // 5. Saturation & Neutral Temperature / Hue (Skin-tone safe)
+        // 5. Saturation & Neutral Temperature / Hue (Natural skin tones)
         var saturationGain = 1f + (profile.saturationPercent / 100f) * qualityDampener
-        if (analysis.saturationMean < 52f) {
-            saturationGain = (saturationGain + 0.08f).coerceAtMost(1.22f)
-            notes.add("Restored natural color vibrancy")
+        if (analysis.saturationMean < 48f) {
+            saturationGain = (saturationGain + 0.06f).coerceAtMost(1.16f)
+            notes.add("Restored subtle color vibrancy")
         } else if (analysis.saturationMean > 142f) {
             saturationGain = 1f + (saturationGain - 1f) * 0.45f
         }
 
         // Preserve Temperature = 0 & Hue = 0 defaults unless severe color cast warrants minimal correction
-        val hasStrongCast = abs(analysis.whiteBalanceShiftR - 1f) > 0.16f || abs(analysis.whiteBalanceShiftB - 1f) > 0.16f
-        val tempBias = (profile.temperatureShift / 100f).coerceIn(-0.15f, 0.15f)
-        val wbGainR = (if (hasStrongCast) 1f + (analysis.whiteBalanceShiftR - 1f) * 0.25f else 1f) + tempBias
-        val wbGainB = (if (hasStrongCast) 1f + (analysis.whiteBalanceShiftB - 1f) * 0.25f else 1f) - tempBias
+        val hasStrongCast = abs(analysis.whiteBalanceShiftR - 1f) > 0.18f || abs(analysis.whiteBalanceShiftB - 1f) > 0.18f
+        val tempBias = (profile.temperatureShift / 100f).coerceIn(-0.12f, 0.12f)
+        val wbGainR = (if (hasStrongCast) 1f + (analysis.whiteBalanceShiftR - 1f) * 0.22f else 1f) + tempBias
+        val wbGainB = (if (hasStrongCast) 1f + (analysis.whiteBalanceShiftB - 1f) * 0.22f else 1f) - tempBias
 
         val flickerAlpha = if (profile.flickerReduction.equals("Automatic", ignoreCase = true)) {
-            if (isHighQualitySource) 0.08f else 0.16f
+            if (isHighQualitySource) 0.06f else 0.14f
         } else 0f
 
-        val aiStrength = (profile.aiStrengthPercent / 100f).coerceIn(0.15f, 0.95f)
-        val detailRecovery = (profile.detailRecoveryPercent / 100f).coerceIn(0.15f, 0.95f)
-        val deblurStrength = (profile.deblurPercent / 100f).coerceIn(0.10f, 0.90f)
-        val aiSharpening = (profile.aiSharpeningPercent / 100f).coerceIn(0.10f, 0.75f)
+        val aiStrength = (profile.aiStrengthPercent / 100f).coerceIn(0.20f, 0.96f)
+        val detailRecovery = (profile.detailRecoveryPercent / 100f).coerceIn(0.20f, 0.96f)
+        val deblurStrength = (profile.deblurPercent / 100f).coerceIn(0.15f, 0.92f)
+        val aiSharpening = (profile.aiSharpeningPercent / 100f).coerceIn(0.10f, 0.60f)
+        val faceEnhanceStrength = (profile.faceEnhancePercent / 100f).coerceIn(0.20f, 0.95f)
 
         return AdaptiveAdjustmentParams(
             profileId = profile.id,
-            brightnessShift = brightnessShift.coerceIn(-16f, 18f),
-            exposureHighlightCompress = highlightCompress.coerceIn(0f, 0.38f),
-            contrastGain = contrastGain.coerceIn(1.0f, 1.24f),
-            claheClipLimit = claheLimit.coerceIn(0.2, 1.55),
-            gamma = gamma.coerceIn(0.84f, 1.18f),
-            saturationGain = saturationGain.coerceIn(0.95f, 1.24f),
-            wbGainR = wbGainR.coerceIn(0.90f, 1.12f),
+            brightnessShift = brightnessShift.coerceIn(-12f, 14f),
+            exposureHighlightCompress = highlightCompress.coerceIn(0f, 0.32f),
+            contrastGain = contrastGain.coerceIn(1.0f, 1.18f),
+            claheClipLimit = claheLimit.coerceIn(0.15, 1.25),
+            gamma = gamma.coerceIn(0.86f, 1.16f),
+            saturationGain = saturationGain.coerceIn(0.96f, 1.16f),
+            wbGainR = wbGainR.coerceIn(0.92f, 1.10f),
             wbGainG = 1.0f,
-            wbGainB = wbGainB.coerceIn(0.90f, 1.12f),
+            wbGainB = wbGainB.coerceIn(0.92f, 1.10f),
             denoiseStrength = denoiseStrength.coerceIn(0.05f, 0.85f),
             useAiDenoise = useAiDenoise,
-            deblockingStrength = deblockingStrength.coerceIn(0.05f, 0.80f),
-            dehazingStrength = dehazing.coerceIn(0f, 0.18f),
-            sharpnessAmount = sharpnessAmount.coerceIn(0.05f, 0.58f),
-            edgeEnhancementAmount = edgeEnhancement.coerceIn(0.04f, 0.42f),
+            deblockingStrength = deblockingStrength.coerceIn(0.05f, 0.78f),
+            dehazingStrength = dehazing.coerceIn(0f, 0.14f),
+            sharpnessAmount = sharpnessAmount.coerceIn(0.03f, 0.35f),
+            edgeEnhancementAmount = edgeEnhancement.coerceIn(0.02f, 0.28f),
             flickerReductionAlpha = flickerAlpha,
-            faceEnhanceStrength = 0f,
+            faceEnhanceStrength = faceEnhanceStrength,
             brillianceStrength = brillianceStrength,
             clarityStrength = clarityStrength,
             shadowsLift = shadowsLift,
@@ -439,9 +449,10 @@ class SmartAutoAdjustmentEngine {
             detailRecovery = detailRecovery,
             deblurStrength = deblurStrength,
             aiSharpening = aiSharpening,
+            dncnnStrength = dncnnStrength.coerceIn(0.15f, 0.95f),
             skinToneProtection = true,
             adjustmentSummary = buildString {
-                append("${profile.displayName} • AI ${(aiStrength * 100).roundToInt()}%")
+                append("${profile.displayName} • SR ${(aiStrength * 100).roundToInt()}% • DnCNN ${(dncnnStrength * 100).roundToInt()}%")
                 if (notes.isNotEmpty()) {
                     append(" • ")
                     append(notes.joinToString(" • "))

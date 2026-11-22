@@ -102,6 +102,12 @@ class DeviceCapabilityDetector(private val context: Context) {
             else -> baseTier.maxBatchFrames
         }
 
+        val maxEncodeEdge = maxOf(
+            if (hardwareH265) queryMaxEncoderLongEdge(MediaFormat.MIMETYPE_VIDEO_HEVC) else 0,
+            if (hardwareH264) queryMaxEncoderLongEdge(MediaFormat.MIMETYPE_VIDEO_AVC) else 0,
+            1920
+        ).coerceIn(1920, 4096)
+
         return DeviceCapabilities(
             tierName = baseTier.name,
             totalRamMb = totalRamMb,
@@ -115,6 +121,7 @@ class DeviceCapabilityDetector(private val context: Context) {
             openGlEsMajor = openGlMajor,
             hardwareH264Supported = hardwareH264,
             hardwareH265Supported = hardwareH265,
+            maxEncodeLongEdge = maxEncodeEdge,
             availableStorageMb = availableStorageMb,
             thermalState = thermalState,
             temperatureCelsius = tempCelsius,
@@ -189,6 +196,29 @@ class DeviceCapabilityDetector(private val context: Context) {
         }
         val name = info.name.lowercase()
         return !name.startsWith("omx.google.") && !name.startsWith("c2.android.")
+    }
+
+    private fun queryMaxEncoderLongEdge(mimeType: String): Int {
+        return try {
+            val list = MediaCodecList(MediaCodecList.REGULAR_CODECS)
+            var best = 1920
+            for (info in list.codecInfos) {
+                if (!info.isEncoder || !info.supportedTypes.any { it.equals(mimeType, ignoreCase = true) }) continue
+                val caps = info.getCapabilitiesForType(mimeType)?.videoCapabilities ?: continue
+                val maxW = caps.supportedWidths.upper
+                val maxH = caps.supportedHeights.upper
+                if (maxW >= 3840 && caps.isSizeSupported(3840, 2160)) {
+                    best = maxOf(best, 3840)
+                } else if (maxW >= 2560 && caps.isSizeSupported(2560, 1440)) {
+                    best = maxOf(best, 2560)
+                } else if (maxH >= 3840 && caps.isSizeSupported(2160, 3840)) {
+                    best = maxOf(best, 3840)
+                }
+            }
+            best
+        } catch (_: Throwable) {
+            1920
+        }
     }
 
     private fun loadTiersFromAssets(): List<DeviceProfileTier> {

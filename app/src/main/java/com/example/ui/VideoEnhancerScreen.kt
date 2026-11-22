@@ -768,24 +768,33 @@ private fun EnhancementReportCard(result: EnhancementResult) {
                 color = MaterialTheme.colorScheme.onSurface
             )
             val appliedLine = buildString {
-                append("Applied: ${result.appliedParams.adjustmentSummary}")
-                append(" • ${result.mode.title} (${result.outputDimensions.aiTileSize}px × ${result.outputDimensions.tilesPerFrame} tiles)")
+                append("AI Models: Real-ESRGAN ${if (result.usedAiSuperResolution) "Active" else "Fallback"}")
+                append(" • DnCNN ${if (result.usedAiDenoise) "Active" else "Off"}")
+                if (result.facesEnhancedCount > 0) {
+                    append(" • Face AI (${result.facesEnhancedCount} detections)")
+                }
+                append(" • ${result.originalMetadata.resolutionLabel} → ${result.outputDimensions.label}")
             }
             Text(
                 text = appliedLine,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurface
+            )
+            Text(
+                text = "Applied: ${result.appliedParams.adjustmentSummary} • ${result.mode.title} (${result.outputDimensions.aiTileSize}px × ${result.outputDimensions.tilesPerFrame} tiles)",
                 style = MaterialTheme.typography.bodySmall,
                 color = MutedSteel
             )
             result.diagnostics?.let { diag ->
                 val tileLabel = when {
                     diag.speedFallbackEngaged -> "GPU/SIMD Speed Fallback"
-                    diag.finalTileSize > 0 -> "${diag.finalTileSize}px × ${result.outputDimensions.tilesPerFrame}"
+                    diag.finalTileSize > 0 -> "${diag.finalTileSize}px × ${result.outputDimensions.tilesPerFrame} (${diag.upscaleScaleLabel})"
                     else -> "No AI tiles"
                 }
                 Text(
-                    text = "Engine: ${diag.executionProvider} • ${diag.decoderBackend} • $tileLabel • " +
-                        "Analysis ${diag.analysisMs}ms${if (diag.analysisReusedFromCache) " (cached)" else ""} • " +
-                        "AI ${diag.aiInferenceMs / 1000}s • Encode ${diag.encodingMs / 1000}s • Peak ${diag.peakMemoryMb}MB",
+                    text = "Engine: ${diag.executionProvider} • $tileLabel • " +
+                        "SR ${diag.aiInferenceMs / 1000}s • DnCNN ${diag.dncnnInferenceMs / 1000}s • " +
+                        "Face ${diag.faceAiMs / 1000}s • Encode ${diag.encodingMs / 1000}s • Peak ${diag.peakMemoryMb}MB",
                     style = MaterialTheme.typography.labelSmall,
                     color = SubtleSteel
                 )
