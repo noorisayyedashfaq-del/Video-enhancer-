@@ -109,7 +109,7 @@ class ForegroundServiceAndSpeedTest {
             statusDetail = "Frame 45 / 100 • 1920x1080",
             processingSpeedLabel = "8.4 fps"
         )
-        val notification = service.buildProgressNotification(progress, EnhancementMode.QHD_2K)
+        val notification = service.buildProgressNotification(progress, EnhancementMode.CLARITY_3X)
 
         val extras = notification.extras
         assertEquals("ClearKit Video Processing", extras.getCharSequence(NotificationCompat.EXTRA_TITLE)?.toString())
@@ -134,8 +134,8 @@ class ForegroundServiceAndSpeedTest {
         val coordinator = EnhancementSessionCoordinator.getInstance(app)
         coordinator.releaseJobLock()
 
-        coordinator.selectMode(EnhancementMode.UHD_4K)
-        assertEquals(EnhancementMode.UHD_4K, coordinator.uiState.value.selectedMode)
+        coordinator.selectMode(EnhancementMode.CLARITY_4X)
+        assertEquals(EnhancementMode.CLARITY_4X, coordinator.uiState.value.selectedMode)
 
         assertTrue(coordinator.tryAcquireJobLock())
         assertFalse("Second concurrent lock attempt must fail to prevent duplicate jobs", coordinator.tryAcquireJobLock())

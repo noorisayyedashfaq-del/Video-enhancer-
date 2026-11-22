@@ -75,7 +75,18 @@ android {
       pickFirsts.add("lib/**/libc++_shared.so")
     }
   }
-  testOptions { unitTests { isIncludeAndroidResources = true } }
+  testOptions {
+    unitTests {
+      isIncludeAndroidResources = true
+      all {
+        it.systemProperty(
+          "robolectric.dependency.repo.url",
+          "https://maven-central.storage-download.googleapis.com/maven2"
+        )
+        it.systemProperty("robolectric.dependency.repo.id", "google-maven-central")
+      }
+    }
+  }
   dependenciesInfo {
     includeInApk = false
     includeInBundle = true

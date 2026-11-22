@@ -8,9 +8,9 @@ import com.example.model.VideoMetadata
 import kotlin.math.roundToInt
 
 /**
- * Resolves output video configuration for each enhancement preset.
- * All presets (HD, HD+, 2K, 4K) keep original video resolution unchanged while
- * configuring the preset's AI tile size and target tile count per frame.
+ * Resolves output video configuration for the 4 Clarity levels (1x, 2x, 3x, 4x).
+ * All presets keep original video resolution unchanged while configuring
+ * 512px max tile size and 4 / 6 / 12 / 25 tiles per frame.
  */
 object ResolutionCalculator {
 
@@ -26,20 +26,17 @@ object ResolutionCalculator {
         val preferH265 = profile.preferredCodec.equals("H265", ignoreCase = true) &&
             (capabilities?.hardwareH265Supported == true)
 
-        val (tileSize, tilesPerFrame) = when (mode) {
-            EnhancementMode.HD -> 0 to 0
-            EnhancementMode.HD_PLUS ->
-                (if (profile.aiTileSize > 0) profile.aiTileSize else 512) to
-                    (if (profile.targetTilesPerFrame > 0) profile.targetTilesPerFrame else 6)
-            EnhancementMode.QHD_2K ->
-                (if (profile.aiTileSize > 0) profile.aiTileSize else 512) to
-                    (if (profile.targetTilesPerFrame > 0) profile.targetTilesPerFrame else 12)
-            EnhancementMode.UHD_4K ->
-                (if (profile.aiTileSize > 0) profile.aiTileSize else 512) to
-                    (if (profile.targetTilesPerFrame > 0) profile.targetTilesPerFrame else 25)
+        val defaultTiles = when (mode) {
+            EnhancementMode.CLARITY_1X -> 4
+            EnhancementMode.CLARITY_2X -> 6
+            EnhancementMode.CLARITY_3X -> 12
+            EnhancementMode.CLARITY_4X -> 25
         }
 
-        val useAiTiles = mode != EnhancementMode.HD && tileSize > 0 && tilesPerFrame > 0
+        val tileSize = (if (profile.aiTileSize > 0) profile.aiTileSize else 512).coerceIn(128, 512)
+        val tilesPerFrame = if (profile.targetTilesPerFrame > 0) profile.targetTilesPerFrame else defaultTiles
+        val useAiTiles = tileSize > 0 && tilesPerFrame > 0
+
         val bitrate = computeTargetBitrate(evenInW, evenInH, metadata.fps, profile.targetBpp, preferH265)
 
         return OutputDimensions(

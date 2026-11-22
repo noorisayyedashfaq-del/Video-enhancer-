@@ -7,32 +7,37 @@ import java.io.File
 enum class EnhancementMode(
     val id: String,
     val label: String,
+    val title: String,
     val shortBadge: String,
     val subtitle: String
 ) {
-    HD(
-        id = "HD",
-        label = "HD",
-        shortBadge = "No AI Tiles",
-        subtitle = "Fast OpenCV • Original Res"
+    CLARITY_1X(
+        id = "CLARITY_1X",
+        label = "1x",
+        title = "Clarity 1x",
+        shortBadge = "Natural • 4 tiles",
+        subtitle = "Natural Enhancement"
     ),
-    HD_PLUS(
-        id = "HD_PLUS",
-        label = "HD+",
-        shortBadge = "512px • 6 tiles",
-        subtitle = "AI 6 Tiles • Original Res"
+    CLARITY_2X(
+        id = "CLARITY_2X",
+        label = "2x",
+        title = "Clarity 2x",
+        shortBadge = "HD • 6 tiles",
+        subtitle = "HD Enhancement"
     ),
-    QHD_2K(
-        id = "QHD_2K",
-        label = "2K",
-        shortBadge = "512px • 12 tiles",
-        subtitle = "AI 12 Tiles • Original Res"
+    CLARITY_3X(
+        id = "CLARITY_3X",
+        label = "3x",
+        title = "Clarity 3x",
+        shortBadge = "Ultra • 12 tiles",
+        subtitle = "Ultra Enhancement"
     ),
-    UHD_4K(
-        id = "UHD_4K",
-        label = "4K",
-        shortBadge = "512px • 25 tiles",
-        subtitle = "AI 25 Tiles • Original Res"
+    CLARITY_4X(
+        id = "CLARITY_4X",
+        label = "4x",
+        title = "Clarity 4x",
+        shortBadge = "Max • 25 tiles",
+        subtitle = "Maximum Enhancement"
     )
 }
 
@@ -47,14 +52,28 @@ data class EnhancementProfile(
     val useAiSuperResolution: Boolean,
     val useMultiStageUpscaling: Boolean,
     val useTiledInference: Boolean,
-    val aiTileSize: Int = 0,
-    val targetTilesPerFrame: Int = 0,
+    val aiTileSize: Int = 512,
+    val targetTilesPerFrame: Int = 4,
     val temporalConsistency: Boolean,
     val brightnessPercent: Float,
     val contrastPercent: Float,
     val sharpnessPercent: Float,
     val denoisePercent: Float,
     val saturationPercent: Float,
+    val brilliancePercent: Float = 0f,
+    val clarityPercent: Float = 0f,
+    val highlightsPercent: Float = 0f,
+    val shadowsPercent: Float = 0f,
+    val whitesPercent: Float = 0f,
+    val blacksPercent: Float = 0f,
+    val temperatureShift: Float = 0f,
+    val hueShift: Float = 0f,
+    val aiStrengthPercent: Float = 45f,
+    val detailRecoveryPercent: Float = 45f,
+    val noiseReductionPercent: Float = 40f,
+    val deblurPercent: Float = 40f,
+    val aiSharpeningPercent: Float = 30f,
+    val artifactReductionPercent: Float = 40f,
     val gamma: Float,
     val whiteBalance: String,
     val colorCorrection: String,
@@ -187,9 +206,9 @@ data class AdaptiveAdjustmentParams(
     val brightnessShift: Float,       // additive luma shift (-25..+25)
     val exposureHighlightCompress: Float, // 0..0.45 highlight roll-off
     val contrastGain: Float,          // 1.0..1.35
-    val claheClipLimit: Double,       // 0.0..2.2
+    val claheClipLimit: Double,       // 0.0..1.6
     val gamma: Float,                 // 0.80..1.25
-    val saturationGain: Float,        // 0.90..1.45
+    val saturationGain: Float,        // 0.90..1.35
     val wbGainR: Float,               // 0.85..1.18
     val wbGainG: Float,               // ~1.0
     val wbGainB: Float,               // 0.85..1.18
@@ -197,10 +216,20 @@ data class AdaptiveAdjustmentParams(
     val useAiDenoise: Boolean,
     val deblockingStrength: Float,    // 0..1.0
     val dehazingStrength: Float,      // 0..0.35
-    val sharpnessAmount: Float,       // 0..0.9
+    val sharpnessAmount: Float,       // 0..0.9 (used for lightweight fallback & clarity scaling)
     val edgeEnhancementAmount: Float, // 0..0.6
     val flickerReductionAlpha: Float, // 0..0.35
     val faceEnhanceStrength: Float,   // 0..0.55
+    val brillianceStrength: Float = 0f,
+    val clarityStrength: Float = 0f,
+    val shadowsLift: Float = 0f,      // 0..0.25 subtle shadow detail lift
+    val whitesGain: Float = 0f,       // 0..0.20 crisp upper-midtone lift without clipping
+    val blacksCrush: Float = 0f,      // 0..0.15 clean near-black anchor
+    val aiStrength: Float = 0.45f,    // 0.15..0.95 ONNX model output blend factor
+    val detailRecovery: Float = 0.45f,
+    val deblurStrength: Float = 0.40f,
+    val aiSharpening: Float = 0.30f,
+    val skinToneProtection: Boolean = true,
     val adjustmentSummary: String
 )
 
@@ -290,7 +319,7 @@ data class MainUiState(
     val deviceCapabilities: DeviceCapabilities? = null,
     val profiles: Map<EnhancementMode, EnhancementProfile> = emptyMap(),
     val selectedVideo: VideoMetadata? = null,
-    val selectedMode: EnhancementMode = EnhancementMode.HD_PLUS,
+    val selectedMode: EnhancementMode = EnhancementMode.CLARITY_2X,
     val computedOutputDimensions: Map<EnhancementMode, OutputDimensions> = emptyMap(),
     val isProcessing: Boolean = false,
     val progress: ProcessingProgress = ProcessingProgress(),

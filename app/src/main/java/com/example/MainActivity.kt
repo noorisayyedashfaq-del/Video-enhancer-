@@ -162,7 +162,7 @@ class MainActivity : ComponentActivity() {
 
     /**
      * Single common entry point used by all 5 action buttons:
-     * HD, HD+, 2K, 4K, and Download / Enhance Video.
+     * Clarity 1x, 2x, 3x, 4x, and Download / Enhance Video.
      *
      * Guarantees processing/download starts ONLY after an Interstitial Ad is watched and closed.
      */
@@ -225,10 +225,10 @@ class MainActivity : ComponentActivity() {
 
     private fun executeQualityTask(quality: String) {
         when (quality.uppercase()) {
-            "HD" -> selectQualityAndOptionallyStart(EnhancementMode.HD)
-            "HD+" -> selectQualityAndOptionallyStart(EnhancementMode.HD_PLUS)
-            "2K" -> selectQualityAndOptionallyStart(EnhancementMode.QHD_2K)
-            "4K" -> selectQualityAndOptionallyStart(EnhancementMode.UHD_4K)
+            "1X", "CLARITY 1X", "CLARITY_1X" -> selectQualityAndOptionallyStart(EnhancementMode.CLARITY_1X)
+            "2X", "CLARITY 2X", "CLARITY_2X" -> selectQualityAndOptionallyStart(EnhancementMode.CLARITY_2X)
+            "3X", "CLARITY 3X", "CLARITY_3X" -> selectQualityAndOptionallyStart(EnhancementMode.CLARITY_3X)
+            "4X", "CLARITY 4X", "CLARITY_4X" -> selectQualityAndOptionallyStart(EnhancementMode.CLARITY_4X)
             "ENHANCE" -> startEnhancementWithNotificationCheck()
             "DOWNLOAD" -> saveEnhancedVideo()
             "EXPORT" -> exportEnhancedVideoAs()
@@ -243,7 +243,7 @@ class MainActivity : ComponentActivity() {
         } else if (currentState.selectedVideo == null) {
             Toast.makeText(
                 this,
-                "${mode.label} selected. Choose a video to start processing.",
+                "${mode.title} selected. Choose a video to start processing.",
                 Toast.LENGTH_SHORT
             ).show()
         }

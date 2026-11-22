@@ -85,7 +85,14 @@ class EnhancementSessionCoordinator private constructor(
 
     private fun restorePersistedModeAndNotice() {
         val savedModeId = prefs.getString(KEY_SELECTED_MODE, null)
-        val restoredMode = EnhancementMode.entries.firstOrNull { it.id == savedModeId } ?: EnhancementMode.HD_PLUS
+        val migratedId = when (savedModeId) {
+            "HD" -> EnhancementMode.CLARITY_1X.id
+            "HD_PLUS" -> EnhancementMode.CLARITY_2X.id
+            "QHD_2K" -> EnhancementMode.CLARITY_3X.id
+            "UHD_4K" -> EnhancementMode.CLARITY_4X.id
+            else -> savedModeId
+        }
+        val restoredMode = EnhancementMode.entries.firstOrNull { it.id == migratedId } ?: EnhancementMode.CLARITY_2X
         val interruptedNotice = prefs.getString(KEY_INTERRUPTED_NOTICE, null)
         _uiState.update {
             it.copy(
@@ -230,7 +237,7 @@ class EnhancementSessionCoordinator private constructor(
         val initialProgress = ProcessingProgress(
             stage = ProcessingStage.IMPORTING,
             overallProgress = 0.02f,
-            statusDetail = "Initializing ${mode.label} background pipeline...",
+            statusDetail = "Initializing ${mode.title} background pipeline...",
             thermalState = caps.thermalState,
             activeAcceleration = onnxEngine.providerLabel
         )

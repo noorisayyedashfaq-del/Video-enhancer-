@@ -106,6 +106,7 @@ object AiTilingMath {
     private fun chooseGridDimensions(w: Int, h: Int, targetTiles: Int): Pair<Int, Int> {
         val isPortrait = h > w
         return when (targetTiles) {
+            4 -> 2 to 2
             6 -> if (isPortrait) 2 to 3 else 3 to 2
             12 -> if (isPortrait) 3 to 4 else 4 to 3
             25 -> 5 to 5
@@ -506,12 +507,19 @@ class OnnxAiInferenceEngine(private val context: Context) {
         targetTilesPerFrame: Int,
         estimatedTotalFrames: Int,
         forceLightweightFallback: Boolean,
+        aiStrength: Float = 0.45f,
+        fallbackSharpnessBoost: Float = 0.32f,
         isCancelled: () -> Boolean,
         logger: EngineDiagnosticsLogger? = null,
         onTileProgress: (done: Int, total: Int, tileSize: Int) -> Unit = { _, _, _ -> }
     ): TileProcessOutcome {
         if (forceLightweightFallback || activeSrSession == null) {
-            val lw = enhanceFastLightweightCopy(srcBgr, sharpnessBoost = 0.34f, contrastBoost = 1.07f, satBoost = 1.05f)
+            val lw = enhanceFastLightweightCopy(
+                srcBgr,
+                sharpnessBoost = fallbackSharpnessBoost.coerceIn(0.08f, 0.65f),
+                contrastBoost = 1.03f,
+                satBoost = 1.02f
+            )
             val label = if (glesGpuAvailable) "GLES 3.1 GPU Fast" else "OpenCV SIMD Fast"
             return TileProcessOutcome(
                 outputBgr = lw,
@@ -601,7 +609,12 @@ class OnnxAiInferenceEngine(private val context: Context) {
                 val projectedMs = avgTileMs * grid.totalTiles
                 val reason = "Auto-switched to Fast GPU/SIMD Engine: ${safeTileSize}px tile took ${avgTileMs}ms (~${projectedMs}ms/frame across ${grid.totalTiles} tiles)"
                 logger?.warn(reason)
-                val fastBgr = enhanceFastLightweightCopy(srcBgr, sharpnessBoost = 0.34f, contrastBoost = 1.07f, satBoost = 1.05f)
+                val fastBgr = enhanceFastLightweightCopy(
+                    srcBgr,
+                    sharpnessBoost = fallbackSharpnessBoost.coerceIn(0.08f, 0.65f),
+                    contrastBoost = 1.03f,
+                    satBoost = 1.02f
+                )
                 val label = if (glesGpuAvailable) "GLES 3.1 GPU Fast" else "OpenCV SIMD Fast"
                 activeProviderDescription = label
                 return TileProcessOutcome(
@@ -613,14 +626,15 @@ class OnnxAiInferenceEngine(private val context: Context) {
             }
         }
 
-        // 4. Native SIMD Normalization + 80% AI / 20% Original crisp blend + BGR conversion
+        // 4. Native SIMD Normalization + Calibrated AI Blend (25% / 45% / 70% / 90%) + BGR conversion
         Core.max(accumWeightMat!!, weightClampFloorMat!!, accumWeightMat!!)
         Core.merge(listOf(accumWeightMat!!, accumWeightMat!!, accumWeightMat!!), accumWeight3CMat!!)
         Core.divide(accumRgbMat!!, accumWeight3CMat!!, accumRgbMat!!)
         Core.min(accumRgbMat!!, Scalar(1.0, 1.0, 1.0), accumRgbMat!!)
         Core.max(accumRgbMat!!, Scalar(0.0, 0.0, 0.0), accumRgbMat!!)
 
-        Core.addWeighted(accumRgbMat!!, 255.0 * 0.80, origFloatMat!!, 0.20, 0.0, blendedRgbFloat!!)
+        val aiBlend = aiStrength.toDouble().coerceIn(0.15, 0.95)
+        Core.addWeighted(accumRgbMat!!, 255.0 * aiBlend, origFloatMat!!, 1.0 - aiBlend, 0.0, blendedRgbFloat!!)
         blendedRgbFloat!!.convertTo(outRgb8u!!, CvType.CV_8UC3)
 
         val finalBgr = Mat(inH, inW, CvType.CV_8UC3)

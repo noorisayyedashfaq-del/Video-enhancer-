@@ -160,7 +160,7 @@ fun VideoEnhancerScreen(
                     enhancementResult = uiState.enhancementResult
                 )
 
-                // 3. Four Enhancement Buttons: HD, HD+, 2K, 4K (all wired to startWithAd)
+                // 3. Four Enhancement Buttons: Clarity 1x, 2x, 3x, 4x (all wired to startWithAd)
                 EnhancementModesSection(
                     selectedMode = uiState.selectedMode,
                     computedDimensions = uiState.computedOutputDimensions,
@@ -466,63 +466,86 @@ private fun EnhancementModesSection(
     isProcessing: Boolean,
     onSelectMode: (EnhancementMode) -> Unit
 ) {
+    val rows = EnhancementMode.entries.chunked(2)
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Text(
             text = stringResource(R.string.label_enhancement_mode),
             style = MaterialTheme.typography.titleMedium
         )
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            EnhancementMode.entries.forEach { mode ->
-                val isSelected = mode == selectedMode
-                val isUltra = mode == EnhancementMode.UHD_4K || mode == EnhancementMode.QHD_2K
-                val accentColor = if (mode == EnhancementMode.UHD_4K) AmberFourK else CyanMaster
-                val containerColor = when {
-                    isSelected && mode == EnhancementMode.UHD_4K -> AmberFourKContainer
-                    isSelected -> CyanMasterContainer
-                    else -> StudioSlate
-                }
-                val dims = computedDimensions[mode]
+        rows.forEach { rowModes ->
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                rowModes.forEach { mode ->
+                    val isSelected = mode == selectedMode
+                    val isMax = mode == EnhancementMode.CLARITY_4X
+                    val isUltra = mode == EnhancementMode.CLARITY_3X || isMax
+                    val accentColor = if (isMax) AmberFourK else CyanMaster
+                    val containerColor = when {
+                        isSelected && isMax -> AmberFourKContainer
+                        isSelected -> CyanMasterContainer
+                        else -> StudioSlate
+                    }
+                    val dims = computedDimensions[mode]
+                    val tileLabel = dims?.let { "${it.aiTileSize}px • ${it.tilesPerFrame}t" } ?: mode.shortBadge
 
-                Surface(
-                    color = containerColor,
-                    shape = RoundedCornerShape(14.dp),
-                    border = BorderStroke(
-                        width = if (isSelected) 1.5.dp else 1.dp,
-                        color = if (isSelected) accentColor else StudioBorder
-                    ),
-                    modifier = Modifier
-                        .weight(1f)
-                        .minimumInteractiveComponentSize()
-                        .clip(RoundedCornerShape(14.dp))
-                        .clickable(enabled = !isProcessing) { onSelectMode(mode) }
-                        .testTag("mode_button_${mode.id.lowercase()}")
-                ) {
-                    Column(
-                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 12.dp),
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    Surface(
+                        color = containerColor,
+                        shape = RoundedCornerShape(14.dp),
+                        border = BorderStroke(
+                            width = if (isSelected) 1.5.dp else 1.dp,
+                            color = if (isSelected) accentColor else StudioBorder
+                        ),
+                        modifier = Modifier
+                            .weight(1f)
+                            .minimumInteractiveComponentSize()
+                            .clip(RoundedCornerShape(14.dp))
+                            .clickable(enabled = !isProcessing) { onSelectMode(mode) }
+                            .testTag("mode_button_${mode.id.lowercase()}")
                     ) {
-                        Icon(
-                            imageVector = if (isUltra) Icons.Default.HighQuality else Icons.Default.Hd,
-                            contentDescription = "${mode.label} enhancement mode",
-                            tint = if (isSelected) accentColor else MutedSteel,
-                            modifier = Modifier.size(20.dp)
-                        )
-                        Text(
-                            text = mode.label,
-                            style = MaterialTheme.typography.titleMedium,
-                            fontWeight = FontWeight.Bold,
-                            color = if (isSelected) accentColor else MaterialTheme.colorScheme.onSurface
-                        )
-                        Text(
-                            text = mode.shortBadge,
-                            style = MaterialTheme.typography.labelSmall,
-                            color = if (isSelected) MaterialTheme.colorScheme.onSurface else SubtleSteel,
-                            maxLines = 1
-                        )
+                        Column(
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 12.dp),
+                            verticalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = if (isUltra) Icons.Default.HighQuality else Icons.Default.Hd,
+                                        contentDescription = "${mode.title} enhancement mode",
+                                        tint = if (isSelected) accentColor else MutedSteel,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                    Text(
+                                        text = mode.title,
+                                        style = MaterialTheme.typography.titleSmall,
+                                        fontWeight = FontWeight.Bold,
+                                        color = if (isSelected) accentColor else MaterialTheme.colorScheme.onSurface,
+                                        maxLines = 1
+                                    )
+                                }
+                                Text(
+                                    text = tileLabel,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = if (isSelected) accentColor else SubtleSteel,
+                                    maxLines = 1
+                                )
+                            }
+                            Text(
+                                text = mode.subtitle,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = if (isSelected) MaterialTheme.colorScheme.onSurface else MutedSteel,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
                     }
                 }
             }
@@ -576,12 +599,13 @@ private fun StartEnhancementSection(
             Icon(imageVector = Icons.Default.AutoAwesome, contentDescription = null)
             Spacer(modifier = Modifier.width(8.dp))
             val targetInfo = outputDims?.let {
-                if (it.tilesPerFrame > 0) " (${it.aiTileSize}px × ${it.tilesPerFrame} • ${it.label})"
-                else " (No AI Tiles • ${it.label})"
+                " (${it.aiTileSize}px × ${it.tilesPerFrame} • ${it.label})"
             } ?: ""
             Text(
-                text = "${stringResource(R.string.action_start_enhancement)} • ${selectedMode.label}$targetInfo",
-                style = MaterialTheme.typography.labelLarge
+                text = "${stringResource(R.string.action_start_enhancement)} • ${selectedMode.title}$targetInfo",
+                style = MaterialTheme.typography.labelLarge,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
             )
         }
     }
@@ -745,11 +769,7 @@ private fun EnhancementReportCard(result: EnhancementResult) {
             )
             val appliedLine = buildString {
                 append("Applied: ${result.appliedParams.adjustmentSummary}")
-                if (result.outputDimensions.tilesPerFrame > 0) {
-                    append(" • AI Preset ${result.outputDimensions.aiTileSize}px × ${result.outputDimensions.tilesPerFrame} tiles")
-                } else {
-                    append(" • Fast OpenCV (No AI Tiles)")
-                }
+                append(" • ${result.mode.title} (${result.outputDimensions.aiTileSize}px × ${result.outputDimensions.tilesPerFrame} tiles)")
             }
             Text(
                 text = appliedLine,
