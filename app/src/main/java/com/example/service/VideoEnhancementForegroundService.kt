@@ -36,7 +36,7 @@ class VideoEnhancementForegroundService : Service() {
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private lateinit var coordinator: EnhancementSessionCoordinator
-    private lateinit var notificationManager: NotificationManager
+    private var notificationManager: NotificationManager? = null
     private var wakeLock: PowerManager.WakeLock? = null
     private var activeServiceJob: Job? = null
     private var lastNotifiedPct: Int = -1
@@ -46,7 +46,7 @@ class VideoEnhancementForegroundService : Service() {
     override fun onCreate() {
         super.onCreate()
         coordinator = EnhancementSessionCoordinator.getInstance(applicationContext)
-        notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
         ensureNotificationChannels()
     }
 
@@ -190,7 +190,7 @@ class VideoEnhancementForegroundService : Service() {
         lastNotifiedStage = progress.stage
         lastNotifyMs = now
         try {
-            notificationManager.notify(
+            notificationManager?.notify(
                 NOTIFICATION_ID_PROGRESS,
                 buildProgressNotification(progress, mode)
             )
@@ -270,7 +270,7 @@ class VideoEnhancementForegroundService : Service() {
             .setContentIntent(contentPending)
             .build()
         try {
-            notificationManager.notify(NOTIFICATION_ID_COMPLETE, notification)
+            notificationManager?.notify(NOTIFICATION_ID_COMPLETE, notification)
         } catch (_: Throwable) {
         }
     }
@@ -292,8 +292,8 @@ class VideoEnhancementForegroundService : Service() {
             ).apply {
                 description = "Alerts when offline video export finishes"
             }
-            notificationManager.createNotificationChannel(progressChannel)
-            notificationManager.createNotificationChannel(completeChannel)
+            notificationManager?.createNotificationChannel(progressChannel)
+            notificationManager?.createNotificationChannel(completeChannel)
         }
     }
 

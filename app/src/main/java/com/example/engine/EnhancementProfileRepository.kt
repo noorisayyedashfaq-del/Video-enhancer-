@@ -19,7 +19,7 @@ class EnhancementProfileRepository(private val context: Context) {
                     root.modes[mode.id]?.let { put(mode, it) }
                 }
             }
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
             emptyMap()
         }
 

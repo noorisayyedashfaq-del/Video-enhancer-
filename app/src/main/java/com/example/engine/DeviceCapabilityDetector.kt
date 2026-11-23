@@ -28,12 +28,22 @@ class DeviceCapabilityDetector(private val context: Context) {
     private val cachedTiers: List<DeviceProfileTier> by lazy { loadTiersFromAssets() }
 
     fun detect(): DeviceCapabilities {
-        val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+        val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
         val memInfo = ActivityManager.MemoryInfo()
-        activityManager.getMemoryInfo(memInfo)
+        val memReadOk = activityManager != null && runCatching {
+            activityManager.getMemoryInfo(memInfo)
+        }.isSuccess
 
-        val totalRamMb = (memInfo.totalMem / (1024L * 1024L)).coerceAtLeast(1024L)
-        val availableRamMb = (memInfo.availMem / (1024L * 1024L)).coerceAtLeast(256L)
+        val totalRamMb = if (memReadOk && memInfo.totalMem > 0L) {
+            (memInfo.totalMem / (1024L * 1024L)).coerceAtLeast(1024L)
+        } else {
+            4096L
+        }
+        val availableRamMb = if (memReadOk && memInfo.availMem > 0L) {
+            (memInfo.availMem / (1024L * 1024L)).coerceAtLeast(256L)
+        } else {
+            1536L
+        }
         val cpuTopology = detectCpuTopology()
         val cpuCores = cpuTopology.totalCores
 
@@ -48,8 +58,7 @@ class DeviceCapabilityDetector(private val context: Context) {
         val hardwareH264 = hasHardwareEncoder(MediaFormat.MIMETYPE_VIDEO_AVC)
         val hardwareH265 = hasHardwareEncoder(MediaFormat.MIMETYPE_VIDEO_HEVC)
 
-        val statFs = StatFs(context.cacheDir.absolutePath)
-        val availableStorageMb = (statFs.availableBlocksLong * statFs.blockSizeLong) / (1024L * 1024L)
+        val availableStorageMb = currentAvailableStorageMb()
 
         val (thermalState, tempCelsius) = readThermalInfo()
 
@@ -132,23 +141,26 @@ class DeviceCapabilityDetector(private val context: Context) {
     }
 
     fun probeHardwareSnapshot(
-        activityManager: ActivityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager,
+        activityManager: ActivityManager? = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager,
         cpuTopology: CpuTopologyInfo = detectCpuTopology()
     ): HardwareProbeSnapshot {
         val pm = context.packageManager
         val vulkanSupported = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            pm.hasSystemFeature(PackageManager.FEATURE_VULKAN_HARDWARE_LEVEL)
+            runCatching { pm?.hasSystemFeature(PackageManager.FEATURE_VULKAN_HARDWARE_LEVEL) == true }
+                .getOrDefault(false)
         } else {
             false
         }
         val vulkanComputeSupported = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            pm.hasSystemFeature(PackageManager.FEATURE_VULKAN_HARDWARE_COMPUTE)
+            runCatching { pm?.hasSystemFeature(PackageManager.FEATURE_VULKAN_HARDWARE_COMPUTE) == true }
+                .getOrDefault(false)
         } else {
             false
         }
         val vulkanVersionLabel = if (vulkanSupported && Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            val verInfo = pm.systemAvailableFeatures.firstOrNull {
-                it.name == PackageManager.FEATURE_VULKAN_HARDWARE_VERSION
+            val features = runCatching { pm?.systemAvailableFeatures }.getOrNull()
+            val verInfo = features?.firstOrNull { fi ->
+                fi != null && fi.name == PackageManager.FEATURE_VULKAN_HARDWARE_VERSION
             }
             if (verInfo != null) {
                 val major = (verInfo.version ushr 22) and 0x3FF
@@ -161,8 +173,8 @@ class DeviceCapabilityDetector(private val context: Context) {
             "Unavailable"
         }
 
-        val configInfo = activityManager.deviceConfigurationInfo
-        val openGlMajor = (configInfo.reqGlEsVersion ushr 16).coerceAtLeast(2)
+        val configInfo = runCatching { activityManager?.deviceConfigurationInfo }.getOrNull()
+        val openGlMajor = ((configInfo?.reqGlEsVersion ?: 0x30000) ushr 16).coerceAtLeast(2)
 
         val (openClPresent, openClSource) = detectOpenClDriver()
         val (isQualcomm, qnnHtp, qnnGpu, qnnLabel) = detectQualcommQnnDrivers()
@@ -271,16 +283,17 @@ class DeviceCapabilityDetector(private val context: Context) {
         val hwStr = "${Build.HARDWARE} ${Build.BOARD} $socMfg $socModel".lowercase()
         val isQcom = hwStr.contains("qcom") || hwStr.contains("qualcomm") || hwStr.contains("snapdragon") || hwStr.contains("sm8") || hwStr.contains("sm7")
 
-        val htpPaths = listOf(
-            "${context.applicationInfo.nativeLibraryDir}/libQnnHtp.so",
-            "/vendor/lib64/libQnnHtp.so",
-            "/system/vendor/lib64/libQnnHtp.so"
-        )
-        val gpuPaths = listOf(
-            "${context.applicationInfo.nativeLibraryDir}/libQnnGpu.so",
-            "/vendor/lib64/libQnnGpu.so",
-            "/system/vendor/lib64/libQnnGpu.so"
-        )
+        val nativeLibDir = runCatching { context.applicationInfo?.nativeLibraryDir }.getOrNull().orEmpty()
+        val htpPaths = buildList {
+            if (nativeLibDir.isNotBlank()) add("$nativeLibDir/libQnnHtp.so")
+            add("/vendor/lib64/libQnnHtp.so")
+            add("/system/vendor/lib64/libQnnHtp.so")
+        }
+        val gpuPaths = buildList {
+            if (nativeLibDir.isNotBlank()) add("$nativeLibDir/libQnnGpu.so")
+            add("/vendor/lib64/libQnnGpu.so")
+            add("/system/vendor/lib64/libQnnGpu.so")
+        }
         val hasHtp = htpPaths.any { runCatching { File(it).exists() }.getOrDefault(false) }
         val hasGpu = gpuPaths.any { runCatching { File(it).exists() }.getOrDefault(false) }
         val ortHasQnn = runCatching {
@@ -325,23 +338,30 @@ class DeviceCapabilityDetector(private val context: Context) {
     }
 
     fun readThermalInfo(): Pair<ThermalState, Float> {
-        val batteryIntent = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
-        val tempTenths = batteryIntent?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 300) ?: 300
+        val batteryIntent = runCatching {
+            context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+        }.getOrNull()
+        val tempTenths = runCatching {
+            batteryIntent?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 300) ?: 300
+        }.getOrDefault(300)
         val tempC = tempTenths / 10f
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            val powerManager = context.getSystemService(Context.POWER_SERVICE) as PowerManager
-            val state = when (powerManager.currentThermalStatus) {
-                PowerManager.THERMAL_STATUS_NONE,
-                PowerManager.THERMAL_STATUS_LIGHT -> if (tempC >= 41f) ThermalState.WARM else ThermalState.NORMAL
-                PowerManager.THERMAL_STATUS_MODERATE -> ThermalState.WARM
-                PowerManager.THERMAL_STATUS_SEVERE -> ThermalState.THROTTLING
-                PowerManager.THERMAL_STATUS_CRITICAL,
-                PowerManager.THERMAL_STATUS_EMERGENCY,
-                PowerManager.THERMAL_STATUS_SHUTDOWN -> ThermalState.CRITICAL
-                else -> ThermalState.NORMAL
+            val powerManager = context.getSystemService(Context.POWER_SERVICE) as? PowerManager
+            val thermalStatus = runCatching { powerManager?.currentThermalStatus }.getOrNull()
+            if (thermalStatus != null) {
+                val state = when (thermalStatus) {
+                    PowerManager.THERMAL_STATUS_NONE,
+                    PowerManager.THERMAL_STATUS_LIGHT -> if (tempC >= 41f) ThermalState.WARM else ThermalState.NORMAL
+                    PowerManager.THERMAL_STATUS_MODERATE -> ThermalState.WARM
+                    PowerManager.THERMAL_STATUS_SEVERE -> ThermalState.THROTTLING
+                    PowerManager.THERMAL_STATUS_CRITICAL,
+                    PowerManager.THERMAL_STATUS_EMERGENCY,
+                    PowerManager.THERMAL_STATUS_SHUTDOWN -> ThermalState.CRITICAL
+                    else -> ThermalState.NORMAL
+                }
+                return state to tempC
             }
-            return state to tempC
         }
 
         val fallbackState = when {
@@ -354,15 +374,23 @@ class DeviceCapabilityDetector(private val context: Context) {
     }
 
     fun currentAvailableRamMb(): Long {
-        val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+        val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
+            ?: return 1024L
         val memInfo = ActivityManager.MemoryInfo()
-        activityManager.getMemoryInfo(memInfo)
-        return memInfo.availMem / (1024L * 1024L)
+        return if (runCatching { activityManager.getMemoryInfo(memInfo) }.isSuccess && memInfo.availMem > 0L) {
+            memInfo.availMem / (1024L * 1024L)
+        } else {
+            1024L
+        }
     }
 
     fun currentAvailableStorageMb(): Long {
-        val statFs = StatFs(context.cacheDir.absolutePath)
-        return (statFs.availableBlocksLong * statFs.blockSizeLong) / (1024L * 1024L)
+        return runCatching {
+            val dir = context.cacheDir ?: context.filesDir
+            if (!dir.exists()) dir.mkdirs()
+            val statFs = StatFs(dir.absolutePath)
+            (statFs.availableBlocksLong * statFs.blockSizeLong) / (1024L * 1024L)
+        }.getOrDefault(1024L)
     }
 
     private fun hasHardwareEncoder(mimeType: String): Boolean {
@@ -410,10 +438,13 @@ class DeviceCapabilityDetector(private val context: Context) {
     }
 
     private fun loadTiersFromAssets(): List<DeviceProfileTier> {
-        return try {
+        val parsed = try {
             val raw = context.assets.open("configuration/device_profiles.json").bufferedReader().use { it.readText() }
             json.decodeFromString<DeviceProfilesRoot>(raw).tiers
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
+            emptyList()
+        }
+        return parsed.ifEmpty {
             listOf(
                 DeviceProfileTier("LOW_4GB", 0, 4608, 96, 8, 1, 4, true, 350, 45, 140),
                 DeviceProfileTier("MID_6GB", 4608, 6656, 128, 12, 2, 6, true, 450, 30, 110),

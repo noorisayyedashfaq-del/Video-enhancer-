@@ -3,7 +3,7 @@ package com.example.service
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
-import android.os.Build
+import android.util.Log
 import androidx.core.content.ContextCompat
 import com.example.engine.DeviceCapabilityDetector
 import com.example.engine.EnhancementProfileRepository
@@ -13,12 +13,14 @@ import com.example.engine.OpenCvFrameProcessor
 import com.example.engine.ResolutionCalculator
 import com.example.engine.SmartAutoAdjustmentEngine
 import com.example.engine.VideoMediaPipeline
+import com.example.model.EngineHealthStatus
 import com.example.model.EnhancementMode
 import com.example.model.EnhancementResult
 import com.example.model.MainUiState
 import com.example.model.ProcessingProgress
 import com.example.model.ProcessingStage
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -37,7 +39,10 @@ import java.util.concurrent.atomic.AtomicBoolean
 class EnhancementSessionCoordinator private constructor(
     private val appContext: Context
 ) {
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val exceptionHandler = CoroutineExceptionHandler { _, throwable ->
+        Log.e(TAG, "Uncaught exception in session coordinator coroutine", throwable)
+    }
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO + exceptionHandler)
     private val prefs = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
     val capabilityDetector = DeviceCapabilityDetector(appContext)
@@ -69,100 +74,156 @@ class EnhancementSessionCoordinator private constructor(
     fun ensureEnginesInitializedAsync() {
         if (!enginesInitialized.compareAndSet(false, true)) return
         scope.launch {
-            val caps = capabilityDetector.detect()
-            val profiles = profileRepository.loadProfiles()
-            val health = pipeline.initializeAndCheckHealth(caps)
-            _uiState.update {
-                it.copy(
-                    deviceCapabilities = caps,
-                    profiles = profiles,
-                    engineHealth = health
-                )
+            try {
+                val profiles = runCatching { profileRepository.loadProfiles() }
+                    .getOrDefault(emptyMap())
+                val caps = runCatching { capabilityDetector.detect() }.getOrNull()
+
+                _uiState.update {
+                    it.copy(
+                        deviceCapabilities = caps ?: it.deviceCapabilities,
+                        profiles = profiles.ifEmpty { it.profiles }
+                    )
+                }
+
+                if (caps != null) {
+                    val health = try {
+                        pipeline.initializeAndCheckHealth(caps)
+                    } catch (ce: CancellationException) {
+                        throw ce
+                    } catch (t: Throwable) {
+                        Log.e(TAG, "Pipeline health init failed safely", t)
+                        EngineHealthStatus(
+                            openCvReady = frameProcessor.isOpenCvReady,
+                            ffmpegReady = false,
+                            onnxRuntimeReady = false,
+                            realEsrganModelReady = onnxEngine.isRealEsrganReady,
+                            dncnnModelReady = onnxEngine.isDncnnReady,
+                            yunetModelReady = frameProcessor.isFaceDetectorReady,
+                            activeExecutionProvider = onnxEngine.providerLabel,
+                            hardwareProfile = onnxEngine.adaptiveProfile,
+                            diagnosticMessage = t.message ?: "Engine startup warning"
+                        )
+                    }
+                    _uiState.update {
+                        it.copy(
+                            deviceCapabilities = caps,
+                            profiles = profiles.ifEmpty { it.profiles },
+                            engineHealth = health
+                        )
+                    }
+                }
+                restorePersistedVideoIfUnset()
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (t: Throwable) {
+                Log.e(TAG, "Cold-start async initialization error caught safely", t)
             }
-            restorePersistedVideoIfUnset()
         }
     }
 
     private fun restorePersistedModeAndNotice() {
-        val savedModeId = prefs.getString(KEY_SELECTED_MODE, null)
-        val migratedId = when (savedModeId) {
-            "HD" -> EnhancementMode.CLARITY_1X.id
-            "HD_PLUS" -> EnhancementMode.CLARITY_2X.id
-            "QHD_2K" -> EnhancementMode.CLARITY_3X.id
-            "UHD_4K" -> EnhancementMode.CLARITY_4X.id
-            else -> savedModeId
-        }
-        val restoredMode = EnhancementMode.entries.firstOrNull { it.id == migratedId } ?: EnhancementMode.CLARITY_2X
-        val interruptedNotice = prefs.getString(KEY_INTERRUPTED_NOTICE, null)
-        _uiState.update {
-            it.copy(
-                selectedMode = restoredMode,
-                errorMessage = interruptedNotice
-            )
+        try {
+            val savedModeId = prefs.getString(KEY_SELECTED_MODE, null)
+            val migratedId = when (savedModeId) {
+                "HD" -> EnhancementMode.CLARITY_1X.id
+                "HD_PLUS" -> EnhancementMode.CLARITY_2X.id
+                "QHD_2K" -> EnhancementMode.CLARITY_3X.id
+                "UHD_4K" -> EnhancementMode.CLARITY_4X.id
+                else -> savedModeId
+            }
+            val restoredMode = EnhancementMode.entries.firstOrNull { it.id == migratedId } ?: EnhancementMode.CLARITY_2X
+            val interruptedNotice = prefs.getString(KEY_INTERRUPTED_NOTICE, null)
+            _uiState.update {
+                it.copy(
+                    selectedMode = restoredMode,
+                    errorMessage = interruptedNotice
+                )
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "Failed restoring persisted mode cleanly", t)
         }
     }
 
     private suspend fun restorePersistedVideoIfUnset() {
-        if (_uiState.value.selectedVideo != null || _uiState.value.isProcessing) return
-        val savedUriStr = prefs.getString(KEY_SELECTED_VIDEO_URI, null) ?: return
-        val uri = runCatching { Uri.parse(savedUriStr) }.getOrNull() ?: return
-        val result = pipeline.importAndProbeVideo(uri)
-        result.onSuccess { metadata ->
-            val caps = _uiState.value.deviceCapabilities ?: capabilityDetector.detect()
-            val profiles = _uiState.value.profiles.ifEmpty { profileRepository.loadProfiles() }
-            val dimsMap = EnhancementMode.entries.associateWith { mode ->
-                ResolutionCalculator.calculate(metadata, mode, profiles.getValue(mode), caps)
+        try {
+            if (_uiState.value.selectedVideo != null || _uiState.value.isProcessing) return
+            val savedUriStr = prefs.getString(KEY_SELECTED_VIDEO_URI, null) ?: return
+            val uri = runCatching { Uri.parse(savedUriStr) }.getOrNull() ?: return
+            val result = pipeline.importAndProbeVideo(uri)
+            result.onSuccess { metadata ->
+                val caps = _uiState.value.deviceCapabilities ?: capabilityDetector.detect()
+                val profiles = _uiState.value.profiles.ifEmpty { profileRepository.loadProfiles() }
+                val dimsMap = EnhancementMode.entries.associateWith { mode ->
+                    ResolutionCalculator.calculate(metadata, mode, profiles.getValue(mode), caps)
+                }
+                _uiState.update { state ->
+                    if (state.selectedVideo != null) state else state.copy(
+                        selectedVideo = metadata,
+                        computedOutputDimensions = dimsMap
+                    )
+                }
             }
-            _uiState.update { state ->
-                if (state.selectedVideo != null) state else state.copy(
-                    selectedVideo = metadata,
-                    computedOutputDimensions = dimsMap
-                )
-            }
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (t: Throwable) {
+            Log.w(TAG, "Could not restore previous video URI cleanly", t)
         }
     }
 
     fun selectVideo(uri: Uri) {
         if (_uiState.value.isProcessing || jobRunningLock.get()) return
         scope.launch {
-            _uiState.update {
-                it.copy(
-                    errorMessage = null,
-                    saveSuccessMessage = null,
-                    enhancementResult = null,
-                    progress = ProcessingProgress(stage = ProcessingStage.IMPORTING, statusDetail = "Reading video metadata...")
-                )
-            }
-            clearInterruptedNotice()
-            val caps = capabilityDetector.detect()
-            val result = pipeline.importAndProbeVideo(uri)
-            result.fold(
-                onSuccess = { metadata ->
-                    prefs.edit().putString(KEY_SELECTED_VIDEO_URI, uri.toString()).apply()
-                    val profiles = _uiState.value.profiles.ifEmpty { profileRepository.loadProfiles() }
-                    val dimsMap = EnhancementMode.entries.associateWith { mode ->
-                        ResolutionCalculator.calculate(metadata, mode, profiles.getValue(mode), caps)
-                    }
-                    _uiState.update {
-                        it.copy(
-                            deviceCapabilities = caps,
-                            profiles = profiles,
-                            selectedVideo = metadata,
-                            computedOutputDimensions = dimsMap,
-                            progress = ProcessingProgress(stage = ProcessingStage.IDLE),
-                            errorMessage = null
-                        )
-                    }
-                },
-                onFailure = { err ->
-                    _uiState.update {
-                        it.copy(
-                            progress = ProcessingProgress(stage = ProcessingStage.ERROR),
-                            errorMessage = err.message ?: "Unable to open selected video."
-                        )
-                    }
+            try {
+                _uiState.update {
+                    it.copy(
+                        errorMessage = null,
+                        saveSuccessMessage = null,
+                        enhancementResult = null,
+                        progress = ProcessingProgress(stage = ProcessingStage.IMPORTING, statusDetail = "Reading video metadata...")
+                    )
                 }
-            )
+                clearInterruptedNotice()
+                val caps = capabilityDetector.detect()
+                val result = pipeline.importAndProbeVideo(uri)
+                result.fold(
+                    onSuccess = { metadata ->
+                        prefs.edit().putString(KEY_SELECTED_VIDEO_URI, uri.toString()).apply()
+                        val profiles = _uiState.value.profiles.ifEmpty { profileRepository.loadProfiles() }
+                        val dimsMap = EnhancementMode.entries.associateWith { mode ->
+                            ResolutionCalculator.calculate(metadata, mode, profiles.getValue(mode), caps)
+                        }
+                        _uiState.update {
+                            it.copy(
+                                deviceCapabilities = caps,
+                                profiles = profiles,
+                                selectedVideo = metadata,
+                                computedOutputDimensions = dimsMap,
+                                progress = ProcessingProgress(stage = ProcessingStage.IDLE),
+                                errorMessage = null
+                            )
+                        }
+                    },
+                    onFailure = { err ->
+                        _uiState.update {
+                            it.copy(
+                                progress = ProcessingProgress(stage = ProcessingStage.ERROR),
+                                errorMessage = err.message ?: "Unable to open selected video."
+                            )
+                        }
+                    }
+                )
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (t: Throwable) {
+                Log.e(TAG, "selectVideo failed safely", t)
+                _uiState.update {
+                    it.copy(
+                        progress = ProcessingProgress(stage = ProcessingStage.ERROR),
+                        errorMessage = t.message ?: "Unable to open selected video."
+                    )
+                }
+            }
         }
     }
 
@@ -337,55 +398,77 @@ class EnhancementSessionCoordinator private constructor(
         if (_uiState.value.isSavingToGallery) return
 
         scope.launch {
-            _uiState.update { it.copy(isSavingToGallery = true, errorMessage = null, saveSuccessMessage = null) }
-            val name = "${result.originalMetadata.displayName.substringBeforeLast('.')}_${result.mode.label}"
-            val saveRes = GallerySaver.saveToMoviesGallery(appContext, result.outputFile, name)
-            saveRes.fold(
-                onSuccess = { savedUri ->
-                    _uiState.update {
-                        it.copy(
-                            isSavingToGallery = false,
-                            enhancementResult = result.copy(savedGalleryUri = savedUri),
-                            saveSuccessMessage = "Saved to Movies/ClearKit (${result.outputDimensions.label})"
-                        )
+            try {
+                _uiState.update { it.copy(isSavingToGallery = true, errorMessage = null, saveSuccessMessage = null) }
+                val name = "${result.originalMetadata.displayName.substringBeforeLast('.')}_${result.mode.label}"
+                val saveRes = GallerySaver.saveToMoviesGallery(appContext, result.outputFile, name)
+                saveRes.fold(
+                    onSuccess = { savedUri ->
+                        _uiState.update {
+                            it.copy(
+                                isSavingToGallery = false,
+                                enhancementResult = result.copy(savedGalleryUri = savedUri),
+                                saveSuccessMessage = "Saved to Movies/ClearKit (${result.outputDimensions.label})"
+                            )
+                        }
+                    },
+                    onFailure = { err ->
+                        _uiState.update {
+                            it.copy(
+                                isSavingToGallery = false,
+                                errorMessage = err.message ?: "Failed to save video to gallery."
+                            )
+                        }
                     }
-                },
-                onFailure = { err ->
-                    _uiState.update {
-                        it.copy(
-                            isSavingToGallery = false,
-                            errorMessage = err.message ?: "Failed to save video to gallery."
-                        )
-                    }
+                )
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (t: Throwable) {
+                _uiState.update {
+                    it.copy(
+                        isSavingToGallery = false,
+                        errorMessage = t.message ?: "Failed to save video to gallery."
+                    )
                 }
-            )
+            }
         }
     }
 
     fun saveToDocumentUri(destUri: Uri) {
         val result = _uiState.value.enhancementResult ?: return
         scope.launch {
-            _uiState.update { it.copy(isSavingToGallery = true, errorMessage = null, saveSuccessMessage = null) }
-            val copyRes = GallerySaver.copyToUri(appContext, result.outputFile, destUri)
-            copyRes.fold(
-                onSuccess = {
-                    _uiState.update {
-                        it.copy(
-                            isSavingToGallery = false,
-                            enhancementResult = result.copy(savedGalleryUri = destUri),
-                            saveSuccessMessage = "Enhanced video exported successfully."
-                        )
+            try {
+                _uiState.update { it.copy(isSavingToGallery = true, errorMessage = null, saveSuccessMessage = null) }
+                val copyRes = GallerySaver.copyToUri(appContext, result.outputFile, destUri)
+                copyRes.fold(
+                    onSuccess = {
+                        _uiState.update {
+                            it.copy(
+                                isSavingToGallery = false,
+                                enhancementResult = result.copy(savedGalleryUri = destUri),
+                                saveSuccessMessage = "Enhanced video exported successfully."
+                            )
+                        }
+                    },
+                    onFailure = { err ->
+                        _uiState.update {
+                            it.copy(
+                                isSavingToGallery = false,
+                                errorMessage = err.message ?: "Failed to export video."
+                            )
+                        }
                     }
-                },
-                onFailure = { err ->
-                    _uiState.update {
-                        it.copy(
-                            isSavingToGallery = false,
-                            errorMessage = err.message ?: "Failed to export video."
-                        )
-                    }
+                )
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (t: Throwable) {
+                _uiState.update {
+                    it.copy(
+                        isSavingToGallery = false,
+                        errorMessage = t.message ?: "Failed to export video."
+                    )
                 }
-            )
+            }
         }
     }
 
@@ -398,14 +481,27 @@ class EnhancementSessionCoordinator private constructor(
         if (_uiState.value.isProcessing || jobRunningLock.get() || _uiState.value.isBenchmarkingHardware) return
         scope.launch {
             _uiState.update { it.copy(isBenchmarkingHardware = true, errorMessage = null) }
-            val caps = capabilityDetector.detect()
-            val health = pipeline.initializeAndCheckHealth(caps, forceRebenchmark = true)
-            _uiState.update {
-                it.copy(
-                    deviceCapabilities = caps,
-                    engineHealth = health,
-                    isBenchmarkingHardware = false
-                )
+            try {
+                val caps = capabilityDetector.detect()
+                val health = pipeline.initializeAndCheckHealth(caps, forceRebenchmark = true)
+                _uiState.update {
+                    it.copy(
+                        deviceCapabilities = caps,
+                        engineHealth = health,
+                        isBenchmarkingHardware = false
+                    )
+                }
+            } catch (ce: CancellationException) {
+                _uiState.update { it.copy(isBenchmarkingHardware = false) }
+                throw ce
+            } catch (t: Throwable) {
+                Log.e(TAG, "Hardware benchmark failed safely", t)
+                _uiState.update {
+                    it.copy(
+                        isBenchmarkingHardware = false,
+                        errorMessage = t.message ?: "Hardware benchmark failed."
+                    )
+                }
             }
         }
     }
@@ -439,6 +535,7 @@ class EnhancementSessionCoordinator private constructor(
     }
 
     companion object {
+        private const val TAG = "ClearKitCoordinator"
         private const val PREFS_NAME = "luminasr_session_state"
         private const val KEY_SELECTED_VIDEO_URI = "selected_video_uri"
         private const val KEY_SELECTED_MODE = "selected_mode"

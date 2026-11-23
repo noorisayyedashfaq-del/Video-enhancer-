@@ -75,7 +75,11 @@ class GlesGpuImageProcessor {
                 probeFailed.set(true)
                 return false
             }
-            val config = configs[0]!!
+            val config = configs[0] ?: run {
+                release()
+                probeFailed.set(true)
+                return false
+            }
 
             val contextAttribs = intArrayOf(
                 EGL14.EGL_CONTEXT_CLIENT_VERSION, 3,

@@ -5,6 +5,8 @@ import android.content.Context
 import android.content.Intent
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
+import android.os.Handler
+import android.os.Looper
 import android.provider.Settings
 import android.util.Log
 import com.google.android.gms.ads.AdError
@@ -14,6 +16,12 @@ import com.google.android.gms.ads.LoadAdError
 import com.google.android.gms.ads.MobileAds
 import com.google.android.gms.ads.interstitial.InterstitialAd
 import com.google.android.gms.ads.interstitial.InterstitialAdLoadCallback
+import kotlinx.coroutines.CoroutineExceptionHandler
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
+import java.util.concurrent.atomic.AtomicBoolean
 
 enum class AdGateDecision {
     SHOW_INTERNET_DIALOG,
@@ -44,6 +52,13 @@ object AdManager {
     // Google's official Test Interstitial Ad Unit ID
     const val TEST_INTERSTITIAL_AD_UNIT_ID = "ca-app-pub-3940256099942544/1033173712"
 
+    private val adInitHandler = CoroutineExceptionHandler { _, throwable ->
+        Log.e(TAG, "Unhandled AdManager init exception", throwable)
+    }
+    private val adScope = CoroutineScope(SupervisorJob() + Dispatchers.IO + adInitHandler)
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val initInProgress = AtomicBoolean(false)
+
     @Volatile
     private var isSdkInitialized: Boolean = false
 
@@ -59,14 +74,22 @@ object AdManager {
             loadAdIfNeeded(appContext)
             return
         }
-        try {
-            MobileAds.initialize(appContext) {
-                isSdkInitialized = true
-                Log.d(TAG, "AdMob SDK initialized")
-                loadAdIfNeeded(appContext)
+        if (!initInProgress.compareAndSet(false, true)) return
+
+        adScope.launch {
+            try {
+                MobileAds.initialize(appContext) {
+                    isSdkInitialized = true
+                    initInProgress.set(false)
+                    Log.d(TAG, "AdMob SDK initialized")
+                    mainHandler.post {
+                        loadAdIfNeeded(appContext)
+                    }
+                }
+            } catch (t: Throwable) {
+                initInProgress.set(false)
+                Log.e(TAG, "AdMob initialization failed", t)
             }
-        } catch (t: Throwable) {
-            Log.e(TAG, "AdMob initialization failed", t)
         }
     }
 
@@ -74,39 +97,51 @@ object AdManager {
 
     fun isAdLoading(): Boolean = isLoading
 
+    fun isSdkReady(): Boolean = isSdkInitialized
+
     fun loadAdIfNeeded(context: Context) {
         val appContext = context.applicationContext
+        if (!isSdkInitialized) {
+            // Avoid calling InterstitialAd.load before MobileAds.initialize finishes on cold start
+            if (!initInProgress.get()) {
+                initialize(appContext)
+            }
+            return
+        }
         if (interstitialAd != null || isLoading) return
         if (!isInternetAvailable(appContext)) {
             Log.d(TAG, "Skipping ad load: internet unavailable")
             return
         }
 
-        isLoading = true
-        val adRequest = AdRequest.Builder().build()
-        try {
-            InterstitialAd.load(
-                appContext,
-                TEST_INTERSTITIAL_AD_UNIT_ID,
-                adRequest,
-                object : InterstitialAdLoadCallback() {
-                    override fun onAdLoaded(ad: InterstitialAd) {
-                        interstitialAd = ad
-                        isLoading = false
-                        Log.d(TAG, "Test Interstitial Ad loaded and ready")
-                    }
+        mainHandler.post {
+            if (interstitialAd != null || isLoading || !isSdkInitialized) return@post
+            isLoading = true
+            try {
+                val adRequest = AdRequest.Builder().build()
+                InterstitialAd.load(
+                    appContext,
+                    TEST_INTERSTITIAL_AD_UNIT_ID,
+                    adRequest,
+                    object : InterstitialAdLoadCallback() {
+                        override fun onAdLoaded(ad: InterstitialAd) {
+                            interstitialAd = ad
+                            isLoading = false
+                            Log.d(TAG, "Test Interstitial Ad loaded and ready")
+                        }
 
-                    override fun onAdFailedToLoad(loadAdError: LoadAdError) {
-                        interstitialAd = null
-                        isLoading = false
-                        Log.w(TAG, "Interstitial Ad failed to load: ${loadAdError.message} (code=${loadAdError.code})")
+                        override fun onAdFailedToLoad(loadAdError: LoadAdError) {
+                            interstitialAd = null
+                            isLoading = false
+                            Log.w(TAG, "Interstitial Ad failed to load: ${loadAdError.message} (code=${loadAdError.code})")
+                        }
                     }
-                }
-            )
-        } catch (t: Throwable) {
-            interstitialAd = null
-            isLoading = false
-            Log.e(TAG, "Exception while requesting Interstitial Ad load", t)
+                )
+            } catch (t: Throwable) {
+                interstitialAd = null
+                isLoading = false
+                Log.e(TAG, "Exception while requesting Interstitial Ad load", t)
+            }
         }
     }
 
@@ -146,19 +181,30 @@ object AdManager {
             }
         }
 
-        ad.show(activity)
+        try {
+            ad.show(activity)
+        } catch (t: Throwable) {
+            Log.e(TAG, "Failed to display Interstitial Ad", t)
+            loadAdIfNeeded(activity.applicationContext)
+            onAdFailedToShow()
+        }
     }
 
     fun isInternetAvailable(context: Context): Boolean {
-        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
-            ?: return false
-        val network = cm.activeNetwork ?: return false
-        val capabilities = cm.getNetworkCapabilities(network) ?: return false
-        return capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
-            (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
-                capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) ||
-                capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) ||
-                capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN))
+        return try {
+            val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+                ?: return false
+            val network = cm.activeNetwork ?: return false
+            val capabilities = cm.getNetworkCapabilities(network) ?: return false
+            capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+                (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
+                    capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) ||
+                    capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) ||
+                    capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN))
+        } catch (t: Throwable) {
+            Log.w(TAG, "Failed checking internet connectivity", t)
+            false
+        }
     }
 
     fun openWifiSettings(context: Context) {

@@ -168,7 +168,7 @@ class OnnxAiInferenceEngine(private val context: Context) {
             File(modelDir, "face_enhancement/face_detection_yunet_2023mar.onnx")
         )
 
-        glesGpuAvailable = gpuProcessor.ensureInitialized(logger)
+        glesGpuAvailable = runCatching { gpuProcessor.ensureInitialized(logger) }.getOrDefault(false)
 
         if (forceRebenchmark) {
             closeModelSessionsOnly()
@@ -1199,11 +1199,25 @@ class OnnxAiInferenceEngine(private val context: Context) {
 
     private fun ensureAssetCopied(assetPath: String, destFile: File): File {
         destFile.parentFile?.mkdirs()
-        if (!destFile.exists() || destFile.length() == 0L) {
-            context.assets.open(assetPath).use { input ->
-                destFile.outputStream().use { output ->
-                    input.copyTo(output)
-                }
+        val expectedLength = runCatching {
+            context.assets.openFd(assetPath).use { it.length }
+        }.getOrDefault(-1L)
+        if (destFile.exists() && destFile.length() > 0L && (expectedLength <= 0L || destFile.length() == expectedLength)) {
+            return destFile
+        }
+        val tmpFile = File(destFile.parentFile, "${destFile.name}.tmp")
+        if (tmpFile.exists()) tmpFile.delete()
+        context.assets.open(assetPath).use { input ->
+            tmpFile.outputStream().use { output ->
+                input.copyTo(output)
+                output.flush()
+            }
+        }
+        if (tmpFile.exists() && tmpFile.length() > 0L) {
+            if (destFile.exists()) destFile.delete()
+            if (!tmpFile.renameTo(destFile)) {
+                tmpFile.copyTo(destFile, overwrite = true)
+                tmpFile.delete()
             }
         }
         return destFile

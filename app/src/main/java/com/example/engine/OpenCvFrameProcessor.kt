@@ -88,17 +88,33 @@ class OpenCvFrameProcessor(
         }
         if (openCvInitialized && faceDetectorPath == null) {
             try {
-                val dest = File(context.filesDir, "ai_models/face_enhancement/face_detection_yunet_2023mar.onnx")
+                val assetPath = "ai_models/face_enhancement/face_detection_yunet_2023mar.onnx"
+                val dest = File(context.filesDir, assetPath)
                 dest.parentFile?.mkdirs()
-                if (!dest.exists() || dest.length() == 0L) {
-                    context.assets.open("ai_models/face_enhancement/face_detection_yunet_2023mar.onnx").use { inp ->
-                        dest.outputStream().use { out -> inp.copyTo(out) }
+                val expectedLen = runCatching {
+                    context.assets.openFd(assetPath).use { it.length }
+                }.getOrDefault(-1L)
+                if (!dest.exists() || dest.length() == 0L || (expectedLen > 0L && dest.length() != expectedLen)) {
+                    val tmp = File(dest.parentFile, "${dest.name}.tmp")
+                    if (tmp.exists()) tmp.delete()
+                    context.assets.open(assetPath).use { inp ->
+                        tmp.outputStream().use { out ->
+                            inp.copyTo(out)
+                            out.flush()
+                        }
+                    }
+                    if (tmp.exists() && tmp.length() > 0L) {
+                        if (dest.exists()) dest.delete()
+                        if (!tmp.renameTo(dest)) {
+                            tmp.copyTo(dest, overwrite = true)
+                            tmp.delete()
+                        }
                     }
                 }
                 if (dest.exists() && dest.length() > 0L) {
                     faceDetectorPath = dest.absolutePath
                 }
-            } catch (_: Exception) {
+            } catch (_: Throwable) {
             }
         }
         return openCvInitialized
