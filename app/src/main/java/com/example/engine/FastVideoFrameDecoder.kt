@@ -11,27 +11,176 @@ import org.opencv.core.Mat
 import org.opencv.imgproc.Imgproc
 import java.io.File
 import java.nio.ByteBuffer
+import java.util.ArrayDeque
+
+enum class YuvFastLayout {
+    NV12,
+    NV21,
+    PLANAR_I420
+}
+
+/**
+ * Pure JVM-testable YUV packing & semi-planar layout heuristics for zero-disk MediaCodec decoding.
+ */
+object FastYuvCopyMath {
+
+    fun detectLayout(
+        uPixelStride: Int,
+        vPixelStride: Int,
+        uRemaining: Int,
+        vRemaining: Int,
+        uProbe0: Byte,
+        uProbe1: Byte,
+        uProbe2: Byte,
+        uProbe3: Byte,
+        vProbe0: Byte,
+        vProbe1: Byte,
+        vProbe2: Byte,
+        vProbe3: Byte
+    ): YuvFastLayout {
+        if (uPixelStride == 2 && vPixelStride == 2) {
+            if (uRemaining > vRemaining) return YuvFastLayout.NV12
+            if (vRemaining > uRemaining) return YuvFastLayout.NV21
+            val looksNv12 = (uProbe1 == vProbe0) && (uProbe3 == vProbe2)
+            val looksNv21 = (vProbe1 == uProbe0) && (vProbe3 == uProbe2)
+            if (looksNv12 && !looksNv21) return YuvFastLayout.NV12
+            if (looksNv21 && !looksNv12) return YuvFastLayout.NV21
+        }
+        return YuvFastLayout.PLANAR_I420
+    }
+
+    fun copySemiPlanarUvPlane(
+        interleavedBuf: ByteBuffer,
+        cropLeftHalf: Int,
+        cropTopHalf: Int,
+        uvWidth: Int,
+        uvHeight: Int,
+        rowStride: Int,
+        dst: ByteArray,
+        dstOffset: Int
+    ) {
+        val buf = interleavedBuf.duplicate()
+        val rowBytes = uvWidth * 2
+        if (rowStride == rowBytes && cropLeftHalf == 0 && cropTopHalf == 0) {
+            buf.position(0)
+            val needed = rowBytes * uvHeight
+            val avail = buf.remaining().coerceAtMost(needed)
+            buf.get(dst, dstOffset, avail)
+            return
+        }
+        val limit = buf.limit()
+        var outPos = dstOffset
+        for (r in 0 until uvHeight) {
+            val srcPos = (cropTopHalf + r) * rowStride + cropLeftHalf * 2
+            val avail = (limit - srcPos).coerceAtLeast(0).coerceAtMost(rowBytes)
+            if (avail > 0) {
+                buf.position(srcPos)
+                buf.get(dst, outPos, avail)
+            }
+            outPos += rowBytes
+        }
+    }
+
+    fun copyPlanarOrStridedPlane(
+        bufSource: ByteBuffer,
+        rowStride: Int,
+        pixelStride: Int,
+        cropLeft: Int,
+        cropTop: Int,
+        width: Int,
+        height: Int,
+        dst: ByteArray,
+        dstOffset: Int
+    ) {
+        val buf = bufSource.duplicate()
+        var outPos = dstOffset
+
+        if (pixelStride == 1 && rowStride == width && cropLeft == 0 && cropTop == 0) {
+            buf.position(0)
+            val needed = width * height
+            val avail = buf.remaining().coerceAtMost(needed)
+            buf.get(dst, dstOffset, avail)
+            return
+        }
+
+        val limit = buf.limit()
+        if (pixelStride == 1) {
+            for (r in 0 until height) {
+                val srcPos = (cropTop + r) * rowStride + cropLeft
+                val avail = (limit - srcPos).coerceAtLeast(0).coerceAtMost(width)
+                if (avail > 0) {
+                    buf.position(srcPos)
+                    buf.get(dst, outPos, avail)
+                }
+                outPos += width
+            }
+        } else {
+            val rowTmp = ByteArray(((width - 1) * pixelStride + 1).coerceAtLeast(1))
+            for (r in 0 until height) {
+                val srcPos = (cropTop + r) * rowStride + cropLeft * pixelStride
+                val readLen = rowTmp.size.coerceAtMost((limit - srcPos).coerceAtLeast(0))
+                if (readLen > 0) {
+                    buf.position(srcPos)
+                    buf.get(rowTmp, 0, readLen)
+                    for (c in 0 until width) {
+                        val sIdx = c * pixelStride
+                        dst[outPos + c] = if (sIdx < readLen) rowTmp[sIdx] else 0
+                    }
+                }
+                outPos += width
+            }
+        }
+    }
+}
 
 /**
  * High-speed zero-disk hardware video decoder built on MediaExtractor + MediaCodec.
- * Decodes directly into YUV_420_888 Images and converts in-memory to OpenCV BGR Mat,
- * eliminating disk JPEG/PNG write+read overhead.
+ * Features:
+ * - Bulk NV12 / NV21 semi-planar fast-path (avoids slow per-pixel UV loops)
+ * - Synchronized BGR Mat ring pool (reuses native C++ frame Mats across frames)
  */
 class FastVideoFrameDecoder(
     private val videoFile: File,
     private val rotationDegrees: Int
 ) {
-    private var i420Bytes = ByteArray(0)
+    private var yuvBytes = ByteArray(0)
     private var yuvMat: Mat? = null
 
-    /**
-     * Streams decoded BGR Mats sequentially into [onFrame].
-     * Caller MUST invoke [releaseMat] or call `.release()` immediately inside [onFrame] if copied,
-     * though each yielded [Mat] is freshly created so ownership transfers cleanly to caller.
-     *
-     * Returns total number of frames decoded, or throws if MediaCodec cannot decode cleanly
-     * so caller can safely fall back to FFmpegKit.
-     */
+    private val poolLock = Any()
+    private val bgrPool = ArrayDeque<Mat>(4)
+
+    fun recycleMat(mat: Mat?) {
+        if (mat == null || mat.empty()) return
+        synchronized(poolLock) {
+            if (bgrPool.size < 4) {
+                bgrPool.addLast(mat)
+            } else {
+                mat.release()
+            }
+        }
+    }
+
+    private fun obtainReusableBgrMat(h: Int, w: Int): Mat {
+        synchronized(poolLock) {
+            while (bgrPool.isNotEmpty()) {
+                val m = bgrPool.removeFirst()
+                if (m.rows() == h && m.cols() == w && m.type() == CvType.CV_8UC3) {
+                    return m
+                }
+                m.release()
+            }
+        }
+        return Mat(h, w, CvType.CV_8UC3)
+    }
+
+    private fun clearMatPool() {
+        synchronized(poolLock) {
+            while (bgrPool.isNotEmpty()) {
+                bgrPool.removeFirst().release()
+            }
+        }
+    }
+
     fun decodeAllFrames(
         isCancelled: () -> Boolean,
         onFrame: (frameIndex: Int, bgrMat: Mat, ptsUs: Long) -> Unit
@@ -101,8 +250,7 @@ class FastVideoFrameDecoder(
                             val image = codec.getOutputImage(outIdx)
                             if (image != null) {
                                 try {
-                                    val outFormat = codec.outputFormat
-                                    val bgrMat = imageYuv420ToBgrMat(image, outFormat, rotationDegrees)
+                                    val bgrMat = imageYuv420ToBgrMat(image, rotationDegrees)
                                     onFrame(framesDecoded, bgrMat, bufferInfo.presentationTimeUs)
                                     framesDecoded++
                                 } finally {
@@ -121,7 +269,6 @@ class FastVideoFrameDecoder(
                     outIdx == MediaCodec.INFO_TRY_AGAIN_LATER -> {
                         idlePolls++
                         if (idlePolls > 600 && inputDone) {
-                            // Guard against rare decoder EOS hang once input has completed
                             outputDone = true
                         }
                     }
@@ -131,7 +278,8 @@ class FastVideoFrameDecoder(
         } finally {
             yuvMat?.release()
             yuvMat = null
-            i420Bytes = ByteArray(0)
+            yuvBytes = ByteArray(0)
+            clearMatPool()
             try {
                 codec?.stop()
             } catch (_: Throwable) {
@@ -149,7 +297,6 @@ class FastVideoFrameDecoder(
 
     private fun imageYuv420ToBgrMat(
         image: Image,
-        outputFormat: MediaFormat,
         rotationDeg: Int
     ): Mat {
         val crop = image.cropRect
@@ -161,110 +308,126 @@ class FastVideoFrameDecoder(
         val ySize = w * h
         val uvSize = ySize / 4
         val totalLen = ySize + 2 * uvSize
-        if (i420Bytes.size != totalLen) {
-            i420Bytes = ByteArray(totalLen)
+        if (yuvBytes.size != totalLen) {
+            yuvBytes = ByteArray(totalLen)
             yuvMat?.release()
             yuvMat = Mat(h + h / 2, w, CvType.CV_8UC1)
         }
 
         val planes = image.planes
-        copyPlaneToI420(
-            plane = planes[0],
+        FastYuvCopyMath.copyPlanarOrStridedPlane(
+            bufSource = planes[0].buffer,
+            rowStride = planes[0].rowStride,
+            pixelStride = planes[0].pixelStride,
             cropLeft = crop.left,
             cropTop = crop.top,
             width = w,
             height = h,
-            dst = i420Bytes,
+            dst = yuvBytes,
             dstOffset = 0
         )
-        copyPlaneToI420(
-            plane = planes[1],
-            cropLeft = crop.left / 2,
-            cropTop = crop.top / 2,
-            width = w / 2,
-            height = h / 2,
-            dst = i420Bytes,
-            dstOffset = ySize
-        )
-        copyPlaneToI420(
-            plane = planes[2],
-            cropLeft = crop.left / 2,
-            cropTop = crop.top / 2,
-            width = w / 2,
-            height = h / 2,
-            dst = i420Bytes,
-            dstOffset = ySize + uvSize
-        )
 
-        val localYuv = yuvMat ?: Mat(h + h / 2, w, CvType.CV_8UC1).also { yuvMat = it }
-        localYuv.put(0, 0, i420Bytes)
-        val bgr = Mat(h, w, CvType.CV_8UC3)
-        Imgproc.cvtColor(localYuv, bgr, Imgproc.COLOR_YUV2BGR_I420)
+        val uPlane = planes[1]
+        val vPlane = planes[2]
+        val uBuf = uPlane.buffer
+        val vBuf = vPlane.buffer
+        val layout = if (uPlane.pixelStride == 2 && vPlane.pixelStride == 2 && uBuf.remaining() >= 4 && vBuf.remaining() >= 4) {
+            FastYuvCopyMath.detectLayout(
+                uPixelStride = uPlane.pixelStride,
+                vPixelStride = vPlane.pixelStride,
+                uRemaining = uBuf.remaining(),
+                vRemaining = vBuf.remaining(),
+                uProbe0 = uBuf.get(0),
+                uProbe1 = uBuf.get(1),
+                uProbe2 = uBuf.get(2),
+                uProbe3 = uBuf.get(3),
+                vProbe0 = vBuf.get(0),
+                vProbe1 = vBuf.get(1),
+                vProbe2 = vBuf.get(2),
+                vProbe3 = vBuf.get(3)
+            )
+        } else {
+            YuvFastLayout.PLANAR_I420
+        }
 
         val normRot = ((rotationDeg % 360) + 360) % 360
-        if (normRot == 90 || normRot == 180 || normRot == 270) {
-            val rotated = Mat()
-            val code = when (normRot) {
-                90 -> Core.ROTATE_90_CLOCKWISE
-                180 -> Core.ROTATE_180
-                else -> Core.ROTATE_90_COUNTERCLOCKWISE
+        val needRotate = normRot == 90 || normRot == 180 || normRot == 270
+        val outW = if (normRot == 90 || normRot == 270) h else w
+        val outH = if (normRot == 90 || normRot == 270) w else h
+
+        val cvColorCode = when (layout) {
+            YuvFastLayout.NV12 -> {
+                FastYuvCopyMath.copySemiPlanarUvPlane(
+                    interleavedBuf = uBuf,
+                    cropLeftHalf = crop.left / 2,
+                    cropTopHalf = crop.top / 2,
+                    uvWidth = w / 2,
+                    uvHeight = h / 2,
+                    rowStride = uPlane.rowStride,
+                    dst = yuvBytes,
+                    dstOffset = ySize
+                )
+                Imgproc.COLOR_YUV2BGR_NV12
             }
-            Core.rotate(bgr, rotated, code)
-            bgr.release()
-            return rotated
-        }
-        return bgr
-    }
-
-    private fun copyPlaneToI420(
-        plane: Image.Plane,
-        cropLeft: Int,
-        cropTop: Int,
-        width: Int,
-        height: Int,
-        dst: ByteArray,
-        dstOffset: Int
-    ) {
-        val buf = plane.buffer.duplicate()
-        val rowStride = plane.rowStride
-        val pixelStride = plane.pixelStride
-        var outPos = dstOffset
-
-        if (pixelStride == 1 && rowStride == width && cropLeft == 0 && cropTop == 0) {
-            buf.position(0)
-            val needed = width * height
-            val avail = buf.remaining().coerceAtMost(needed)
-            buf.get(dst, dstOffset, avail)
-            return
-        }
-
-        val limit = buf.limit()
-        if (pixelStride == 1) {
-            for (r in 0 until height) {
-                val srcPos = (cropTop + r) * rowStride + cropLeft
-                if (srcPos + width <= limit) {
-                    buf.position(srcPos)
-                    buf.get(dst, outPos, width)
-                }
-                outPos += width
+            YuvFastLayout.NV21 -> {
+                FastYuvCopyMath.copySemiPlanarUvPlane(
+                    interleavedBuf = vBuf,
+                    cropLeftHalf = crop.left / 2,
+                    cropTopHalf = crop.top / 2,
+                    uvWidth = w / 2,
+                    uvHeight = h / 2,
+                    rowStride = vPlane.rowStride,
+                    dst = yuvBytes,
+                    dstOffset = ySize
+                )
+                Imgproc.COLOR_YUV2BGR_NV21
             }
-        } else {
-            val rowTmp = ByteArray((width - 1) * pixelStride + 1)
-            for (r in 0 until height) {
-                val srcPos = (cropTop + r) * rowStride + cropLeft * pixelStride
-                val readLen = rowTmp.size.coerceAtMost((limit - srcPos).coerceAtLeast(0))
-                if (readLen > 0) {
-                    buf.position(srcPos)
-                    buf.get(rowTmp, 0, readLen)
-                    var cIdx = 0
-                    for (c in 0 until width) {
-                        val sIdx = c * pixelStride
-                        dst[outPos + c] = if (sIdx < readLen) rowTmp[sIdx] else 0
-                        cIdx++
-                    }
-                }
-                outPos += width
+            YuvFastLayout.PLANAR_I420 -> {
+                FastYuvCopyMath.copyPlanarOrStridedPlane(
+                    bufSource = uBuf,
+                    rowStride = uPlane.rowStride,
+                    pixelStride = uPlane.pixelStride,
+                    cropLeft = crop.left / 2,
+                    cropTop = crop.top / 2,
+                    width = w / 2,
+                    height = h / 2,
+                    dst = yuvBytes,
+                    dstOffset = ySize
+                )
+                FastYuvCopyMath.copyPlanarOrStridedPlane(
+                    bufSource = vBuf,
+                    rowStride = vPlane.rowStride,
+                    pixelStride = vPlane.pixelStride,
+                    cropLeft = crop.left / 2,
+                    cropTop = crop.top / 2,
+                    width = w / 2,
+                    height = h / 2,
+                    dst = yuvBytes,
+                    dstOffset = ySize + uvSize
+                )
+                Imgproc.COLOR_YUV2BGR_I420
             }
         }
+
+        val localYuv = yuvMat ?: Mat(h + h / 2, w, CvType.CV_8UC1).also { yuvMat = it }
+        localYuv.put(0, 0, yuvBytes)
+
+        if (!needRotate) {
+            val outBgr = obtainReusableBgrMat(h, w)
+            Imgproc.cvtColor(localYuv, outBgr, cvColorCode)
+            return outBgr
+        }
+
+        val unrotatedBgr = Mat(h, w, CvType.CV_8UC3)
+        Imgproc.cvtColor(localYuv, unrotatedBgr, cvColorCode)
+        val rotated = obtainReusableBgrMat(outH, outW)
+        val rotCode = when (normRot) {
+            90 -> Core.ROTATE_90_CLOCKWISE
+            180 -> Core.ROTATE_180
+            else -> Core.ROTATE_90_COUNTERCLOCKWISE
+        }
+        Core.rotate(unrotatedBgr, rotated, rotCode)
+        unrotatedBgr.release()
+        return rotated
     }
 }

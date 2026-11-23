@@ -9,12 +9,17 @@ import android.media.MediaMuxer
 import android.os.Build
 import android.view.Surface
 import java.io.File
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import java.util.concurrent.Future
+import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.roundToInt
 
 /**
  * Streaming MediaCodec + MediaMuxer video encoder using COLOR_FormatSurface.
- * Attempts preferred codec (H.265 hardware -> H.264 hardware -> software MediaCodec fallback)
- * while maintaining exact source FPS via deterministic presentation timestamps.
+ * Supports double-buffered asynchronous surface encoding via [enqueueFrameAsync]
+ * so hardware video encoding overlaps concurrently with the next frame's AI inference.
  */
 class HardwareVideoEncoder(
     private val outputFile: File,
@@ -31,8 +36,16 @@ class HardwareVideoEncoder(
     private var muxerStarted: Boolean = false
     private val bufferInfo = MediaCodec.BufferInfo()
 
+    private var encodeExecutor: ExecutorService? = null
+    private var pendingEncodeFuture: Future<*>? = null
+    private val asyncError = AtomicReference<Throwable?>(null)
+
     var activeCodecLabel: String = "H.264"
         private set
+
+    private var outputFrameCounter: Long = 0L
+    private val totalEncodeTimeMsAtomic = AtomicLong(0L)
+    val totalEncodeTimeMs: Long get() = totalEncodeTimeMsAtomic.get()
 
     fun start() {
         val candidates = buildList {
@@ -55,6 +68,9 @@ class HardwareVideoEncoder(
                     } else {
                         if (requireHardware) "H.264 (Hardware)" else "H.264 (Software)"
                     }
+                    encodeExecutor = Executors.newSingleThreadExecutor { r ->
+                        Thread(r, "ClearKit-HwEncoder").apply { isDaemon = true }
+                    }
                     return
                 }
             } catch (t: Throwable) {
@@ -64,10 +80,6 @@ class HardwareVideoEncoder(
         }
         throw IllegalStateException("Unable to initialize video encoder for ${width}x${height}: ${lastError?.message}", lastError)
     }
-
-    private var outputFrameCounter: Long = 0L
-    var totalEncodeTimeMs: Long = 0L
-        private set
 
     private fun tryConfigure(mime: String, requireHardware: Boolean): Boolean {
         val codecInfo = findMatchingEncoder(mime, requireHardware) ?: return false
@@ -79,6 +91,10 @@ class HardwareVideoEncoder(
             val caps = runCatching { codecInfo.getCapabilitiesForType(mime).encoderCapabilities }.getOrNull()
             if (caps?.isBitrateModeSupported(MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR) == true) {
                 setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                setInteger(MediaFormat.KEY_PRIORITY, 0)
+                setInteger(MediaFormat.KEY_OPERATING_RATE, 120)
             }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
@@ -99,11 +115,50 @@ class HardwareVideoEncoder(
         videoTrackIndex = -1
         muxerStarted = false
         outputFrameCounter = 0L
-        totalEncodeTimeMs = 0L
+        totalEncodeTimeMsAtomic.set(0L)
+        asyncError.set(null)
         return true
     }
 
+    /**
+     * Overlaps encoding of [bitmap] (double-buffered ping-pong bitmap) with AI processing of the next frame.
+     * Waits only if the previous asynchronous encode has not yet finished drawing to the encoder Surface.
+     */
+    fun enqueueFrameAsync(bitmap: Bitmap, frameIndex: Int) {
+        awaitPendingEncode()
+        val exec = encodeExecutor
+        if (exec == null || exec.isShutdown) {
+            encodeFrameInternal(bitmap)
+            return
+        }
+        pendingEncodeFuture = exec.submit {
+            try {
+                encodeFrameInternal(bitmap)
+            } catch (t: Throwable) {
+                asyncError.compareAndSet(null, t)
+            }
+        }
+    }
+
+    fun awaitPendingEncode() {
+        val fut = pendingEncodeFuture
+        pendingEncodeFuture = null
+        if (fut != null) {
+            try {
+                fut.get()
+            } catch (t: Throwable) {
+                asyncError.compareAndSet(null, t)
+            }
+        }
+        asyncError.getAndSet(null)?.let { throw it }
+    }
+
     fun encodeFrame(bitmap: Bitmap, frameIndex: Int) {
+        awaitPendingEncode()
+        encodeFrameInternal(bitmap)
+    }
+
+    private fun encodeFrameInternal(bitmap: Bitmap) {
         val t0 = System.currentTimeMillis()
         val surface = inputSurface ?: throw IllegalStateException("Encoder surface not initialized")
         val canvas = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
@@ -117,20 +172,21 @@ class HardwareVideoEncoder(
             surface.unlockCanvasAndPost(canvas)
         }
         drainEncoder(endOfStream = false)
-        totalEncodeTimeMs += (System.currentTimeMillis() - t0)
+        totalEncodeTimeMsAtomic.addAndGet(System.currentTimeMillis() - t0)
     }
 
     fun finish() {
         val t0 = System.currentTimeMillis()
         val codec = mediaCodec ?: return
         try {
+            awaitPendingEncode()
             codec.signalEndOfInputStream()
             drainEncoder(endOfStream = true)
             if (outputFrameCounter == 0L) {
                 throw IllegalStateException("Encoder produced 0 output frames for ${width}x${height} ($activeCodecLabel)")
             }
         } finally {
-            totalEncodeTimeMs += (System.currentTimeMillis() - t0)
+            totalEncodeTimeMsAtomic.addAndGet(System.currentTimeMillis() - t0)
             releaseInternal()
         }
     }
@@ -157,7 +213,6 @@ class HardwareVideoEncoder(
                     if (!endOfStream) break
                     eosTryAgainCount++
                     if (eosTryAgainCount > 300 || System.nanoTime() > eosDeadlineNs) {
-                        // Guard against hardware MediaCodec EOS deadlocks on some devices
                         break
                     }
                 }
@@ -205,6 +260,11 @@ class HardwareVideoEncoder(
     }
 
     private fun releaseInternal() {
+        pendingEncodeFuture?.cancel(true)
+        pendingEncodeFuture = null
+        encodeExecutor?.shutdownNow()
+        encodeExecutor = null
+
         try {
             inputSurface?.release()
         } catch (_: Exception) {

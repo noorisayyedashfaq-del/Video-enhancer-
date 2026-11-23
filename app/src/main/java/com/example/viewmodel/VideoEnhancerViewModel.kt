@@ -46,4 +46,8 @@ class VideoEnhancerViewModel(application: Application) : AndroidViewModel(applic
     fun clearError() {
         coordinator.clearError()
     }
+
+    fun onRebenchmarkHardware() {
+        coordinator.rebenchmarkHardware()
+    }
 }

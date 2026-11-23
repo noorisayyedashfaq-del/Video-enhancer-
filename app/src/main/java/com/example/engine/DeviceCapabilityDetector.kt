@@ -12,11 +12,14 @@ import android.os.BatteryManager
 import android.os.Build
 import android.os.PowerManager
 import android.os.StatFs
+import com.example.model.CpuTopologyInfo
 import com.example.model.DeviceCapabilities
 import com.example.model.DeviceProfileTier
 import com.example.model.DeviceProfilesRoot
+import com.example.model.HardwareProbeSnapshot
 import com.example.model.ThermalState
 import kotlinx.serialization.json.Json
+import java.io.File
 import kotlin.math.roundToInt
 
 class DeviceCapabilityDetector(private val context: Context) {
@@ -31,35 +34,16 @@ class DeviceCapabilityDetector(private val context: Context) {
 
         val totalRamMb = (memInfo.totalMem / (1024L * 1024L)).coerceAtLeast(1024L)
         val availableRamMb = (memInfo.availMem / (1024L * 1024L)).coerceAtLeast(256L)
-        val cpuCores = Runtime.getRuntime().availableProcessors().coerceAtLeast(2)
+        val cpuTopology = detectCpuTopology()
+        val cpuCores = cpuTopology.totalCores
 
         val abis = Build.SUPPORTED_ABIS?.toList().orEmpty()
         val primaryAbi = abis.firstOrNull() ?: "unknown"
 
-        val pm = context.packageManager
-        val vulkanSupported = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            pm.hasSystemFeature(PackageManager.FEATURE_VULKAN_HARDWARE_LEVEL)
-        } else {
-            false
-        }
-        val vulkanVersionLabel = if (vulkanSupported && Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            val verInfo = pm.systemAvailableFeatures.firstOrNull {
-                it.name == PackageManager.FEATURE_VULKAN_HARDWARE_VERSION
-            }
-            if (verInfo != null) {
-                val major = (verInfo.version ushr 22) and 0x3FF
-                val minor = (verInfo.version ushr 12) and 0x3FF
-                "Vulkan $major.$minor"
-            } else {
-                "Vulkan 1.x"
-            }
-        } else {
-            "CPU/OpenGL"
-        }
-
-        val configInfo = activityManager.deviceConfigurationInfo
-        val openGlMajor = (configInfo.reqGlEsVersion ushr 16).coerceAtLeast(2)
-        val nnapiSupported = Build.VERSION.SDK_INT >= Build.VERSION_CODES.P
+        val probeSnapshot = probeHardwareSnapshot(
+            activityManager = activityManager,
+            cpuTopology = cpuTopology
+        )
 
         val hardwareH264 = hasHardwareEncoder(MediaFormat.MIMETYPE_VIDEO_AVC)
         val hardwareH265 = hasHardwareEncoder(MediaFormat.MIMETYPE_VIDEO_HEVC)
@@ -72,14 +56,18 @@ class DeviceCapabilityDetector(private val context: Context) {
         val baseTier = cachedTiers.firstOrNull { totalRamMb >= it.minRamMb && totalRamMb < it.maxRamMb }
             ?: cachedTiers.last()
 
-        // Never rely on RAM alone: calculate holistic processing capacity score (0..100)
-        val ramScore = ((totalRamMb.coerceIn(2048L, 12288L) - 2048L) * 40f / 10240f)
-        val cpuScore = ((cpuCores.coerceIn(2, 8) - 2) * 25f / 6f)
-        val gpuScore = if (vulkanSupported) 20f else if (openGlMajor >= 3) 10f else 0f
+        // Holistic capacity score factoring RAM, big cores, GPU compute, and thermal headroom
+        val ramScore = ((totalRamMb.coerceIn(2048L, 12288L) - 2048L) * 38f / 10240f)
+        val cpuScore = ((cpuTopology.bigCoreCount.coerceIn(1, 6) - 1) * 24f / 5f)
+        val gpuScore = when {
+            probeSnapshot.qnnGpuAvailable || probeSnapshot.vulkanComputeSupported -> 23f
+            probeSnapshot.vulkanSupported || probeSnapshot.openClSupported -> 18f
+            probeSnapshot.openGlEsMajor >= 3 -> 11f
+            else -> 0f
+        }
         val headroomScore = if (availableRamMb > 2500L) 15f else if (availableRamMb > 1200L) 8f else 2f
         val capacityScore = (ramScore + cpuScore + gpuScore + headroomScore).roundToInt().coerceIn(10, 100)
 
-        // Adapt tile size by BOTH holistic capacity, available RAM, and thermal state
         var tileSize = when {
             capacityScore >= 82 && availableRamMb >= 3000L -> baseTier.tileSize
             capacityScore >= 55 && availableRamMb >= 1800L -> baseTier.tileSize.coerceAtMost(192)
@@ -90,11 +78,13 @@ class DeviceCapabilityDetector(private val context: Context) {
             tileSize = tileSize.coerceAtMost(128)
         }
 
+        // Default inference threads prioritize big-core cluster count cleanly while honoring thermal caps
+        val preferredBig = cpuTopology.bigCoreCount.coerceIn(2, baseTier.maxInferenceThreads)
         val optimalThreads = when (thermalState) {
             ThermalState.CRITICAL -> 2
-            ThermalState.THROTTLING -> (cpuCores / 2).coerceIn(2, 4)
-            ThermalState.WARM -> (cpuCores / 2).coerceIn(2, baseTier.maxInferenceThreads)
-            ThermalState.NORMAL -> cpuCores.coerceIn(2, baseTier.maxInferenceThreads)
+            ThermalState.THROTTLING -> (preferredBig / 2).coerceIn(2, 4)
+            ThermalState.WARM -> (preferredBig - 1).coerceIn(2, baseTier.maxInferenceThreads)
+            ThermalState.NORMAL -> preferredBig
         }
 
         val batchSize = when {
@@ -115,10 +105,10 @@ class DeviceCapabilityDetector(private val context: Context) {
             cpuCores = cpuCores,
             primaryAbi = primaryAbi,
             supportedAbis = abis,
-            vulkanSupported = vulkanSupported,
-            vulkanVersionLabel = vulkanVersionLabel,
-            nnapiSupported = nnapiSupported,
-            openGlEsMajor = openGlMajor,
+            vulkanSupported = probeSnapshot.vulkanSupported,
+            vulkanVersionLabel = probeSnapshot.vulkanVersionLabel,
+            nnapiSupported = probeSnapshot.nnapiSupported,
+            openGlEsMajor = probeSnapshot.openGlEsMajor,
             hardwareH264Supported = hardwareH264,
             hardwareH265Supported = hardwareH265,
             maxEncodeLongEdge = maxEncodeEdge,
@@ -132,8 +122,206 @@ class DeviceCapabilityDetector(private val context: Context) {
             minRequiredFreeStorageMb = baseTier.minRequiredFreeStorageMb,
             throttleDelayMsOnWarm = baseTier.throttleDelayMsOnWarm,
             throttleDelayMsOnHot = baseTier.throttleDelayMsOnHot,
-            processingCapacityScore = capacityScore
+            processingCapacityScore = capacityScore,
+            vulkanComputeSupported = probeSnapshot.vulkanComputeSupported,
+            openClSupported = probeSnapshot.openClSupported,
+            qnnSupported = probeSnapshot.qnnHtpAvailable || probeSnapshot.qnnGpuAvailable,
+            cpuTopology = cpuTopology,
+            hardwareProbeSnapshot = probeSnapshot
         )
+    }
+
+    fun probeHardwareSnapshot(
+        activityManager: ActivityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager,
+        cpuTopology: CpuTopologyInfo = detectCpuTopology()
+    ): HardwareProbeSnapshot {
+        val pm = context.packageManager
+        val vulkanSupported = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            pm.hasSystemFeature(PackageManager.FEATURE_VULKAN_HARDWARE_LEVEL)
+        } else {
+            false
+        }
+        val vulkanComputeSupported = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            pm.hasSystemFeature(PackageManager.FEATURE_VULKAN_HARDWARE_COMPUTE)
+        } else {
+            false
+        }
+        val vulkanVersionLabel = if (vulkanSupported && Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            val verInfo = pm.systemAvailableFeatures.firstOrNull {
+                it.name == PackageManager.FEATURE_VULKAN_HARDWARE_VERSION
+            }
+            if (verInfo != null) {
+                val major = (verInfo.version ushr 22) and 0x3FF
+                val minor = (verInfo.version ushr 12) and 0x3FF
+                "Vulkan $major.$minor"
+            } else {
+                "Vulkan 1.x"
+            }
+        } else {
+            "Unavailable"
+        }
+
+        val configInfo = activityManager.deviceConfigurationInfo
+        val openGlMajor = (configInfo.reqGlEsVersion ushr 16).coerceAtLeast(2)
+
+        val (openClPresent, openClSource) = detectOpenClDriver()
+        val (isQualcomm, qnnHtp, qnnGpu, qnnLabel) = detectQualcommQnnDrivers()
+
+        val nnapiSupported = Build.VERSION.SDK_INT >= Build.VERSION_CODES.P
+        val (nnapiGpu, nnapiNpu, nnapiSummary) = classifyNnapiExpectation(
+            nnapiSupported = nnapiSupported,
+            vulkanSupported = vulkanSupported,
+            openClPresent = openClPresent,
+            isQualcomm = isQualcomm
+        )
+
+        return HardwareProbeSnapshot(
+            vulkanSupported = vulkanSupported,
+            vulkanVersionLabel = vulkanVersionLabel,
+            vulkanComputeSupported = vulkanComputeSupported,
+            openClSupported = openClPresent,
+            openClSourceLabel = openClSource,
+            openGlEsMajor = openGlMajor,
+            nnapiSupported = nnapiSupported,
+            nnapiGpuDetected = nnapiGpu,
+            nnapiNpuDetected = nnapiNpu,
+            nnapiDriversSummary = nnapiSummary,
+            isQualcommSoc = isQualcomm,
+            qnnHtpAvailable = qnnHtp,
+            qnnGpuAvailable = qnnGpu,
+            qnnStatusLabel = qnnLabel,
+            cpuTopology = cpuTopology
+        )
+    }
+
+    fun detectCpuTopology(): CpuTopologyInfo {
+        val totalCores = Runtime.getRuntime().availableProcessors().coerceAtLeast(2)
+        val maxFreqsKhz = ArrayList<Int>(totalCores)
+        for (idx in 0 until totalCores) {
+            val f = File("/sys/devices/system/cpu/cpu$idx/cpufreq/cpuinfo_max_freq")
+            val khz = runCatching {
+                if (f.exists() && f.canRead()) f.readText().trim().toIntOrNull() else null
+            }.getOrNull()
+            if (khz != null && khz > 0) {
+                maxFreqsKhz.add(khz)
+            }
+        }
+
+        if (maxFreqsKhz.size < 2) {
+            val fallbackBig = (totalCores / 2).coerceIn(2, totalCores)
+            return CpuTopologyInfo(
+                totalCores = totalCores,
+                bigCoreCount = fallbackBig,
+                littleCoreCount = (totalCores - fallbackBig).coerceAtLeast(0),
+                maxClockMhz = 0,
+                clusterSummary = "${totalCores}T (Uniform/Unknown)"
+            )
+        }
+
+        val maxKhz = maxFreqsKhz.maxOrNull() ?: 1
+        val bigThreshold = (maxKhz * 0.72).toInt()
+        val bigCount = maxFreqsKhz.count { it >= bigThreshold }.coerceIn(1, totalCores)
+        val littleCount = (totalCores - bigCount).coerceAtLeast(0)
+        val maxMhz = maxKhz / 1000
+        return CpuTopologyInfo(
+            totalCores = totalCores,
+            bigCoreCount = bigCount,
+            littleCoreCount = littleCount,
+            maxClockMhz = maxMhz,
+            clusterSummary = "${bigCount} Big + ${littleCount} Little (${maxMhz}MHz)"
+        )
+    }
+
+    private fun detectOpenClDriver(): Pair<Boolean, String> {
+        val candidates = listOf(
+            "/vendor/lib64/libOpenCL.so" to "Vendor OpenCL 64",
+            "/system/vendor/lib64/libOpenCL.so" to "System Vendor OpenCL 64",
+            "/system/lib64/libOpenCL.so" to "System OpenCL 64",
+            "/vendor/lib64/egl/libGLES_mali.so" to "ARM Mali OpenCL/EGL",
+            "/vendor/lib64/libOpenCL_adreno.so" to "Adreno OpenCL",
+            "/vendor/lib/libOpenCL.so" to "Vendor OpenCL 32"
+        )
+        for ((path, label) in candidates) {
+            try {
+                if (File(path).exists()) return true to label
+            } catch (_: Throwable) {
+            }
+        }
+        return false to "Not found"
+    }
+
+    private data class QnnProbeResult(
+        val isQualcomm: Boolean,
+        val htpAvailable: Boolean,
+        val gpuAvailable: Boolean,
+        val label: String
+    )
+
+    private fun detectQualcommQnnDrivers(): QnnProbeResult {
+        val socMfg = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            runCatching { Build.SOC_MANUFACTURER.orEmpty() }.getOrDefault("")
+        } else {
+            ""
+        }
+        val socModel = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            runCatching { Build.SOC_MODEL.orEmpty() }.getOrDefault("")
+        } else {
+            ""
+        }
+        val hwStr = "${Build.HARDWARE} ${Build.BOARD} $socMfg $socModel".lowercase()
+        val isQcom = hwStr.contains("qcom") || hwStr.contains("qualcomm") || hwStr.contains("snapdragon") || hwStr.contains("sm8") || hwStr.contains("sm7")
+
+        val htpPaths = listOf(
+            "${context.applicationInfo.nativeLibraryDir}/libQnnHtp.so",
+            "/vendor/lib64/libQnnHtp.so",
+            "/system/vendor/lib64/libQnnHtp.so"
+        )
+        val gpuPaths = listOf(
+            "${context.applicationInfo.nativeLibraryDir}/libQnnGpu.so",
+            "/vendor/lib64/libQnnGpu.so",
+            "/system/vendor/lib64/libQnnGpu.so"
+        )
+        val hasHtp = htpPaths.any { runCatching { File(it).exists() }.getOrDefault(false) }
+        val hasGpu = gpuPaths.any { runCatching { File(it).exists() }.getOrDefault(false) }
+        val ortHasQnn = runCatching {
+            ai.onnxruntime.OrtEnvironment.getAvailableProviders().any { it.name.contains("QNN", ignoreCase = true) }
+        }.getOrDefault(false)
+
+        val label = when {
+            ortHasQnn && hasHtp && hasGpu -> "QNN HTP NPU + GPU Ready"
+            ortHasQnn && hasHtp -> "QNN HTP NPU Ready"
+            ortHasQnn && hasGpu -> "QNN GPU Ready"
+            isQcom && (hasHtp || hasGpu) -> "Snapdragon Vendor QNN Libs"
+            isQcom -> "Snapdragon (NNAPI Fallback)"
+            else -> "Non-Qualcomm SoC"
+        }
+        return QnnProbeResult(
+            isQualcomm = isQcom,
+            htpAvailable = ortHasQnn && hasHtp,
+            gpuAvailable = ortHasQnn && hasGpu,
+            label = label
+        )
+    }
+
+    private fun classifyNnapiExpectation(
+        nnapiSupported: Boolean,
+        vulkanSupported: Boolean,
+        openClPresent: Boolean,
+        isQualcomm: Boolean
+    ): Triple<Boolean, Boolean, String> {
+        if (!nnapiSupported) return Triple(false, false, "API < 28 (Unsupported)")
+        val hw = "${Build.HARDWARE} ${Build.BOARD} ${Build.MANUFACTURER}".lowercase()
+        val hasNpuHint = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && (
+            isQualcomm || hw.contains("mt") || hw.contains("dimensity") ||
+                hw.contains("exynos") || hw.contains("s5e") || hw.contains("tensor") ||
+                hw.contains("kirin") || !hw.contains("ranchu") && !hw.contains("goldfish")
+            )
+        val hasGpuHint = vulkanSupported || openClPresent
+        val summary = buildList {
+            if (hasGpuHint) add("GPU Delegate")
+            if (hasNpuHint) add("NPU/DSP Accelerator")
+        }.joinToString(" + ").ifBlank { "CPU Reference Only" }
+        return Triple(hasGpuHint, hasNpuHint, summary)
     }
 
     fun readThermalInfo(): Pair<ThermalState, Float> {

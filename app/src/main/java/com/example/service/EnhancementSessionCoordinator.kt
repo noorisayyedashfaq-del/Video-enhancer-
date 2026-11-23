@@ -394,6 +394,22 @@ class EnhancementSessionCoordinator private constructor(
         _uiState.update { it.copy(errorMessage = null) }
     }
 
+    fun rebenchmarkHardware() {
+        if (_uiState.value.isProcessing || jobRunningLock.get() || _uiState.value.isBenchmarkingHardware) return
+        scope.launch {
+            _uiState.update { it.copy(isBenchmarkingHardware = true, errorMessage = null) }
+            val caps = capabilityDetector.detect()
+            val health = pipeline.initializeAndCheckHealth(caps, forceRebenchmark = true)
+            _uiState.update {
+                it.copy(
+                    deviceCapabilities = caps,
+                    engineHealth = health,
+                    isBenchmarkingHardware = false
+                )
+            }
+        }
+    }
+
     fun onTrimMemory() {
         if (!jobRunningLock.get()) {
             onnxEngine.releaseWorkBuffers()

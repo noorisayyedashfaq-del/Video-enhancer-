@@ -127,7 +127,8 @@ class MainActivity : ComponentActivity() {
                 onVideoSelected = viewModel::onVideoSelected,
                 onStartWithAd = ::startWithAd,
                 onCancelEnhancement = viewModel::onCancelEnhancement,
-                onDismissError = viewModel::clearError
+                onDismissError = viewModel::clearError,
+                onRebenchmarkHardware = viewModel::onRebenchmarkHardware
             )
 
             ClearKitSplashScreen(visible = showSplashScreen)

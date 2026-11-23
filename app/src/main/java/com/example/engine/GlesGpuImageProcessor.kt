@@ -36,6 +36,7 @@ class GlesGpuImageProcessor {
     private var rgbaScratchMat: Mat? = null
     private var inPixelBuf: ByteBuffer? = null
     private var outPixelBuf: ByteBuffer? = null
+    private var rgbaIoBytes: ByteArray = ByteArray(0)
     private var fboIds = IntArray(1)
 
     val isAvailable: Boolean get() = initialized && !probeFailed.get()
@@ -140,13 +141,13 @@ class GlesGpuImageProcessor {
     }
 
     /**
-     * Benchmarks GLES 3.1 compute dispatch latency on a 128x128 RGBA patch.
+     * Benchmarks GLES 3.1 compute dispatch latency on a 256x256 RGBA patch.
      * Returns duration in ms or null if unsupported.
      */
     @Synchronized
     fun benchmarkMs(): Long? {
         if (!ensureInitialized()) return null
-        val testMat = Mat(128, 128, org.opencv.core.CvType.CV_8UC3)
+        val testMat = Mat(256, 256, org.opencv.core.CvType.CV_8UC3)
         return try {
             testMat.setTo(org.opencv.core.Scalar(90.0, 120.0, 150.0))
             // Warmup
@@ -196,8 +197,12 @@ class GlesGpuImageProcessor {
                 ?: ByteBuffer.allocateDirect(neededBytes).order(ByteOrder.nativeOrder()).also {
                     outPixelBuf = it
                 }
+            val rawBytes = if (rgbaIoBytes.size >= neededBytes) {
+                rgbaIoBytes
+            } else {
+                ByteArray(neededBytes).also { rgbaIoBytes = it }
+            }
 
-            val rawBytes = ByteArray(neededBytes)
             rgba.get(0, 0, rawBytes)
             inBuf.clear()
             inBuf.put(rawBytes, 0, neededBytes)
@@ -289,6 +294,7 @@ class GlesGpuImageProcessor {
             rgbaScratchMat = null
             inPixelBuf = null
             outPixelBuf = null
+            rgbaIoBytes = ByteArray(0)
             val disp = eglDisplay
             if (disp != null && disp != EGL14.EGL_NO_DISPLAY) {
                 val ctx = eglContext

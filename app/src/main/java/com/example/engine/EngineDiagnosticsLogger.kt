@@ -6,12 +6,12 @@ import java.util.Collections
 import java.util.concurrent.atomic.AtomicLong
 
 /**
- * Structured engine telemetry & error logger for LuminaSR.
- * Records exact timings, execution provider benchmark outcomes, peak memory usage,
- * and warnings/errors without hiding failures.
+ * Structured engine telemetry & error logger for ClearKit.
+ * Records exact timings, execution provider benchmark outcomes, per-model hardware allocation,
+ * temporal reuse gains, peak memory usage, and runtime fallback events.
  */
 class EngineDiagnosticsLogger(
-    private val tag: String = "LuminaSR_Engine"
+    private val tag: String = "ClearKit_Engine"
 ) {
     private val warnings = Collections.synchronizedList(mutableListOf<String>())
     private val timeline = Collections.synchronizedList(mutableListOf<String>())
@@ -27,7 +27,7 @@ class EngineDiagnosticsLogger(
     var muxingMs: Long = 0L
     var speedFallbackEngaged: Boolean = false
     var speedFallbackReason: String? = null
-    var decoderBackend: String = "MediaCodec Zero-Copy"
+    var decoderBackend: String = "MediaCodec NV12/I420 Pooled"
     private var peakMemMb: Long = 0L
 
     fun info(message: String) {
@@ -85,7 +85,11 @@ class EngineDiagnosticsLogger(
         framesProcessed: Int,
         recoveredFrames: Int,
         analysisReusedFromCache: Boolean,
-        upscaleScaleLabel: String = "1.0x"
+        upscaleScaleLabel: String = "1.0x",
+        perModelAccelerationSummary: String = executionProvider,
+        staticTilesReused: Int = 0,
+        framesReusedDuplicate: Int = 0,
+        runtimeFallbacksCount: Int = 0
     ): EngineDiagnosticsReport {
         return EngineDiagnosticsReport(
             modelInitMs = modelInitMs,
@@ -111,6 +115,10 @@ class EngineDiagnosticsLogger(
             dncnnInferenceMs = dncnnInferenceMs.get(),
             faceAiMs = faceAiMs.get(),
             upscaleScaleLabel = upscaleScaleLabel,
+            perModelAccelerationSummary = perModelAccelerationSummary,
+            staticTilesReused = staticTilesReused,
+            framesReusedDuplicate = framesReusedDuplicate,
+            runtimeFallbacksCount = runtimeFallbacksCount,
             warnings = warnings.toList()
         )
     }

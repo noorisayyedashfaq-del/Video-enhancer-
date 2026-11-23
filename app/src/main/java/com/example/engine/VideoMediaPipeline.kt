@@ -46,7 +46,8 @@ class VideoMediaPipeline(
     private data class DecodedFrame(
         val index: Int,
         val bgrMat: Mat? = null,
-        val diskFile: File? = null
+        val diskFile: File? = null,
+        val fromDecoderPool: Boolean = false
     )
 
     private val cancelled = AtomicBoolean(false)
@@ -59,14 +60,17 @@ class VideoMediaPipeline(
         }
     }
 
-    suspend fun initializeAndCheckHealth(capabilities: DeviceCapabilities): EngineHealthStatus =
+    suspend fun initializeAndCheckHealth(
+        capabilities: DeviceCapabilities,
+        forceRebenchmark: Boolean = false
+    ): EngineHealthStatus =
         withContext(Dispatchers.IO) {
             val logger = EngineDiagnosticsLogger()
             val cvReady = frameProcessor.ensureInitialized()
             var ortReady = false
             var diag: String? = null
             try {
-                onnxEngine.initialize(capabilities, logger)
+                onnxEngine.initialize(capabilities, logger, forceRebenchmark = forceRebenchmark)
                 ortReady = true
             } catch (t: Throwable) {
                 logger.error("AI Runtime initialization failed", t)
@@ -87,6 +91,7 @@ class VideoMediaPipeline(
                 dncnnModelReady = onnxEngine.isDncnnReady,
                 yunetModelReady = frameProcessor.isFaceDetectorReady,
                 activeExecutionProvider = onnxEngine.providerLabel,
+                hardwareProfile = onnxEngine.adaptiveProfile,
                 diagnosticMessage = diag
             )
         }
@@ -126,13 +131,16 @@ class VideoMediaPipeline(
         val finalMp4 = File(outputDir, "ClearKit_${mode.label}_$sessionId.mp4")
 
         var encoder: HardwareVideoEncoder? = null
-        var reusableBitmap: Bitmap? = null
+        var outputBitmapA: Bitmap? = null
+        var outputBitmapB: Bitmap? = null
         var activeExtractSession: FFmpegSession? = null
+        var activeFastDecoder: FastVideoFrameDecoder? = null
 
         runCatching {
             try {
                 check(frameProcessor.ensureInitialized()) { "OpenCV native engine failed to initialize." }
                 frameProcessor.resetTemporalState()
+                onnxEngine.resetTemporalCaches()
 
                 // 1. Metadata & Resource Pre-flight
                 val availStorageMb = capabilityDetector.currentAvailableStorageMb()
@@ -190,17 +198,17 @@ class VideoMediaPipeline(
                 // 3. Adaptive Adjustments
                 val adaptiveParams = smartAdjuster.computeAdaptiveAdjustments(profile, qualityAnalysis)
 
-                // 4. Initialize & Benchmark GPU vs XNNPACK 4/6/8T Once
-                if (outDims.needsAiSuperResolution || onnxEngine.isGlesGpuReady.not()) {
+                // 4. Adaptive Hardware Acceleration Benchmark & Model Initialization
+                if (outDims.needsAiSuperResolution || !onnxEngine.isGlesGpuReady || !onnxEngine.isRealEsrganReady) {
                     onProgress(
                         ProcessingProgress(
                             stage = ProcessingStage.LOADING_MODEL,
                             totalFrames = metadata.estimatedFrameCount,
                             overallProgress = 0.12f,
                             statusDetail = if (outDims.needsAiSuperResolution) {
-                                "Benchmarking GPU & multi-thread AI (${outDims.aiTileSize}px × ${outDims.tilesPerFrame} tiles)..."
+                                "Optimizing GPU / NPU / CPU per model (${outDims.aiTileSize}px × ${outDims.tilesPerFrame} tiles)..."
                             } else {
-                                "Initializing hardware GPU/OpenCV acceleration..."
+                                "Initializing adaptive GPU / NPU / OpenCV acceleration..."
                             },
                             thermalState = capabilities.thermalState,
                             activeAcceleration = onnxEngine.providerLabel,
@@ -224,15 +232,19 @@ class VideoMediaPipeline(
                 ).apply { start() }
                 encoder = activeEncoder
 
-                val outputBitmap = Bitmap.createBitmap(outDims.width, outDims.height, Bitmap.Config.ARGB_8888)
-                reusableBitmap = outputBitmap
+                // Ping-pong double-buffered Bitmaps overlap AI Enhance(N+1) with Hardware Encode(N)
+                val bmpA = Bitmap.createBitmap(outDims.width, outDims.height, Bitmap.Config.ARGB_8888)
+                val bmpB = Bitmap.createBitmap(outDims.width, outDims.height, Bitmap.Config.ARGB_8888)
+                outputBitmapA = bmpA
+                outputBitmapB = bmpB
+                var lastCompletedBitmap = bmpA
 
                 onProgress(
                     ProcessingProgress(
                         stage = ProcessingStage.EXTRACTING,
                         totalFrames = metadata.estimatedFrameCount,
                         overallProgress = 0.16f,
-                        statusDetail = "Decoding video stream via zero-copy MediaCodec...",
+                        statusDetail = "Decoding video stream via zero-copy NV12/I420 MediaCodec...",
                         thermalState = capabilities.thermalState,
                         activeAcceleration = onnxEngine.providerLabel,
                         memoryUsageMb = logger.sampleHeapUsedMb()
@@ -247,13 +259,14 @@ class VideoMediaPipeline(
                 var usedAiDenoiseAny = false
                 var recoveredFrames = 0
                 var processedCount = 0
+                var duplicateFramesReused = 0
                 var lightweightFallbackActive = false
                 var activeAccelLabel = onnxEngine.providerLabel
                 val expectedTotalFrames = metadata.estimatedFrameCount.coerceAtLeast(1)
                 val decodedCountAtomic = AtomicInteger(0)
 
                 coroutineScope {
-                    // Producer: Primary zero-disk hardware MediaCodec decoder, automatic FFmpegKit fallback
+                    // Stage 1 Producer: Pooled Zero-Disk NV12/I420 MediaCodec decoder, automatic FFmpeg fallback
                     val producerJob = launch(Dispatchers.IO) {
                         val decodeStartMs = System.currentTimeMillis()
                         var mediaCodecSucceeded = false
@@ -263,24 +276,29 @@ class VideoMediaPipeline(
                             val fastDecoder = FastVideoFrameDecoder(
                                 videoFile = inputCopy,
                                 rotationDegrees = metadata.rotationDegrees
-                            )
+                            ).also { activeFastDecoder = it }
+
                             val count = fastDecoder.decodeAllFrames(
                                 isCancelled = { cancelled.get() || !isActive },
                                 onFrame = { idx, bgrMat, _ ->
                                     sentAny = true
                                     decodedCountAtomic.set(idx + 1)
-                                    val sendOk = frameChannel.trySend(DecodedFrame(index = idx, bgrMat = bgrMat)).isSuccess
+                                    val frameMsg = DecodedFrame(
+                                        index = idx,
+                                        bgrMat = bgrMat,
+                                        fromDecoderPool = true
+                                    )
+                                    val sendOk = frameChannel.trySend(frameMsg).isSuccess
                                     if (!sendOk) {
-                                        // Backpressure via blocking send inside coroutine isn't inline here; switch cleanly:
                                         kotlinx.coroutines.runBlocking {
-                                            frameChannel.send(DecodedFrame(index = idx, bgrMat = bgrMat))
+                                            frameChannel.send(frameMsg)
                                         }
                                     }
                                 }
                             )
                             if (count > 0) {
                                 mediaCodecSucceeded = true
-                                logger.decoderBackend = "MediaCodec Zero-Copy YUV->BGR"
+                                logger.decoderBackend = "MediaCodec NV12/I420 Pooled"
                                 logger.extractionMs = System.currentTimeMillis() - decodeStartMs
                                 logger.info("Fast MediaCodec decoder yielded $count frames in ${logger.extractionMs}ms")
                             }
@@ -317,15 +335,16 @@ class VideoMediaPipeline(
                         }
                     }
 
-                    // Consumer: Frame enhancement -> AI tiles / GPU fallback -> Hardware encoder
+                    // Stage 2 & 3 Overlapped Consumer: Frame Enhance (bitmap[i%2]) -> Async HW Encode(bitmap[(i-1)%2])
                     val enhanceLoopStartMs = System.currentTimeMillis()
                     var lastThermalCheckMs = 0L
                     var currentThermalState = capabilities.thermalState
+                    var encodeSlotIndex = 0
 
                     try {
                         for (item in frameChannel) {
                             if (cancelled.get()) {
-                                item.bgrMat?.release()
+                                if (item.fromDecoderPool) activeFastDecoder?.recycleMat(item.bgrMat) else item.bgrMat?.release()
                                 item.diskFile?.delete()
                                 throw InterruptedException("Cancelled by user")
                             }
@@ -333,12 +352,13 @@ class VideoMediaPipeline(
                             val frameIndex = item.index
                             val dynamicTotal = max(expectedTotalFrames, max(decodedCountAtomic.get(), frameIndex + 1))
 
-                            // Periodic thermal & RAM check
+                            // Periodic thermal watchdog + adaptive backend step-down if critically hot
                             val now = System.currentTimeMillis()
                             if (now - lastThermalCheckMs >= 800L || frameIndex == 0) {
                                 val thermalPair = capabilityDetector.readThermalInfo()
                                 currentThermalState = thermalPair.first
                                 lastThermalCheckMs = now
+                                onnxEngine.handleThermalPressure(currentThermalState, logger)
 
                                 val freeRamMb = capabilityDetector.currentAvailableRamMb()
                                 if (freeRamMb < 220L) {
@@ -346,7 +366,7 @@ class VideoMediaPipeline(
                                     delay(30L)
                                     val postGcRam = capabilityDetector.currentAvailableRamMb()
                                     if (postGcRam < 180L) {
-                                        item.bgrMat?.release()
+                                        if (item.fromDecoderPool) activeFastDecoder?.recycleMat(item.bgrMat) else item.bgrMat?.release()
                                         item.diskFile?.delete()
                                         throw IllegalStateException("Low device memory (${postGcRam}MB free) during ${mode.label} enhancement.")
                                     }
@@ -366,10 +386,13 @@ class VideoMediaPipeline(
                                 recoveredFrames++
                                 logger.warn("Recovered empty/corrupted frame #$frameIndex")
                                 if (frameIndex > 0) {
-                                    activeEncoder.encodeFrame(outputBitmap, frameIndex)
+                                    activeEncoder.encodeFrame(lastCompletedBitmap, frameIndex)
                                 }
                                 continue
                             }
+
+                            val targetBitmap = if ((encodeSlotIndex and 1) == 0) bmpA else bmpB
+                            encodeSlotIndex++
 
                             val baseFrameProgress = 0.20f + (frameIndex.toFloat() / dynamicTotal.toFloat()) * 0.70f
                             val frameSlice = 0.70f / dynamicTotal.toFloat()
@@ -397,10 +420,11 @@ class VideoMediaPipeline(
                                     outDims = outDims,
                                     params = adaptiveParams,
                                     capabilities = capabilities,
-                                    reusableOutBitmap = outputBitmap,
+                                    reusableOutBitmap = targetBitmap,
                                     estimatedTotalFrames = dynamicTotal,
                                     forceLightweightFallback = lightweightFallbackActive,
                                     tileSizeOverride = if (presetTileSize > 0) presetTileSize else null,
+                                    frameIndex = frameIndex,
                                     logger = logger,
                                     isCancelled = { cancelled.get() },
                                     onUpscaleTileProgress = { tileDone, totalTiles, usedTile ->
@@ -424,6 +448,7 @@ class VideoMediaPipeline(
                                 )
                                 totalFacesEnhanced += frameResult.facesEnhanced
                                 if (frameResult.usedAiDenoise) usedAiDenoiseAny = true
+                                if (frameResult.usedDuplicateFrameReuse) duplicateFramesReused++
                                 if (frameResult.dncnnInferenceMs > 0L) logger.dncnnInferenceMs.addAndGet(frameResult.dncnnInferenceMs)
                                 if (frameResult.faceAiMs > 0L) logger.faceAiMs.addAndGet(frameResult.faceAiMs)
                                 if (frameResult.lightweightFallbackTriggered && !lightweightFallbackActive) {
@@ -434,7 +459,9 @@ class VideoMediaPipeline(
                                 if (frameResult.activeAccelerationLabel.isNotBlank()) {
                                     activeAccelLabel = frameResult.activeAccelerationLabel
                                 }
-                                activeEncoder.encodeFrame(outputBitmap, frameIndex)
+                                lastCompletedBitmap = targetBitmap
+                                // Async overlap: submits encoding of targetBitmap while loop immediately advances to next frame
+                                activeEncoder.enqueueFrameAsync(targetBitmap, frameIndex)
                             } catch (e: InterruptedException) {
                                 throw e
                             } catch (oom: OutOfMemoryError) {
@@ -444,12 +471,16 @@ class VideoMediaPipeline(
                                 logger.error("Frame $frameIndex processing error", t)
                                 recoveredFrames++
                                 if (frameIndex > 0) {
-                                    activeEncoder.encodeFrame(outputBitmap, frameIndex)
+                                    activeEncoder.encodeFrame(lastCompletedBitmap, frameIndex)
                                 } else {
                                     throw t
                                 }
                             } finally {
-                                bgr.release()
+                                if (item.fromDecoderPool) {
+                                    activeFastDecoder?.recycleMat(bgr)
+                                } else {
+                                    bgr.release()
+                                }
                                 item.diskFile?.delete()
                                 logger.enhancementMs.addAndGet(System.currentTimeMillis() - frameProcStartMs)
                             }
@@ -489,10 +520,13 @@ class VideoMediaPipeline(
                             )
                         }
                     } finally {
-                        // Drain any remaining queued native Mats to prevent native leaks on cancel/error
                         while (true) {
                             val leftover = frameChannel.tryReceive().getOrNull() ?: break
-                            leftover.bgrMat?.release()
+                            if (leftover.fromDecoderPool) {
+                                activeFastDecoder?.recycleMat(leftover.bgrMat)
+                            } else {
+                                leftover.bgrMat?.release()
+                            }
                             leftover.diskFile?.delete()
                         }
                     }
@@ -559,15 +593,18 @@ class VideoMediaPipeline(
                     framesProcessed = processedCount,
                     recoveredFrames = recoveredFrames,
                     analysisReusedFromCache = analysisOutcome.reusedFromCache,
-                    upscaleScaleLabel = scaleLabel
+                    upscaleScaleLabel = scaleLabel,
+                    perModelAccelerationSummary = onnxEngine.currentPerModelSummary(),
+                    staticTilesReused = onnxEngine.totalStaticTilesReused,
+                    framesReusedDuplicate = duplicateFramesReused,
+                    runtimeFallbacksCount = onnxEngine.runtimeFallbacksCount
                 )
 
                 logger.info(
-                    "Job completed in ${totalElapsed}ms • frames=$processedCount • " +
-                        "scale=$scaleLabel (${outDims.label}) • faces=$totalFacesEnhanced • " +
-                        "dncnn=${diagnostics.dncnnInferenceMs}ms • faceAi=${diagnostics.faceAiMs}ms • " +
-                        "sr=${diagnostics.aiInferenceMs}ms • encode=${diagnostics.encodingMs}ms • " +
-                        "peakMem=${diagnostics.peakMemoryMb}MB • provider=${diagnostics.executionProvider}"
+                    "Job completed in ${totalElapsed}ms • frames=$processedCount • dupReuse=$duplicateFramesReused • " +
+                        "staticTileReuse=${diagnostics.staticTilesReused} • fallbacks=${diagnostics.runtimeFallbacksCount} • " +
+                        "scale=$scaleLabel (${outDims.label}) • sr=${diagnostics.aiInferenceMs}ms • " +
+                        "encode=${diagnostics.encodingMs}ms • provider=${diagnostics.executionProvider}"
                 )
 
                 onProgress(
@@ -605,6 +642,7 @@ class VideoMediaPipeline(
                 } catch (_: Exception) {
                 }
                 encoder?.abort()
+                encoder = null
                 finalMp4.delete()
                 throw interrupted
             } catch (t: Throwable) {
@@ -614,10 +652,13 @@ class VideoMediaPipeline(
                 } catch (_: Exception) {
                 }
                 encoder?.abort()
+                encoder = null
                 finalMp4.delete()
                 throw t
             } finally {
-                reusableBitmap?.recycle()
+                encoder?.abort()
+                outputBitmapA?.recycle()
+                outputBitmapB?.recycle()
                 frameProcessor.resetTemporalState()
                 onnxEngine.releaseWorkBuffers()
                 workDir.deleteRecursively()

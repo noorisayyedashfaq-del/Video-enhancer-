@@ -38,14 +38,16 @@ import androidx.compose.material.icons.filled.HighQuality
 import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.Movie
 import androidx.compose.material.icons.filled.OfflineBolt
-import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.SaveAlt
+import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.VideoLibrary
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -56,6 +58,10 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -67,12 +73,15 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.Dialog
 import com.example.R
+import com.example.model.AcceleratorKind
 import com.example.model.DeviceCapabilities
 import com.example.model.EngineHealthStatus
 import com.example.model.EnhancementMode
 import com.example.model.EnhancementResult
 import com.example.model.MainUiState
+import com.example.model.ModelKind
 import com.example.model.OutputDimensions
 import com.example.model.ProcessingProgress
 import com.example.model.ProcessingStage
@@ -100,7 +109,8 @@ fun VideoEnhancerScreen(
     onVideoSelected: (Uri) -> Unit,
     onStartWithAd: (String) -> Unit,
     onCancelEnhancement: () -> Unit,
-    onDismissError: () -> Unit
+    onDismissError: () -> Unit,
+    onRebenchmarkHardware: () -> Unit = {}
 ) {
     // Zero-permission Photo Picker for video selection (Google Play compliant)
     val photoPickerLauncher = rememberLauncherForActivityResult(
@@ -108,6 +118,8 @@ fun VideoEnhancerScreen(
     ) { uri ->
         uri?.let(onVideoSelected)
     }
+
+    var showHardwareDialog by remember { mutableStateOf(false) }
 
     Scaffold(
         containerColor = StudioObsidian
@@ -133,7 +145,9 @@ fun VideoEnhancerScreen(
             ) {
                 StudioHeader(
                     health = uiState.engineHealth,
-                    capabilities = uiState.deviceCapabilities
+                    capabilities = uiState.deviceCapabilities,
+                    isBenchmarking = uiState.isBenchmarkingHardware,
+                    onHardwarePillClick = { showHardwareDialog = true }
                 )
 
                 // Error Banner
@@ -206,12 +220,25 @@ fun VideoEnhancerScreen(
             }
         }
     }
+
+    if (showHardwareDialog) {
+        AdaptiveHardwareDiagnosticsDialog(
+            health = uiState.engineHealth,
+            capabilities = uiState.deviceCapabilities,
+            isProcessing = uiState.isProcessing,
+            isBenchmarking = uiState.isBenchmarkingHardware,
+            onRebenchmark = onRebenchmarkHardware,
+            onDismiss = { showHardwareDialog = false }
+        )
+    }
 }
 
 @Composable
 private fun StudioHeader(
     health: EngineHealthStatus?,
-    capabilities: DeviceCapabilities?
+    capabilities: DeviceCapabilities?,
+    isBenchmarking: Boolean,
+    onHardwarePillClick: () -> Unit
 ) {
     Row(
         modifier = Modifier.fillMaxWidth(),
@@ -220,7 +247,8 @@ private fun StudioHeader(
     ) {
         Row(
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(10.dp)
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+            modifier = Modifier.weight(1f)
         ) {
             Image(
                 painter = painterResource(id = R.drawable.img_clearkit_logo),
@@ -245,28 +273,50 @@ private fun StudioHeader(
             }
         }
 
+        val pillLabel = when {
+            isBenchmarking -> "BENCHMARK..."
+            health?.hardwareProfile != null -> health.hardwareProfile.compactSummaryPill()
+            health?.realEsrganModelReady == true -> "OFFLINE AI"
+            else -> "INIT..."
+        }
+
         Surface(
             color = StudioSurfaceElevated,
             shape = RoundedCornerShape(10.dp),
-            border = BorderStroke(1.dp, StudioBorder)
+            border = BorderStroke(1.dp, CyanMaster.copy(alpha = 0.45f)),
+            modifier = Modifier
+                .minimumInteractiveComponentSize()
+                .clip(RoundedCornerShape(10.dp))
+                .clickable(onClick = onHardwarePillClick)
+                .testTag("hardware_diagnostics_button")
         ) {
             Row(
                 modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(6.dp)
             ) {
-                Icon(
-                    imageVector = Icons.Default.OfflineBolt,
-                    contentDescription = "100% offline engine",
-                    tint = CyanMaster,
-                    modifier = Modifier.size(16.dp)
-                )
+                if (isBenchmarking) {
+                    CircularProgressIndicator(
+                        color = CyanMaster,
+                        strokeWidth = 2.dp,
+                        modifier = Modifier.size(14.dp)
+                    )
+                } else {
+                    Icon(
+                        imageVector = Icons.Default.OfflineBolt,
+                        contentDescription = "Hardware acceleration status",
+                        tint = CyanMaster,
+                        modifier = Modifier.size(16.dp)
+                    )
+                }
                 Text(
-                    text = if (health?.realEsrganModelReady == true) "100% OFFLINE AI" else "INIT...",
+                    text = pillLabel,
                     style = MaterialTheme.typography.labelSmall,
-                    color = CyanMaster
+                    color = CyanMaster,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
                 )
-                if (capabilities != null) {
+                if (!isBenchmarking && capabilities != null && health?.hardwareProfile == null) {
                     Text(
                         text = "• ${capabilities.totalRamMb / 1024}GB",
                         style = MaterialTheme.typography.labelSmall,
@@ -791,13 +841,30 @@ private fun EnhancementReportCard(result: EnhancementResult) {
                     diag.finalTileSize > 0 -> "${diag.finalTileSize}px × ${result.outputDimensions.tilesPerFrame} (${diag.upscaleScaleLabel})"
                     else -> "No AI tiles"
                 }
+                val perModelText = diag.perModelAccelerationSummary.ifBlank { diag.executionProvider }
                 Text(
-                    text = "Engine: ${diag.executionProvider} • $tileLabel • " +
+                    text = "Engine: $perModelText • $tileLabel • " +
                         "SR ${diag.aiInferenceMs / 1000}s • DnCNN ${diag.dncnnInferenceMs / 1000}s • " +
                         "Face ${diag.faceAiMs / 1000}s • Encode ${diag.encodingMs / 1000}s • Peak ${diag.peakMemoryMb}MB",
                     style = MaterialTheme.typography.labelSmall,
                     color = SubtleSteel
                 )
+                if (diag.staticTilesReused > 0 || diag.framesReusedDuplicate > 0 || diag.runtimeFallbacksCount > 0) {
+                    val speedStats = buildString {
+                        append("Speed Opts: ${diag.staticTilesReused} static tiles reused")
+                        if (diag.framesReusedDuplicate > 0) {
+                            append(" • ${diag.framesReusedDuplicate} duplicate frames reused")
+                        }
+                        if (diag.runtimeFallbacksCount > 0) {
+                            append(" • ${diag.runtimeFallbacksCount} runtime fallback(s)")
+                        }
+                    }
+                    Text(
+                        text = speedStats,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = CyanMaster
+                    )
+                }
                 if (diag.warnings.isNotEmpty()) {
                     Text(
                         text = "Notices: ${diag.warnings.joinToString(" | ")}",
@@ -934,3 +1001,239 @@ private fun ErrorBanner(message: String, onDismiss: () -> Unit) {
         }
     }
 }
+
+@Composable
+private fun AdaptiveHardwareDiagnosticsDialog(
+    health: EngineHealthStatus?,
+    capabilities: DeviceCapabilities?,
+    isProcessing: Boolean,
+    isBenchmarking: Boolean,
+    onRebenchmark: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    Dialog(onDismissRequest = onDismiss) {
+        Card(
+            colors = CardDefaults.cardColors(containerColor = StudioSlate),
+            border = BorderStroke(1.dp, CyanMaster.copy(alpha = 0.45f)),
+            shape = RoundedCornerShape(18.dp),
+            modifier = Modifier
+                .fillMaxWidth()
+                .testTag("hardware_diagnostics_dialog")
+        ) {
+            Column(
+                modifier = Modifier
+                    .verticalScroll(rememberScrollState())
+                    .padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Speed,
+                            contentDescription = "Adaptive Hardware Acceleration",
+                            tint = CyanMaster,
+                            modifier = Modifier.size(22.dp)
+                        )
+                        Text(
+                            text = stringResource(R.string.hardware_diagnostics_title),
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                    }
+                }
+
+                val profile = health?.hardwareProfile
+                val probe = profile?.probeSnapshot ?: capabilities?.hardwareProbeSnapshot
+
+                if (probe != null) {
+                    Surface(
+                        color = StudioSurfaceElevated,
+                        shape = RoundedCornerShape(12.dp),
+                        border = BorderStroke(1.dp, StudioBorder)
+                    ) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(10.dp),
+                            verticalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            Text(
+                                text = "Hardware Capabilities & Drivers",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = CyanMaster
+                            )
+                            Text(
+                                text = "Vulkan: ${if (probe.vulkanSupported) "Yes (${probe.vulkanVersionLabel}, compute=${probe.vulkanComputeSupported})" else "Unavailable"}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                            Text(
+                                text = "OpenCL: ${probe.openClSourceLabel} • GLES ${probe.openGlEsMajor}.x",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                            Text(
+                                text = "NNAPI: ${probe.nnapiDriversSummary} • QNN: ${probe.qnnStatusLabel}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                            Text(
+                                text = "CPU Topology: ${probe.cpuTopology.clusterSummary}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MutedSteel
+                            )
+                        }
+                    }
+                }
+
+                HorizontalDivider(color = StudioBorder)
+
+                Text(
+                    text = "Per-Model Benchmark Selection (GPU → NPU → CPU)",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = AmberFourK
+                )
+
+                if (profile == null) {
+                    Text(
+                        text = if (isBenchmarking) {
+                            stringResource(R.string.benchmarking_hardware_status)
+                        } else {
+                            "Benchmark profile not yet populated. Tap Re-Run Benchmark below."
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MutedSteel
+                    )
+                } else {
+                    listOf(
+                        ModelKind.REAL_ESRGAN,
+                        ModelKind.DNCNN,
+                        ModelKind.FACE_YUNET
+                    ).forEach { modelKind ->
+                        val plan = profile.plans[modelKind]
+                        Surface(
+                            color = StudioSurfaceElevated,
+                            shape = RoundedCornerShape(12.dp),
+                            border = BorderStroke(1.dp, StudioBorder)
+                        ) {
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(10.dp),
+                                verticalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text(
+                                        text = modelKind.displayName,
+                                        style = MaterialTheme.typography.labelLarge,
+                                        color = MaterialTheme.colorScheme.onSurface
+                                    )
+                                    val badgeColor = when (plan?.selectedKind) {
+                                        AcceleratorKind.GPU -> CyanMaster
+                                        AcceleratorKind.NPU -> AmberFourK
+                                        else -> MutedSteel
+                                    }
+                                    Text(
+                                        text = plan?.let { "${it.selectedKind.label} • ${it.measuredLatencyMs}ms" } ?: "CPU",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        fontWeight = FontWeight.Bold,
+                                        color = badgeColor
+                                    )
+                                }
+                                if (plan != null) {
+                                    Text(
+                                        text = "Active: ${plan.selectedLabel}",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = CyanMaster
+                                    )
+                                    val evalSummary = plan.evaluatedBackends.joinToString(" | ") { b ->
+                                        if (b.medianLatencyMs != null && b.verifiedFullOffload && b.numericalParityOk) {
+                                            "${b.kind.label}:${b.medianLatencyMs}ms"
+                                        } else {
+                                            "${b.displayLabel}:${b.rejectedReason ?: "skip"}"
+                                        }
+                                    }
+                                    Text(
+                                        text = evalSummary,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = SubtleSteel,
+                                        maxLines = 2,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Button(
+                        onClick = onRebenchmark,
+                        enabled = !isProcessing && !isBenchmarking,
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = CyanMaster,
+                            contentColor = StudioObsidian
+                        ),
+                        modifier = Modifier
+                            .weight(1f)
+                            .minimumInteractiveComponentSize()
+                            .testTag("rebenchmark_hardware_button")
+                    ) {
+                        if (isBenchmarking) {
+                            CircularProgressIndicator(
+                                color = StudioObsidian,
+                                strokeWidth = 2.dp,
+                                modifier = Modifier.size(16.dp)
+                            )
+                        } else {
+                            Icon(
+                                imageVector = Icons.Default.Refresh,
+                                contentDescription = null,
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = if (isBenchmarking) {
+                                stringResource(R.string.benchmarking_hardware_status)
+                            } else {
+                                stringResource(R.string.action_rebenchmark_hardware)
+                            },
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                    OutlinedButton(
+                        onClick = onDismiss,
+                        border = BorderStroke(1.dp, StudioBorder),
+                        modifier = Modifier
+                            .minimumInteractiveComponentSize()
+                            .testTag("close_hardware_dialog_button")
+                    ) {
+                        Text(
+                            text = stringResource(R.string.action_close),
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+

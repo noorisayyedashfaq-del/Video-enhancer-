@@ -25,4 +25,8 @@
     <string name="internet_required_message">To enhance video you need to watch a small Ad first. Please turn on Internet.</string>
     <string name="action_turn_on_internet">Turn On Internet</string>
     <string name="action_cancel_dialog">Cancel</string>
+    <string name="hardware_diagnostics_title">Adaptive Hardware Acceleration</string>
+    <string name="action_rebenchmark_hardware">Re-Run Benchmark</string>
+    <string name="benchmarking_hardware_status">Benchmarking GPU / NPU / CPU...</string>
+    <string name="action_close">Close</string>
 </resources>

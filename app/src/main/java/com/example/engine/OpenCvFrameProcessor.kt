@@ -13,8 +13,8 @@ import org.opencv.core.Mat
 import org.opencv.core.Rect
 import org.opencv.core.Scalar
 import org.opencv.core.Size
+import org.opencv.imgproc.CLAHE
 import org.opencv.imgproc.Imgproc
-import org.opencv.objdetect.FaceDetectorYN
 import java.io.File
 import kotlin.math.abs
 import kotlin.math.exp
@@ -30,7 +30,9 @@ data class FrameProcessResult(
     val faceAiMs: Long = 0L,
     val lightweightFallbackTriggered: Boolean = false,
     val fallbackReason: String? = null,
-    val activeAccelerationLabel: String = ""
+    val activeAccelerationLabel: String = "",
+    val staticTilesReused: Int = 0,
+    val usedDuplicateFrameReuse: Boolean = false
 )
 
 class OpenCvFrameProcessor(
@@ -39,12 +41,15 @@ class OpenCvFrameProcessor(
 ) {
     private var openCvInitialized = false
     private var faceDetectorPath: String? = null
-    private var faceDetector: FaceDetectorYN? = null
-    private var faceDetInputW: Int = -1
-    private var faceDetInputH: Int = -1
     private var prevFaceBoxes: List<Rect> = emptyList()
 
+    // Duplicate-frame & scene-cut detector (48x48 thumbnail MAD)
+    private val frameMotionProbe = StaticTileReuseCache()
+    private var consecutiveDuplicateReuses: Int = 0
+    private var prevEnhancedRgbaMat: Mat? = null
+
     // Persistent temporal & reusable scratch Mats (eliminates per-frame native heap churn)
+    private var workMatScratch: Mat? = null
     private var prevDenoisedFrame: Mat? = null
     private var prevLumaMean: Double? = null
     private var reusableRgbaMat: Mat? = null
@@ -56,13 +61,13 @@ class OpenCvFrameProcessor(
     private var blendScratch: Mat? = null
     private var blurScratch: Mat? = null
     private var claheOutScratch: Mat? = null
+    private var cachedClahe: CLAHE? = null
+    private var cachedClaheClip: Double = -1.0
     private var alignedScratch: Mat? = null
     private var skinMaskScratch: Mat? = null
     private var nonSkinMaskScratch: Mat? = null
     private var satBoostScratch: Mat? = null
     private var satHalfScratch: Mat? = null
-    private var faceDetScaledMat: Mat? = null
-    private var faceDetOutMat: Mat? = null
     private var toneLutMat: Mat? = null
     private var cachedLutKey: String = ""
     private var satLutMat: Mat? = null
@@ -100,6 +105,10 @@ class OpenCvFrameProcessor(
     }
 
     fun resetTemporalState() {
+        frameMotionProbe.reset()
+        consecutiveDuplicateReuses = 0
+        prevEnhancedRgbaMat?.release(); prevEnhancedRgbaMat = null
+        workMatScratch?.release(); workMatScratch = null
         prevDenoisedFrame?.release(); prevDenoisedFrame = null
         prevLumaMean = null
         prevFaceBoxes = emptyList()
@@ -112,16 +121,13 @@ class OpenCvFrameProcessor(
         blendScratch?.release(); blendScratch = null
         blurScratch?.release(); blurScratch = null
         claheOutScratch?.release(); claheOutScratch = null
+        cachedClahe = null
+        cachedClaheClip = -1.0
         alignedScratch?.release(); alignedScratch = null
         skinMaskScratch?.release(); skinMaskScratch = null
         nonSkinMaskScratch?.release(); nonSkinMaskScratch = null
         satBoostScratch?.release(); satBoostScratch = null
         satHalfScratch?.release(); satHalfScratch = null
-        faceDetScaledMat?.release(); faceDetScaledMat = null
-        faceDetOutMat?.release(); faceDetOutMat = null
-        faceDetector = null
-        faceDetInputW = -1
-        faceDetInputH = -1
         toneLutMat?.release(); toneLutMat = null
         cachedLutKey = ""
         satLutMat?.release(); satLutMat = null
@@ -130,11 +136,12 @@ class OpenCvFrameProcessor(
     }
 
     /**
-     * Genuine multi-stage AI enhancement pipeline per frame:
+     * Genuine multi-stage adaptive AI enhancement pipeline per frame:
+     * 0. Near-duplicate frame gate (< 0.65 MAD, max 2 consecutive reuses)
      * 1. Gentle temporal motion-masked grain suppression (zero spatial blur)
-     * 2. DnCNN neural luminance denoising ([1,1,256,256] ONNX) + chroma deblocking + restrained tone LUT
-     * 3. YuNet face detection with temporal bbox stabilization
-     * 4. Real-ESRGAN x4v3 aspect-preserving tiled super-resolution + dedicated Face ROI AI SR -> [outDims.width x outDims.height]
+     * 2. DnCNN neural luminance denoising ([1,1,256,256] ONNX) + chroma deblocking + cached CLAHE + tone LUT
+     * 3. Keyframe-scheduled Multi-Backend YuNet face detection with IoU box smoothing
+     * 4. Double-buffered Real-ESRGAN x4v3 static-tile-cached SR + Face ROI AI SR -> [outDims.width x outDims.height]
      */
     fun processFrame(
         srcBgr: Mat,
@@ -145,11 +152,11 @@ class OpenCvFrameProcessor(
         estimatedTotalFrames: Int,
         forceLightweightFallback: Boolean,
         tileSizeOverride: Int? = null,
+        frameIndex: Int = 0,
         logger: EngineDiagnosticsLogger? = null,
         isCancelled: () -> Boolean,
         onUpscaleTileProgress: (done: Int, total: Int, tileSize: Int) -> Unit = { _, _, _ -> }
     ): FrameProcessResult {
-        var workMat = srcBgr.clone()
         var usedFallback = forceLightweightFallback
         var fallbackReason: String? = null
         var accelLabel = onnxEngine.providerLabel
@@ -157,28 +164,88 @@ class OpenCvFrameProcessor(
         var usedAiDenoise = false
         var dncnnMs = 0L
         var faceAiMs = 0L
+        var staticTilesReused = 0
+
+        // 0. Measure thumbnail frame MAD once for duplicate-frame check, scene-cut gating & face keyframing
+        val (_, frameMad) = frameMotionProbe.computeFrameThumbnailAndMad(srcBgr)
+        val cachedRgba = prevEnhancedRgbaMat
+        val canReuseWholeFrame = !forceLightweightFallback &&
+            frameIndex > 0 &&
+            cachedRgba != null &&
+            cachedRgba.cols() == outDims.width &&
+            cachedRgba.rows() == outDims.height &&
+            TemporalReusePolicy.shouldReuseDuplicateFrame(
+                frameMad = frameMad,
+                consecutiveDuplicateReuses = consecutiveDuplicateReuses,
+                hasCachedFrame = true
+            )
+
+        if (canReuseWholeFrame && cachedRgba != null) {
+            consecutiveDuplicateReuses++
+            Utils.matToBitmap(cachedRgba, reusableOutBitmap)
+            return FrameProcessResult(
+                facesEnhanced = prevFaceBoxes.size,
+                usedAiDenoise = params.useAiDenoise && onnxEngine.isDncnnReady,
+                activeAccelerationLabel = accelLabel,
+                usedDuplicateFrameReuse = true
+            )
+        }
+        consecutiveDuplicateReuses = 0
+        val isSceneCut = frameIndex == 0 || frameMad >= TemporalReusePolicy.SCENE_CUT_MAD_THRESHOLD
+
+        val workScratch = workMatScratch ?: Mat().also { workMatScratch = it }
+        srcBgr.copyTo(workScratch)
+        var activeMat = workScratch
+        var ownedAiMat: Mat? = null
 
         try {
-            // 1. Temporal Motion-Stabilized Noise Reduction (never blurs pixels spatially before SR)
-            applyTemporalMotionStabilizedDenoise(workMat, params.denoiseStrength)
+            // 1. Temporal Motion-Stabilized Noise Reduction (never blends across scene cuts)
+            if (!isSceneCut) {
+                applyTemporalMotionStabilizedDenoise(activeMat, params.denoiseStrength)
+            } else {
+                val prev = prevDenoisedFrame
+                if (prev == null || prev.cols() != activeMat.cols() || prev.rows() != activeMat.rows()) {
+                    prevDenoisedFrame?.release()
+                    prevDenoisedFrame = activeMat.clone()
+                } else {
+                    activeMat.copyTo(prev)
+                }
+            }
 
-            // 2. Single Fused Luma Pass: DnCNN Neural Denoise + Chroma Deblocking + Restrained CLAHE + Tone LUT
-            val ycrcbOutcome = applyFusedYCrCbMastering(workMat, params, logger)
+            // 2. Single Fused Luma Pass: DnCNN Neural Denoise (Adaptive GPU/NPU/CPU + tile cache) + CLAHE + Tone LUT
+            val ycrcbOutcome = applyFusedYCrCbMastering(activeMat, params, isSceneCut, logger)
             usedAiDenoise = ycrcbOutcome.first
             dncnnMs = ycrcbOutcome.second
 
             // 3. Neutral Temperature / White Balance & Skin-Safe Saturation
             if (abs(params.wbGainR - 1f) >= 0.01f || abs(params.wbGainB - 1f) >= 0.01f) {
-                applyWhiteBalance(workMat, params)
+                applyWhiteBalance(activeMat, params)
             }
             if (abs(params.saturationGain - 1f) > 0.01f) {
-                applySaturationBoost(workMat, params.saturationGain, params.skinToneProtection)
+                applySaturationBoost(activeMat, params.saturationGain, params.skinToneProtection)
             }
 
-            // 4. YuNet Neural Face Detection in cleaned input space
-            val rawFaces = detectFacesWithYuNet(workMat, logger)
-            val stabilizedFaces = smoothFaceBoxes(prevFaceBoxes, rawFaces, workMat.cols(), workMat.rows())
-            prevFaceBoxes = stabilizedFaces
+            // 4. Keyframe-Scheduled Adaptive Face AI Detection (YuNet on fastest verified GPU/NPU/CPU backend)
+            val runFaceDetNow = TemporalReusePolicy.shouldRunFullFaceDetection(
+                frameIndex = frameIndex,
+                frameMad = frameMad,
+                hasPreviousBoxes = prevFaceBoxes.isNotEmpty()
+            )
+            val stabilizedFaces = if (runFaceDetNow) {
+                val td0 = System.currentTimeMillis()
+                val rawFaces = onnxEngine.yuNetRunner.detectFaces(activeMat, logger)
+                faceAiMs += (System.currentTimeMillis() - td0)
+                val smoothed = smoothFaceBoxes(
+                    if (isSceneCut) emptyList() else prevFaceBoxes,
+                    rawFaces,
+                    activeMat.cols(),
+                    activeMat.rows()
+                )
+                prevFaceBoxes = smoothed
+                smoothed
+            } else {
+                prevFaceBoxes
+            }
             facesEnhanced = stabilizedFaces.size
 
             // 5. Real-ESRGAN x4v3 Tiled Super-Resolution + Dedicated Face ROI AI Enhancement
@@ -186,7 +253,7 @@ class OpenCvFrameProcessor(
                 val tAi0 = System.currentTimeMillis()
                 val activeTileSize = tileSizeOverride ?: outDims.aiTileSize
                 val outcome = onnxEngine.enhanceBgrWithPresetTiles(
-                    srcBgr = workMat,
+                    srcBgr = activeMat,
                     outW = outDims.width,
                     outH = outDims.height,
                     tileSize = activeTileSize,
@@ -197,73 +264,79 @@ class OpenCvFrameProcessor(
                     fallbackSharpnessBoost = params.sharpnessAmount,
                     faces = stabilizedFaces,
                     faceEnhanceStrength = params.faceEnhanceStrength,
+                    isSceneCut = isSceneCut,
                     isCancelled = isCancelled,
                     logger = logger,
                     onTileProgress = onUpscaleTileProgress
                 )
                 logger?.aiInferenceMs?.addAndGet(System.currentTimeMillis() - tAi0)
-                faceAiMs = outcome.faceAiMs
+                faceAiMs += outcome.faceAiMs
+                staticTilesReused = outcome.staticTilesReused
                 usedFallback = outcome.usedLightweightFallback
                 fallbackReason = outcome.fallbackReason
                 accelLabel = outcome.activeAccelerationLabel
-                workMat.release()
-                workMat = outcome.outputBgr
+                ownedAiMat = outcome.outputBgr
+                activeMat = ownedAiMat
             } else {
-                if (workMat.cols() != outDims.width || workMat.rows() != outDims.height) {
+                if (activeMat.cols() != outDims.width || activeMat.rows() != outDims.height) {
                     val aligned = alignedScratch ?: Mat().also { alignedScratch = it }
                     Imgproc.resize(
-                        workMat,
+                        activeMat,
                         aligned,
                         Size(outDims.width.toDouble(), outDims.height.toDouble()),
                         0.0,
                         0.0,
                         Imgproc.INTER_CUBIC
                     )
-                    workMat.release()
-                    workMat = aligned.clone()
+                    activeMat = aligned
                 }
                 if (onnxEngine.isGlesGpuReady && (params.sharpnessAmount > 0.03f || params.edgeEnhancementAmount > 0.03f)) {
                     val sharpness = (params.sharpnessAmount + params.edgeEnhancementAmount * 0.35f).coerceIn(0.05f, 0.45f)
                     val gpuOk = onnxEngine.gpuProcessor.enhanceBgrInPlace(
-                        bgr = workMat,
+                        bgr = activeMat,
                         sharpness = sharpness,
                         contrast = 1.02f,
                         saturation = 1.0f
                     )
-                    if (gpuOk) {
-                        accelLabel = "GLES 3.1 GPU"
-                    } else {
-                        applyFastUnsharpMask(workMat, params.sharpnessAmount, params.edgeEnhancementAmount)
+                    if (!gpuOk) {
+                        applyFastUnsharpMask(activeMat, params.sharpnessAmount, params.edgeEnhancementAmount)
                     }
                 } else if (params.sharpnessAmount > 0.03f || params.edgeEnhancementAmount > 0.03f) {
-                    applyFastUnsharpMask(workMat, params.sharpnessAmount, params.edgeEnhancementAmount)
+                    applyFastUnsharpMask(activeMat, params.sharpnessAmount, params.edgeEnhancementAmount)
                 }
             }
 
             // Ensure exact target output resolution
-            if (workMat.cols() != outDims.width || workMat.rows() != outDims.height) {
+            if (activeMat.cols() != outDims.width || activeMat.rows() != outDims.height) {
                 val aligned = alignedScratch ?: Mat().also { alignedScratch = it }
                 Imgproc.resize(
-                    workMat,
+                    activeMat,
                     aligned,
                     Size(outDims.width.toDouble(), outDims.height.toDouble()),
                     0.0,
                     0.0,
                     Imgproc.INTER_LINEAR
                 )
-                workMat.release()
-                workMat = aligned.clone()
+                activeMat = aligned
             }
 
-            val rgbaMat = reusableRgbaMat?.takeIf { it.cols() == workMat.cols() && it.rows() == workMat.rows() }
-                ?: Mat(workMat.rows(), workMat.cols(), CvType.CV_8UC4).also {
+            val rgbaMat = reusableRgbaMat?.takeIf { it.cols() == activeMat.cols() && it.rows() == activeMat.rows() }
+                ?: Mat(activeMat.rows(), activeMat.cols(), CvType.CV_8UC4).also {
                     reusableRgbaMat?.release()
                     reusableRgbaMat = it
                 }
-            Imgproc.cvtColor(workMat, rgbaMat, Imgproc.COLOR_BGR2RGBA)
+            Imgproc.cvtColor(activeMat, rgbaMat, Imgproc.COLOR_BGR2RGBA)
+
+            val prevOut = prevEnhancedRgbaMat?.takeIf { it.cols() == rgbaMat.cols() && it.rows() == rgbaMat.rows() }
+                ?: Mat(rgbaMat.rows(), rgbaMat.cols(), CvType.CV_8UC4).also {
+                    prevEnhancedRgbaMat?.release()
+                    prevEnhancedRgbaMat = it
+                }
+            rgbaMat.copyTo(prevOut)
+
             Utils.matToBitmap(rgbaMat, reusableOutBitmap)
         } finally {
-            workMat.release()
+            ownedAiMat?.release()
         }
 
         return FrameProcessResult(
@@ -273,82 +346,10 @@ class OpenCvFrameProcessor(
             faceAiMs = faceAiMs,
             lightweightFallbackTriggered = usedFallback,
             fallbackReason = fallbackReason,
-            activeAccelerationLabel = accelLabel
+            activeAccelerationLabel = accelLabel,
+            staticTilesReused = staticTilesReused,
+            usedDuplicateFrameReuse = false
         )
-    }
-
-    /**
-     * Detects up to 3 primary human faces via bundled YuNet ONNX detector (face_detection_yunet_2023mar.onnx),
-     * running on a <= 480px copy for speed and mapping exact bounding boxes back to full frame coordinates.
-     */
-    private fun detectFacesWithYuNet(srcBgr: Mat, logger: EngineDiagnosticsLogger?): List<Rect> {
-        val modelPath = faceDetectorPath ?: return emptyList()
-        val srcW = srcBgr.cols()
-        val srcH = srcBgr.rows()
-        if (srcW < 32 || srcH < 32) return emptyList()
-
-        return try {
-            val maxDetSide = 480.0
-            val scale = if (max(srcW, srcH) > maxDetSide) maxDetSide / max(srcW, srcH).toDouble() else 1.0
-            val detW = (srcW * scale).roundToInt().coerceAtLeast(32)
-            val detH = (srcH * scale).roundToInt().coerceAtLeast(32)
-
-            val detInput = if (scale < 0.99) {
-                val scaled = faceDetScaledMat ?: Mat().also { faceDetScaledMat = it }
-                Imgproc.resize(srcBgr, scaled, Size(detW.toDouble(), detH.toDouble()), 0.0, 0.0, Imgproc.INTER_AREA)
-                scaled
-            } else {
-                srcBgr
-            }
-
-            val detector = faceDetector ?: FaceDetectorYN.create(
-                modelPath,
-                "",
-                Size(detW.toDouble(), detH.toDouble()),
-                0.56f,
-                0.30f,
-                10
-            ).also {
-                faceDetector = it
-                faceDetInputW = detW
-                faceDetInputH = detH
-            }
-
-            if (faceDetInputW != detW || faceDetInputH != detH) {
-                detector.inputSize = Size(detW.toDouble(), detH.toDouble())
-                faceDetInputW = detW
-                faceDetInputH = detH
-            }
-
-            val outFaces = faceDetOutMat ?: Mat().also { faceDetOutMat = it }
-            detector.detect(detInput, outFaces)
-
-            val rows = outFaces.rows()
-            if (rows <= 0) return emptyList()
-
-            val invScaleX = srcW.toDouble() / detW.toDouble()
-            val invScaleY = srcH.toDouble() / detH.toDouble()
-            val rowBuf = FloatArray(outFaces.cols().coerceAtLeast(15))
-            val detected = ArrayList<Pair<Rect, Float>>(rows)
-
-            for (r in 0 until rows) {
-                outFaces.get(r, 0, rowBuf)
-                val score = rowBuf[14]
-                if (score < 0.56f) continue
-                val x = (rowBuf[0] * invScaleX).roundToInt().coerceIn(0, srcW - 2)
-                val y = (rowBuf[1] * invScaleY).roundToInt().coerceIn(0, srcH - 2)
-                val w = (rowBuf[2] * invScaleX).roundToInt().coerceIn(8, srcW - x)
-                val h = (rowBuf[3] * invScaleY).roundToInt().coerceIn(8, srcH - y)
-                if (w >= 16 && h >= 16) {
-                    detected.add(Rect(x, y, w, h) to (w * h).toFloat())
-                }
-            }
-
-            detected.sortedByDescending { it.second }.take(3).map { it.first }
-        } catch (t: Throwable) {
-            logger?.warn("YuNet face detection skipped (${t.message})")
-            emptyList()
-        }
     }
 
     private fun applyTemporalMotionStabilizedDenoise(bgr: Mat, strength: Float) {
@@ -373,15 +374,10 @@ class OpenCvFrameProcessor(
         bgr.copyTo(prev)
     }
 
-    /**
-     * Single-pass YCrCb luminance mastering:
-     * - Executes real DnCNN neural denoiser on Y channel (preserves edges/textures while cleaning noise)
-     * - Applies light chroma median cleanup only for high compression blockiness
-     * - Restrained tone LUT + ultra-gentle CLAHE (<= 0.16) + flicker damping
-     */
     private fun applyFusedYCrCbMastering(
         bgr: Mat,
         params: AdaptiveAdjustmentParams,
+        isSceneCut: Boolean,
         logger: EngineDiagnosticsLogger?
     ): Pair<Boolean, Long> {
         val ycrcb = ycrcbScratch ?: Mat().also { ycrcbScratch = it }
@@ -393,10 +389,15 @@ class OpenCvFrameProcessor(
             Core.split(ycrcb, channels)
             val yChan = channels[0]
 
-            // Real DnCNN Neural Luminance Denoising (removes noise/grain cleanly without edge blur)
+            // Real DnCNN Neural Luminance Denoising (adaptive backend + static-tile cache)
             if (params.useAiDenoise && onnxEngine.isDncnnReady) {
                 val td0 = System.currentTimeMillis()
-                usedDnCnn = onnxEngine.denoiseLuminanceYWithDnCnn(yChan, params.dncnnStrength, logger)
+                usedDnCnn = onnxEngine.denoiseLuminanceYWithDnCnn(
+                    yChan = yChan,
+                    strength = params.dncnnStrength,
+                    isSceneCut = isSceneCut,
+                    logger = logger
+                )
                 dncnnMs = System.currentTimeMillis() - td0
             }
 
@@ -416,9 +417,9 @@ class OpenCvFrameProcessor(
                 }
             }
 
-            // Restrained local clarity via CLAHE (capped at 0.16 weight so video never looks artificially HDR)
+            // Restrained local clarity via cached CLAHE object
             if (params.claheClipLimit > 0.22) {
-                val clahe = Imgproc.createCLAHE(params.claheClipLimit, Size(8.0, 8.0))
+                val clahe = getOrCreateClahe(params.claheClipLimit)
                 val claheOut = claheOutScratch ?: Mat().also { claheOutScratch = it }
                 clahe.apply(yChan, claheOut)
                 Core.addWeighted(claheOut, 0.16, yChan, 0.84, 0.0, yChan)
@@ -430,7 +431,7 @@ class OpenCvFrameProcessor(
             if (params.flickerReductionAlpha > 0.01f) {
                 val currentMean = Core.mean(yChan).`val`[0]
                 val prev = prevLumaMean
-                if (prev == null) {
+                if (prev == null || isSceneCut) {
                     prevLumaMean = currentMean
                 } else {
                     val targetMean = prev * params.flickerReductionAlpha + currentMean * (1.0 - params.flickerReductionAlpha)
@@ -448,6 +449,17 @@ class OpenCvFrameProcessor(
             channels.forEach { it.release() }
         }
         return usedDnCnn to dncnnMs
+    }
+
+    private fun getOrCreateClahe(clipLimit: Double): CLAHE {
+        val existing = cachedClahe
+        if (existing != null && abs(cachedClaheClip - clipLimit) < 0.005) {
+            return existing
+        }
+        return Imgproc.createCLAHE(clipLimit, Size(8.0, 8.0)).also {
+            cachedClahe = it
+            cachedClaheClip = clipLimit
+        }
     }
 
     private fun getOrCreateToneLut(params: AdaptiveAdjustmentParams): Mat {
@@ -486,9 +498,6 @@ class OpenCvFrameProcessor(
         }
     }
 
-    /**
-     * Soft highlight-safe saturation adjustment with natural skin-tone protection.
-     */
     private fun applySaturationBoost(bgr: Mat, satGain: Float, protectSkin: Boolean) {
         val hsv = hsvScratch ?: Mat().also { hsvScratch = it }
         val channels = ArrayList<Mat>(3)
@@ -542,10 +551,6 @@ class OpenCvFrameProcessor(
     }
 
     companion object {
-        /**
-         * Temporally stabilizes detected face bounding boxes against nearest boxes in the
-         * previous frame using IoU matching and exponential smoothing to prevent shimmer.
-         */
         fun smoothFaceBoxes(
             prev: List<Rect>,
             curr: List<Rect>,
@@ -553,7 +558,7 @@ class OpenCvFrameProcessor(
             frameH: Int
         ): List<Rect> {
             if (prev.isEmpty() || curr.isEmpty()) return curr
-            val alpha = 0.65f // new box weight
+            val alpha = 0.65f
             return curr.map { box ->
                 var bestMatch: Rect? = null
                 var bestIou = 0.25f

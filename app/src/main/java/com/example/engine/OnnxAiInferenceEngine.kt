@@ -2,12 +2,13 @@ package com.example.engine
 
 import ai.onnxruntime.OnnxTensor
 import ai.onnxruntime.OrtEnvironment
-import ai.onnxruntime.OrtProvider
 import ai.onnxruntime.OrtSession
-import ai.onnxruntime.providers.NNAPIFlags
 import android.content.Context
-import android.os.Build
+import com.example.model.AdaptiveHardwareProfile
+import com.example.model.BackendCandidateId
 import com.example.model.DeviceCapabilities
+import com.example.model.ModelKind
+import com.example.model.ThermalState
 import org.opencv.core.Core
 import org.opencv.core.CvType
 import org.opencv.core.Mat
@@ -16,10 +17,13 @@ import org.opencv.core.Scalar
 import org.opencv.core.Size
 import org.opencv.imgproc.Imgproc
 import java.io.File
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.nio.FloatBuffer
-import java.util.EnumSet
+import java.util.concurrent.Callable
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
-import java.util.concurrent.TimeUnit
+import java.util.concurrent.Future
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.ceil
@@ -30,349 +34,55 @@ import kotlin.math.min
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
 
-/**
- * Pure geometry helpers for dynamic preset tile division and upscaled tile mapping
- * with guaranteed seam overlap, 1:1 aspect preservation, and zero cropped frame content.
- */
-object AiTilingMath {
-
-    data class TileRegion(
-        val index: Int,
-        val row: Int,
-        val col: Int,
-        val x: Int,
-        val y: Int,
-        val width: Int,
-        val height: Int,
-        val outX: Int = x,
-        val outY: Int = y,
-        val outWidth: Int = width,
-        val outHeight: Int = height,
-        val isFirstX: Boolean,
-        val isLastX: Boolean,
-        val isFirstY: Boolean,
-        val isLastY: Boolean
-    )
-
-    data class TileGridPlan(
-        val cols: Int,
-        val rows: Int,
-        val totalTiles: Int,
-        val overlapX: Int,
-        val overlapY: Int,
-        val outOverlapX: Int = overlapX,
-        val outOverlapY: Int = overlapY,
-        val tiles: List<TileRegion>
-    )
-
-    /**
-     * Dynamically divides a [frameW] x [frameH] frame into exactly [targetTilesPerFrame]
-     * overlapping tiles (e.g., 4 -> 2x2, 6 -> 3x2/2x3, 12 -> 4x3/3x4, 25 -> 5x5) covering 100%
-     * of the frame with zero cropped pixels.
-     */
-    fun planDynamicTileGrid(frameW: Int, frameH: Int, targetTilesPerFrame: Int): TileGridPlan {
-        val safeW = frameW.coerceAtLeast(2)
-        val safeH = frameH.coerceAtLeast(2)
-        val target = targetTilesPerFrame.coerceAtLeast(1)
-
-        val (cols, rows) = chooseGridDimensions(safeW, safeH, target)
-        val xAxis = divideAxisWithOverlap(safeW, cols)
-        val yAxis = divideAxisWithOverlap(safeH, rows)
-
-        val tiles = ArrayList<TileRegion>(cols * rows)
-        var idx = 0
-        for (r in 0 until rows) {
-            val (y0, tileH) = yAxis.segments[r]
-            for (c in 0 until cols) {
-                val (x0, tileW) = xAxis.segments[c]
-                tiles.add(
-                    TileRegion(
-                        index = idx++,
-                        row = r,
-                        col = c,
-                        x = x0,
-                        y = y0,
-                        width = tileW,
-                        height = tileH,
-                        outX = x0,
-                        outY = y0,
-                        outWidth = tileW,
-                        outHeight = tileH,
-                        isFirstX = (c == 0),
-                        isLastX = (c == cols - 1),
-                        isFirstY = (r == 0),
-                        isLastY = (r == rows - 1)
-                    )
-                )
-            }
-        }
-
-        return TileGridPlan(
-            cols = cols,
-            rows = rows,
-            totalTiles = tiles.size,
-            overlapX = xAxis.overlap,
-            overlapY = yAxis.overlap,
-            outOverlapX = xAxis.overlap,
-            outOverlapY = yAxis.overlap,
-            tiles = tiles
-        )
-    }
-
-    /**
-     * Plans an optimal aspect-preserving tile grid for input [inW]x[inH] -> output [outW]x[outH]
-     * so every tile stays <= [tileSize] where possible (1:1 mirror-padded, zero distortion) and
-     * maps cleanly with guaranteed overlap into [outW]x[outH] output space with zero seams.
-     */
-    fun planUpscaleTileGrid(
-        inW: Int,
-        inH: Int,
-        outW: Int,
-        outH: Int,
-        tileSize: Int,
-        maxTilesCap: Int = 25
-    ): TileGridPlan {
-        val safeInW = inW.coerceAtLeast(2)
-        val safeInH = inH.coerceAtLeast(2)
-        val safeOutW = outW.coerceAtLeast(safeInW)
-        val safeOutH = outH.coerceAtLeast(safeInH)
-        val safeTile = tileSize.coerceIn(128, 512)
-
-        if (safeInW <= safeTile && safeInH <= safeTile) {
-            return TileGridPlan(
-                cols = 1,
-                rows = 1,
-                totalTiles = 1,
-                overlapX = 0,
-                overlapY = 0,
-                outOverlapX = 0,
-                outOverlapY = 0,
-                tiles = listOf(
-                    TileRegion(
-                        index = 0,
-                        row = 0,
-                        col = 0,
-                        x = 0,
-                        y = 0,
-                        width = safeInW,
-                        height = safeInH,
-                        outX = 0,
-                        outY = 0,
-                        outWidth = safeOutW,
-                        outHeight = safeOutH,
-                        isFirstX = true,
-                        isLastX = true,
-                        isFirstY = true,
-                        isLastY = true
-                    )
-                )
-            )
-        }
-
-        val overlapEstimate = (safeTile * 0.12f).roundToInt().coerceIn(16, 48)
-        val step = (safeTile - overlapEstimate).coerceAtLeast(64)
-        var cols = if (safeInW <= safeTile) 1 else ceil((safeInW - overlapEstimate).toDouble() / step.toDouble()).toInt().coerceAtLeast(2)
-        var rows = if (safeInH <= safeTile) 1 else ceil((safeInH - overlapEstimate).toDouble() / step.toDouble()).toInt().coerceAtLeast(2)
-
-        val safeCap = maxTilesCap.coerceAtLeast(1)
-        while (cols * rows > safeCap && (cols > 1 || rows > 1)) {
-            if (cols >= rows && cols > 1) cols-- else if (rows > 1) rows--
-        }
-
-        val xAxis = divideAxisWithOverlap(safeInW, cols)
-        val yAxis = divideAxisWithOverlap(safeInH, rows)
-
-        val scaleX = safeOutW.toDouble() / safeInW.toDouble()
-        val scaleY = safeOutH.toDouble() / safeInH.toDouble()
-
-        val tiles = ArrayList<TileRegion>(cols * rows)
-        var idx = 0
-        for (r in 0 until rows) {
-            val (y0, inTileH) = yAxis.segments[r]
-            val outY0 = if (r == 0) 0 else floor(y0 * scaleY).toInt().coerceIn(0, safeOutH - 2)
-            val outY1 = if (r == rows - 1) safeOutH else ceil((y0 + inTileH) * scaleY).toInt().coerceIn(outY0 + 2, safeOutH)
-            val outTileH = outY1 - outY0
-
-            for (c in 0 until cols) {
-                val (x0, inTileW) = xAxis.segments[c]
-                val outX0 = if (c == 0) 0 else floor(x0 * scaleX).toInt().coerceIn(0, safeOutW - 2)
-                val outX1 = if (c == cols - 1) safeOutW else ceil((x0 + inTileW) * scaleX).toInt().coerceIn(outX0 + 2, safeOutW)
-                val outTileW = outX1 - outX0
-
-                tiles.add(
-                    TileRegion(
-                        index = idx++,
-                        row = r,
-                        col = c,
-                        x = x0,
-                        y = y0,
-                        width = inTileW,
-                        height = inTileH,
-                        outX = outX0,
-                        outY = outY0,
-                        outWidth = outTileW,
-                        outHeight = outTileH,
-                        isFirstX = (c == 0),
-                        isLastX = (c == cols - 1),
-                        isFirstY = (r == 0),
-                        isLastY = (r == rows - 1)
-                    )
-                )
-            }
-        }
-
-        return TileGridPlan(
-            cols = cols,
-            rows = rows,
-            totalTiles = tiles.size,
-            overlapX = xAxis.overlap,
-            overlapY = yAxis.overlap,
-            outOverlapX = (xAxis.overlap * scaleX).roundToInt().coerceAtLeast(if (cols > 1) 12 else 0),
-            outOverlapY = (yAxis.overlap * scaleY).roundToInt().coerceAtLeast(if (rows > 1) 12 else 0),
-            tiles = tiles
-        )
-    }
-
-    private fun chooseGridDimensions(w: Int, h: Int, targetTiles: Int): Pair<Int, Int> {
-        val isPortrait = h > w
-        return when (targetTiles) {
-            4 -> 2 to 2
-            6 -> if (isPortrait) 2 to 3 else 3 to 2
-            12 -> if (isPortrait) 3 to 4 else 4 to 3
-            25 -> 5 to 5
-            else -> {
-                val aspect = w.toDouble() / h.toDouble()
-                var bestCols = 1
-                var bestRows = targetTiles
-                var bestDiff = Double.MAX_VALUE
-                val limit = sqrt(targetTiles.toDouble()).toInt() + 1
-                for (a in 1..limit) {
-                    if (targetTiles % a == 0) {
-                        val b = targetTiles / a
-                        for ((c, r) in listOf(a to b, b to a)) {
-                            val diff = abs((c.toDouble() / r.toDouble()) - aspect)
-                            if (diff < bestDiff) {
-                                bestDiff = diff
-                                bestCols = c
-                                bestRows = r
-                            }
-                        }
-                    }
-                }
-                bestCols to bestRows
-            }
-        }
-    }
-
-    private data class AxisDivision(
-        val overlap: Int,
-        val segments: List<Pair<Int, Int>>
-    )
-
-    private fun divideAxisWithOverlap(totalLen: Int, count: Int): AxisDivision {
-        if (count <= 1) {
-            return AxisDivision(overlap = 0, segments = listOf(0 to totalLen))
-        }
-        val baseStride = totalLen.toDouble() / count.toDouble()
-        val maxSafeOverlap = ((totalLen / count) - 1).coerceAtLeast(1)
-        val desiredOverlap = (baseStride * 0.16).roundToInt()
-        val overlap = desiredOverlap.coerceIn(min(16, maxSafeOverlap), maxSafeOverlap)
-
-        val tileSpan = ceil((totalLen + (count - 1) * overlap) / count.toDouble())
-            .toInt()
-            .coerceIn(1, totalLen)
-
-        val spanStep = if (count > 1) {
-            (totalLen - tileSpan).toDouble() / (count - 1).toDouble()
-        } else {
-            0.0
-        }
-
-        val segments = (0 until count).map { i ->
-            val start = if (i == count - 1) {
-                (totalLen - tileSpan).coerceAtLeast(0)
-            } else {
-                (i * spanStep).roundToInt().coerceIn(0, (totalLen - tileSpan).coerceAtLeast(0))
-            }
-            start to tileSpan
-        }
-        return AxisDivision(overlap = overlap, segments = segments)
-    }
-
-    fun featherWeight(
-        pos: Int,
-        len: Int,
-        isFirst: Boolean,
-        isLast: Boolean,
-        feather: Int
-    ): Float {
-        if (feather <= 0) return 1f
-        var w = 1f
-        if (!isFirst && pos < feather) {
-            w = min(w, (pos + 1).toFloat() / feather.toFloat())
-        }
-        if (!isLast && pos >= len - feather) {
-            w = min(w, (len - pos).toFloat() / feather.toFloat())
-        }
-        return w.coerceIn(0.05f, 1f)
-    }
-}
-
-/**
- * Safeguard policy that prioritizes real ONNX AI execution (stepping down tile sizes if needed)
- * and only triggers non-neural fallback under catastrophic multi-second-per-tile hangs.
- */
-object AiSpeedPolicy {
-    const val MAX_ACCEPTABLE_AI_FRAME_MS = 12_000L
-    const val MAX_ACCEPTABLE_SINGLE_TILE_MS_HEAVY = 3_000L
-
-    fun shouldEngageLightweightFallback(
-        measuredTileMs: Long,
-        tilesPerFrame: Int,
-        estimatedFrameCount: Int
-    ): Boolean {
-        if (tilesPerFrame <= 0 || measuredTileMs <= 0L) return false
-        if (measuredTileMs > MAX_ACCEPTABLE_SINGLE_TILE_MS_HEAVY) return true
-        val projectedPerFrameMs = measuredTileMs * tilesPerFrame.toLong()
-        return estimatedFrameCount >= 180 && projectedPerFrameMs > MAX_ACCEPTABLE_AI_FRAME_MS
-    }
-}
-
 data class TileProcessOutcome(
     val outputBgr: Mat,
     val usedLightweightFallback: Boolean,
     val fallbackReason: String? = null,
     val activeAccelerationLabel: String,
-    val faceAiMs: Long = 0L
+    val faceAiMs: Long = 0L,
+    val staticTilesReused: Int = 0
 )
 
 class OnnxAiInferenceEngine(private val context: Context) {
 
     private val env: OrtEnvironment by lazy { OrtEnvironment.getEnvironment() }
     val gpuProcessor: GlesGpuImageProcessor = GlesGpuImageProcessor()
+    val yuNetRunner: YuNetOnnxRunner by lazy { YuNetOnnxRunner(env) }
+    private val hwAccelerator: AdaptiveHardwareAccelerator by lazy {
+        AdaptiveHardwareAccelerator(context, env)
+    }
 
-    private var cpuFallbackSession: OrtSession? = null
-    private var activeSrSession: OrtSession? = null
-    private var dncnnSession: OrtSession? = null
+    // Independent ranked fallback chains per AI model
+    private var srRankedSessions: List<Pair<BackendCandidateId, OrtSession>> = emptyList()
+    private var srActiveIndex: Int = 0
+    private var dncnnRankedSessions: List<Pair<BackendCandidateId, OrtSession>> = emptyList()
+    private var dncnnActiveIndex: Int = 0
 
-    private var activeProviderDescription: String = "CPU XNNPACK"
+    var adaptiveProfile: AdaptiveHardwareProfile? = null
+        private set
+
+    var runtimeFallbacksCount: Int = 0
+        private set
+
+    private var activeProviderDescription: String = "Initializing..."
     private var benchmarkDetails: String = "Not benchmarked"
     private var lastInitDurationMs: Long = 0L
-    private var nnapiDisabledDueToRuntimeError = false
     private var glesGpuAvailable = false
 
-    // Reusable Real-ESRGAN ONNX tile buffers
+    // Double-buffered direct FloatBuffers for pipelined zero-GC Real-ESRGAN tile packing
     private var allocTileSize: Int = 0
-    private var tileInArr: FloatArray = FloatArray(0)
-    private var tileInBuf: FloatBuffer = FloatBuffer.wrap(tileInArr)
-    private var tileInPlaneTmp: FloatArray = FloatArray(0)
+    private var tileInBufA: FloatBuffer? = null
+    private var tileInBufB: FloatBuffer? = null
+    private var tileInPlaneTmpA: FloatArray = FloatArray(0)
+    private var tileInPlaneTmpB: FloatArray = FloatArray(0)
     private var tileOutPlaneTmp: FloatArray = FloatArray(0)
+    private var tilePrepExecutor: ExecutorService? = null
 
-    // Reusable DnCNN ONNX [1, 1, 256, 256] buffers
+    // Direct off-heap FloatBuffer for DnCNN [1, 1, 256, 256]
     private val dncnnTileSize = 256
     private val dncnnTilePixels = dncnnTileSize * dncnnTileSize
-    private var dncnnInArr: FloatArray? = null
-    private var dncnnInBuf: FloatBuffer? = null
+    private var dncnnDirectInBuf: FloatBuffer? = null
+    private var dncnnInTmpArr: FloatArray? = null
     private var dncnnOutArr: FloatArray? = null
     private var dncnnPadMat: Mat? = null
     private var dncnnFloatMat: Mat? = null
@@ -382,47 +92,61 @@ class OnnxAiInferenceEngine(private val context: Context) {
     private var dncnnWeightedMat: Mat? = null
     private var dncnnU8Mat: Mat? = null
 
-    // Reusable OpenCV native C++ scratch Mats (zero per-tile/per-frame allocations)
+    // Static tile temporal reuse caches (100% quality preserving)
+    private val srTileCache = StaticTileReuseCache()
+    private val dncnnTileCache = StaticTileReuseCache()
+
+    // Reusable OpenCV native C++ scratch Mats
     private var srcRgbMat: Mat? = null
     private var baseRgb8u: Mat? = null
-    private var tilePaddedMat: Mat? = null
-    private var tileFloatHwc: Mat? = null
-    private var tileChannels: List<Mat>? = null
+    private var tilePaddedMatA: Mat? = null
+    private var tilePaddedMatB: Mat? = null
+    private var tileFloatHwcA: Mat? = null
+    private var tileFloatHwcB: Mat? = null
+    private var tileChannelsA: List<Mat>? = null
+    private var tileChannelsB: List<Mat>? = null
     private var outFullPlaneMat: Mat? = null
     private var resizedOutChannels: List<Mat>? = null
     private var outResizedFloat: Mat? = null
     private var weightedTileFloat: Mat? = null
     private var accumRgbMat: Mat? = null
     private var accumWeightMat: Mat? = null
-    private var accumChSplit: MutableList<Mat>? = null
+    private var invWeightSingleMat: Mat? = null
+    private var invWeightThreeMat: Mat? = null
     private var weightClampFloorMat: Mat? = null
     private var outRgb8u: Mat? = null
 
-    // Face ROI super-resolution scratch buffers
+    // Face ROI super-resolution buffers & canonical mask template (zero per-frame heap churn)
     private var faceSrFloatMat: Mat? = null
-    private var faceSr8uMat: Mat? = null
-    private var faceMaskFloatMat: Mat? = null
+    private var faceMaskTemplate128: Mat? = null
+    private var faceMaskScaledSingle: Mat? = null
+    private var faceMask3C: Mat? = null
+    private var faceDstSubF: Mat? = null
+    private var faceSrWeightedF: Mat? = null
+    private var faceBlendF: Mat? = null
 
-    // Lightweight OpenCV SIMD fallback scratch Mats
+    // Lightweight OpenCV fallback scratch Mats
     private var lwBlurMat: Mat? = null
     private var lwDetailMat: Mat? = null
 
     // Feather weight Mat cache keyed by tile dimensions & overlap
     private val featherMaskCache = HashMap<Long, Mat>()
 
-    val isRealEsrganReady: Boolean get() = activeSrSession != null
-    val isDncnnReady: Boolean get() = dncnnSession != null
+    val isRealEsrganReady: Boolean get() = srActiveIndex < srRankedSessions.size
+    val isDncnnReady: Boolean get() = dncnnActiveIndex < dncnnRankedSessions.size
     val isGlesGpuReady: Boolean get() = glesGpuAvailable
     val providerLabel: String get() = activeProviderDescription
     val benchmarkSummary: String get() = benchmarkDetails
     val initDurationMs: Long get() = lastInitDurationMs
+    val totalStaticTilesReused: Int get() = srTileCache.totalTilesReused + dncnnTileCache.totalTilesReused
 
     @Synchronized
     fun initialize(
         capabilities: DeviceCapabilities,
-        logger: EngineDiagnosticsLogger? = null
+        logger: EngineDiagnosticsLogger? = null,
+        forceRebenchmark: Boolean = false
     ) {
-        if (activeSrSession != null && dncnnSession != null) {
+        if (!forceRebenchmark && isRealEsrganReady && isDncnnReady && adaptiveProfile != null) {
             return
         }
         val t0 = System.currentTimeMillis()
@@ -435,297 +159,121 @@ class OnnxAiInferenceEngine(private val context: Context) {
             "ai_models/denoise/dncnn.onnx",
             File(modelDir, "denoise/dncnn.onnx")
         )
-        // Copy external weights beside dncnn.onnx so ORT resolves dncnn.data cleanly
-        val dncnnDataFile = ensureAssetCopied(
+        ensureAssetCopied(
             "ai_models/denoise/dncnn.data",
             File(modelDir, "denoise/dncnn.data")
+        )
+        val yunetFile = ensureAssetCopied(
+            "ai_models/face_enhancement/face_detection_yunet_2023mar.onnx",
+            File(modelDir, "face_enhancement/face_detection_yunet_2023mar.onnx")
         )
 
         glesGpuAvailable = gpuProcessor.ensureInitialized(logger)
 
-        val availableProviders = try {
-            OrtEnvironment.getAvailableProviders()
-        } catch (_: Throwable) {
-            EnumSet.of(OrtProvider.CPU)
-        }
-        logger?.info("Available ORT providers: ${availableProviders.joinToString()} • GLES31=$glesGpuAvailable")
-
-        val notes = mutableListOf<String>()
-        var bestThreads = capabilities.inferenceThreads.coerceIn(2, 6)
-
-        if (activeSrSession == null && srFile.exists() && srFile.length() > 0L) {
-            val candidates = mutableListOf<Triple<String, OrtSession, Long>>()
-            val threadCandidates = DeviceCapabilityDetector.benchmarkThreadCandidates(
-                cpuCores = capabilities.cpuCores,
-                maxTierThreads = 8
-            )
-            var bestCpuPair: Pair<String, OrtSession>? = null
-            var bestCpuMs = Long.MAX_VALUE
-
-            for (threads in threadCandidates) {
-                var session: OrtSession? = null
-                val label = "CPU XNNPACK (${threads}T)"
-                try {
-                    session = createXnnpackSession(srFile.absolutePath, threads)
-                    val ms = benchmarkSrSession(session, tile = 128, timeoutSec = 6L, logger = logger)
-                    if (ms != null) {
-                        notes.add("XNN-${threads}T=${ms}ms")
-                        candidates.add(Triple(label, session, ms))
-                        if (ms < bestCpuMs) {
-                            bestCpuMs = ms
-                            bestCpuPair = label to session
-                            bestThreads = threads
-                        }
-                    } else {
-                        notes.add("XNN-${threads}T=FAIL")
-                        session.close()
-                    }
-                } catch (t: Throwable) {
-                    notes.add("XNN-${threads}T=ERR")
-                    logger?.warn("$label init failed (${t.message})")
-                    try {
-                        session?.close()
-                    } catch (_: Throwable) {
-                    }
-                }
-            }
-
-            if (bestCpuPair == null) {
-                try {
-                    val std = createPlainCpuSession(srFile.absolutePath, capabilities.inferenceThreads.coerceIn(2, 8))
-                    val ms = benchmarkSrSession(std, tile = 128, timeoutSec = 6L, logger = logger) ?: 500L
-                    val label = "CPU ORT (${capabilities.inferenceThreads}T)"
-                    notes.add("CPU=${ms}ms")
-                    candidates.add(Triple(label, std, ms))
-                    bestCpuPair = label to std
-                } catch (t: Throwable) {
-                    logger?.error("CPU ONNX session creation failed", t)
-                }
-            }
-
-            cpuFallbackSession = bestCpuPair?.second
-
-            val nnapiAllowed = !nnapiDisabledDueToRuntimeError &&
-                capabilities.nnapiSupported &&
-                Build.VERSION.SDK_INT >= Build.VERSION_CODES.P &&
-                availableProviders.contains(OrtProvider.NNAPI)
-
-            if (nnapiAllowed) {
-                val nnapiAttempts = listOf(
-                    "Vulkan/NNAPI GPU FP16" to EnumSet.of(NNAPIFlags.USE_FP16, NNAPIFlags.USE_NCHW, NNAPIFlags.CPU_DISABLED),
-                    "NNAPI Hardware FP16" to EnumSet.of(NNAPIFlags.USE_FP16),
-                    "NNAPI Standard" to EnumSet.noneOf(NNAPIFlags::class.java)
-                )
-                for ((nnLabel, flags) in nnapiAttempts) {
-                    var nnSession: OrtSession? = null
-                    try {
-                        nnSession = createNnapiSession(srFile.absolutePath, capabilities, flags)
-                        val ms = benchmarkSrSession(nnSession, tile = 128, timeoutSec = 5L, logger = logger)
-                        if (ms != null) {
-                            notes.add("$nnLabel=${ms}ms")
-                            candidates.add(Triple(nnLabel, nnSession, ms))
-                            break
-                        } else {
-                            nnSession.close()
-                        }
-                    } catch (_: Throwable) {
-                        try {
-                            nnSession?.close()
-                        } catch (_: Throwable) {
-                        }
-                    }
-                }
-            }
-
-            val winner = candidates.minByOrNull { it.third }
-            if (winner != null) {
-                activeSrSession = winner.second
-                activeProviderDescription = "${winner.first} (${winner.third}ms/128p)"
-                for ((_, sess, _) in candidates) {
-                    if (sess !== winner.second && sess !== cpuFallbackSession) {
-                        try {
-                            sess.close()
-                        } catch (_: Throwable) {
-                        }
-                    }
-                }
-            } else {
-                activeSrSession = cpuFallbackSession
-                activeProviderDescription = "CPU Fallback"
-            }
-        } else if (!srFile.exists()) {
-            logger?.error("Missing bundled Real-ESRGAN ONNX asset")
+        if (forceRebenchmark) {
+            closeModelSessionsOnly()
         }
 
-        // Initialize DnCNN grayscale neural denoiser (dncnn.onnx + dncnn.data)
-        if (dncnnSession == null && dncnnFile.exists() && dncnnFile.length() > 0L && dncnnDataFile.exists()) {
-            try {
-                val sess = try {
-                    createXnnpackSession(dncnnFile.absolutePath, bestThreads)
-                } catch (_: Throwable) {
-                    createPlainCpuSession(dncnnFile.absolutePath, bestThreads)
-                }
-                val dnMs = benchmarkDnCnnSession(sess, timeoutSec = 5L, logger = logger)
-                if (dnMs != null) {
-                    dncnnSession = sess
-                    notes.add("DnCNN=${dnMs}ms")
-                } else {
-                    sess.close()
-                    notes.add("DnCNN=FAIL")
-                }
-            } catch (t: Throwable) {
-                logger?.warn("DnCNN session initialization failed: ${t.message}")
-                notes.add("DnCNN=ERR")
-            }
-        }
-
-        benchmarkDetails = notes.joinToString(" | ").ifBlank { "No benchmark" }
-        lastInitDurationMs = System.currentTimeMillis() - t0
-        logger?.info(
-            "AI Init complete (${lastInitDurationMs}ms): SR=${isRealEsrganReady}, DnCNN=${isDncnnReady}, " +
-                "Provider=$activeProviderDescription • Benchmarks=[$benchmarkDetails]"
+        val bundle = hwAccelerator.buildOrRestoreExecutionBundle(
+            srFile = srFile,
+            dncnnFile = dncnnFile,
+            yunetFile = yunetFile,
+            yunetRunner = yuNetRunner,
+            capabilities = capabilities,
+            forceRebenchmark = forceRebenchmark,
+            logger = logger
         )
+
+        adaptiveProfile = bundle.profile
+        srRankedSessions = bundle.srRankedSessions
+        srActiveIndex = 0
+        dncnnRankedSessions = bundle.dncnnRankedSessions
+        dncnnActiveIndex = 0
+
+        refreshActiveLabelsAndSummary()
+        lastInitDurationMs = System.currentTimeMillis() - t0
+        logger?.info("Adaptive AI init finished in ${lastInitDurationMs}ms: $activeProviderDescription • [$benchmarkDetails]")
     }
 
-    private fun createXnnpackSession(modelPath: String, threads: Int): OrtSession {
-        val opts = OrtSession.SessionOptions().apply {
-            setExecutionMode(OrtSession.SessionOptions.ExecutionMode.SEQUENTIAL)
-            setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
-            setInterOpNumThreads(1)
-            setIntraOpNumThreads(1)
-            addConfigEntry("session.intra_op.allow_spinning", "0")
-            addXnnpack(mapOf("intra_op_num_threads" to threads.toString()))
-        }
-        return env.createSession(modelPath, opts)
-    }
-
-    private fun createPlainCpuSession(modelPath: String, threads: Int): OrtSession {
-        val opts = OrtSession.SessionOptions().apply {
-            setIntraOpNumThreads(threads.coerceIn(1, 8))
-            setInterOpNumThreads(1)
-            setExecutionMode(OrtSession.SessionOptions.ExecutionMode.SEQUENTIAL)
-            setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
-        }
-        return env.createSession(modelPath, opts)
-    }
-
-    private fun createNnapiSession(
-        modelPath: String,
+    @Synchronized
+    fun rebenchmarkHardware(
         capabilities: DeviceCapabilities,
-        flags: EnumSet<NNAPIFlags>
-    ): OrtSession {
-        val opts = OrtSession.SessionOptions().apply {
-            setIntraOpNumThreads(capabilities.inferenceThreads.coerceIn(2, 6))
-            setExecutionMode(OrtSession.SessionOptions.ExecutionMode.SEQUENTIAL)
-            setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
-            if (flags.isEmpty()) addNnapi() else addNnapi(flags)
-        }
-        return env.createSession(modelPath, opts)
+        logger: EngineDiagnosticsLogger? = null
+    ): AdaptiveHardwareProfile? {
+        initialize(capabilities, logger, forceRebenchmark = true)
+        return adaptiveProfile
     }
 
-    private fun benchmarkSrSession(
-        session: OrtSession,
-        tile: Int,
-        timeoutSec: Long,
-        logger: EngineDiagnosticsLogger?
-    ): Long? {
-        val executor = Executors.newSingleThreadExecutor()
-        return try {
-            val future = executor.submit<Long?> {
-                val inputName = session.inputNames.first()
-                val buf = FloatBuffer.allocate(3 * tile * tile)
-                for (i in 0 until buf.capacity()) {
-                    buf.put(i, 0.5f)
-                }
-                buf.rewind()
-                val shape = longArrayOf(1L, 3L, tile.toLong(), tile.toLong())
-
-                OnnxTensor.createTensor(env, buf, shape).use { tWarm ->
-                    session.run(mapOf(inputName to tWarm)).use { res ->
-                        val out = res[0] as OnnxTensor
-                        val outBuf = out.floatBuffer
-                        if (outBuf.remaining() < 3 * tile * tile * 16) return@submit null
-                        val probe = outBuf.get(0)
-                        if (probe.isNaN() || probe.isInfinite()) return@submit null
-                    }
-                }
-
-                buf.rewind()
-                val t0 = System.nanoTime()
-                OnnxTensor.createTensor(env, buf, shape).use { tRun ->
-                    session.run(mapOf(inputName to tRun)).use { res ->
-                        val out = res[0] as OnnxTensor
-                        val outBuf = out.floatBuffer
-                        val probe = outBuf.get(outBuf.remaining() / 2)
-                        if (probe.isNaN() || probe.isInfinite()) return@submit null
-                    }
-                }
-                ((System.nanoTime() - t0) / 1_000_000L).coerceAtLeast(1L)
-            }
-            future.get(timeoutSec, TimeUnit.SECONDS)
-        } catch (t: Throwable) {
-            logger?.warn("SR session benchmark failed/timed out: ${t.message}")
-            null
-        } finally {
-            executor.shutdownNow()
-        }
-    }
-
-    private fun benchmarkDnCnnSession(
-        session: OrtSession,
-        timeoutSec: Long,
-        logger: EngineDiagnosticsLogger?
-    ): Long? {
-        val executor = Executors.newSingleThreadExecutor()
-        return try {
-            val future = executor.submit<Long?> {
-                val inputName = session.inputNames.first()
-                val buf = FloatBuffer.allocate(dncnnTilePixels)
-                for (i in 0 until dncnnTilePixels) {
-                    buf.put(i, 0.5f)
-                }
-                buf.rewind()
-                val shape = longArrayOf(1L, 1L, dncnnTileSize.toLong(), dncnnTileSize.toLong())
-                val t0 = System.nanoTime()
-                OnnxTensor.createTensor(env, buf, shape).use { tensor ->
-                    session.run(mapOf(inputName to tensor)).use { res ->
-                        val out = res[0] as OnnxTensor
-                        val outBuf = out.floatBuffer
-                        if (outBuf.remaining() < dncnnTilePixels) return@submit null
-                        val probe = outBuf.get(dncnnTilePixels / 2)
-                        if (probe.isNaN() || probe.isInfinite()) return@submit null
-                    }
-                }
-                ((System.nanoTime() - t0) / 1_000_000L).coerceAtLeast(1L)
-            }
-            future.get(timeoutSec, TimeUnit.SECONDS)
-        } catch (t: Throwable) {
-            logger?.warn("DnCNN session benchmark failed: ${t.message}")
-            null
-        } finally {
-            executor.shutdownNow()
-        }
+    fun resetTemporalCaches() {
+        srTileCache.reset()
+        dncnnTileCache.reset()
+        runtimeFallbacksCount = 0
     }
 
     /**
+     * Checks live thermal pressure: if CRITICAL overheating hits while running heavy GPU/NPU
+     * sessions, gracefully demotes to a cooler verified backend without ever reducing AI strength.
+     */
+    @Synchronized
+    fun handleThermalPressure(thermalState: ThermalState, logger: EngineDiagnosticsLogger?) {
+        if (thermalState == ThermalState.CRITICAL) {
+            val srCurr = srRankedSessions.getOrNull(srActiveIndex)
+            if (srCurr != null && srCurr.first.kind != com.example.model.AcceleratorKind.CPU && srActiveIndex + 1 < srRankedSessions.size) {
+                srActiveIndex++
+                runtimeFallbacksCount++
+                refreshActiveLabelsAndSummary()
+                logger?.warn("Thermal critical demotion for Real-ESRGAN -> ${srRankedSessions[srActiveIndex].first.displayLabel}")
+            }
+        }
+    }
+
+    private fun refreshActiveLabelsAndSummary() {
+        val srCurr = srRankedSessions.getOrNull(srActiveIndex)?.first
+        val dnCurr = dncnnRankedSessions.getOrNull(dncnnActiveIndex)?.first
+        val faceCurr = yuNetRunner.currentAcceleratorKind
+
+        val srKindLabel = srCurr?.kind?.label ?: "CPU"
+        val dnKindLabel = dnCurr?.kind?.label ?: "CPU"
+        activeProviderDescription = "SR:$srKindLabel • DN:$dnKindLabel • Face:${faceCurr.label}"
+
+        val prof = adaptiveProfile
+        benchmarkDetails = if (prof != null) {
+            val srPlan = prof.plans[ModelKind.REAL_ESRGAN]
+            val dnPlan = prof.plans[ModelKind.DNCNN]
+            val fcPlan = prof.plans[ModelKind.FACE_YUNET]
+            buildString {
+                srPlan?.let { append("SR=${it.selectedLabel}(${it.measuredLatencyMs}ms)") }
+                dnPlan?.let { append(" | DN=${it.selectedLabel}(${it.measuredLatencyMs}ms)") }
+                fcPlan?.let { append(" | Face=${it.selectedLabel}(${it.measuredLatencyMs}ms)") }
+                if (prof.fromCache) append(" [Cached]")
+            }
+        } else {
+            activeProviderDescription
+        }
+    }
+
+    fun currentPerModelSummary(): String = activeProviderDescription
+
+    /**
      * Runs genuine DnCNN neural denoising ([1, 1, 256, 256] luminance Y tensor) over [yChan]
-     * with BORDER_REFLECT_101 mirror-padding and feathered tile stitching, preserving sharp
-     * edges and textures while stripping film grain, sensor noise, and macroblock ringing.
+     * using DnCNN's independently selected hardware processor + static-tile temporal cache
+     * and live fallback along DnCNN's ranked backend chain.
      */
     fun denoiseLuminanceYWithDnCnn(
         yChan: Mat,
         strength: Float,
+        isSceneCut: Boolean = false,
         logger: EngineDiagnosticsLogger? = null
     ): Boolean {
-        val session = dncnnSession ?: return false
+        if (!isDncnnReady) return false
         val blend = strength.toDouble().coerceIn(0.05, 0.95)
         val w = yChan.cols()
         val h = yChan.rows()
         if (w < 8 || h < 8) return false
 
         ensureDnCnnBuffers(w, h)
-        val inArr = dncnnInArr!!
-        val inBuf = dncnnInBuf!!
+        val inBuf = dncnnDirectInBuf!!
+        val inTmp = dncnnInTmpArr!!
         val outArr = dncnnOutArr!!
         val padMat = dncnnPadMat!!
         val floatMat = dncnnFloatMat!!
@@ -736,7 +284,6 @@ class OnnxAiInferenceEngine(private val context: Context) {
         val u8Out = dncnnU8Mat!!
 
         val shape = longArrayOf(1L, 1L, dncnnTileSize.toLong(), dncnnTileSize.toLong())
-        val inputName = session.inputNames.first()
 
         return try {
             val cols = if (w <= dncnnTileSize) 1 else ceil((w - 24).toDouble() / (dncnnTileSize - 24).toDouble()).toInt()
@@ -752,37 +299,39 @@ class OnnxAiInferenceEngine(private val context: Context) {
                 for ((c, xInfo) in xSegments.withIndex()) {
                     val (x0, cropW) = xInfo
                     val cropRect = Rect(x0, y0, cropW, cropH)
+                    val tileIdx = r * cols + c
                     val sub = Mat(yChan, cropRect)
 
-                    if (cropW == dncnnTileSize && cropH == dncnnTileSize) {
-                        sub.convertTo(floatMat, CvType.CV_32FC1, 1.0 / 255.0)
-                    } else {
-                        Core.copyMakeBorder(
-                            sub,
-                            padMat,
-                            0,
-                            dncnnTileSize - cropH,
-                            0,
-                            dncnnTileSize - cropW,
-                            Core.BORDER_REFLECT_101
-                        )
-                        padMat.convertTo(floatMat, CvType.CV_32FC1, 1.0 / 255.0)
+                    val tileSig = dncnnTileCache.computeTileSignature(sub)
+                    val reused = dncnnTileCache.tryReuseTileOutput(tileIdx, tileSig, isSceneCut, outTileMat)
+
+                    if (!reused) {
+                        if (cropW == dncnnTileSize && cropH == dncnnTileSize) {
+                            sub.convertTo(floatMat, CvType.CV_32FC1, 1.0 / 255.0)
+                        } else {
+                            Core.copyMakeBorder(
+                                sub,
+                                padMat,
+                                0,
+                                dncnnTileSize - cropH,
+                                0,
+                                dncnnTileSize - cropW,
+                                Core.BORDER_REFLECT_101
+                            )
+                            padMat.convertTo(floatMat, CvType.CV_32FC1, 1.0 / 255.0)
+                        }
+
+                        floatMat.get(0, 0, inTmp)
+                        inBuf.clear()
+                        inBuf.put(inTmp, 0, dncnnTilePixels)
+                        inBuf.rewind()
+
+                        runDnCnnWithFallback(shape, inBuf, outArr, logger)
+                        outTileMat.put(0, 0, outArr)
+                        dncnnTileCache.storeTileOutput(tileIdx, tileSig, outTileMat)
                     }
                     sub.release()
 
-                    floatMat.get(0, 0, inArr)
-                    inBuf.rewind()
-
-                    OnnxTensor.createTensor(env, inBuf, shape).use { tensor ->
-                        session.run(mapOf(inputName to tensor)).use { results ->
-                            val outTensor = results[0] as OnnxTensor
-                            val outBuf = outTensor.floatBuffer
-                            outBuf.position(0)
-                            outBuf.get(outArr, 0, dncnnTilePixels)
-                        }
-                    }
-
-                    outTileMat.put(0, 0, outArr)
                     val validOut = if (cropW == dncnnTileSize && cropH == dncnnTileSize) {
                         outTileMat
                     } else {
@@ -790,7 +339,7 @@ class OnnxAiInferenceEngine(private val context: Context) {
                     }
 
                     val featherTile = AiTilingMath.TileRegion(
-                        index = r * cols + c,
+                        index = tileIdx,
                         row = r,
                         col = c,
                         x = x0,
@@ -827,16 +376,47 @@ class OnnxAiInferenceEngine(private val context: Context) {
 
             Core.max(weightAccum, Scalar(1e-5), weightAccum)
             Core.divide(accum, weightAccum, accum)
-            Core.min(accum, Scalar(1.0), accum)
-            Core.max(accum, Scalar(0.0), accum)
             accum.convertTo(u8Out, CvType.CV_8UC1, 255.0)
-
             Core.addWeighted(u8Out, blend, yChan, 1.0 - blend, 0.0, yChan)
             true
         } catch (t: Throwable) {
             logger?.warn("DnCNN inference fallback to temporal cleanup (${t.message})")
             false
         }
+    }
+
+    private fun runDnCnnWithFallback(
+        shape: LongArray,
+        inBuf: FloatBuffer,
+        outArr: FloatArray,
+        logger: EngineDiagnosticsLogger?
+    ) {
+        while (dncnnActiveIndex < dncnnRankedSessions.size) {
+            val (backendId, session) = dncnnRankedSessions[dncnnActiveIndex]
+            try {
+                val inputName = session.inputNames.first()
+                inBuf.rewind()
+                OnnxTensor.createTensor(env, inBuf, shape).use { tensor ->
+                    session.run(mapOf(inputName to tensor)).use { results ->
+                        val outTensor = results[0] as OnnxTensor
+                        val outBuf = outTensor.floatBuffer
+                        outBuf.position(0)
+                        outBuf.get(outArr, 0, dncnnTilePixels)
+                        val probe = outArr[dncnnTilePixels / 2]
+                        if (probe.isNaN() || probe.isInfinite()) {
+                            throw IllegalStateException("NaN output from ${backendId.displayLabel}")
+                        }
+                    }
+                }
+                return
+            } catch (t: Throwable) {
+                logger?.warn("DnCNN runtime fallback from ${backendId.displayLabel} (${t.message})")
+                dncnnActiveIndex++
+                runtimeFallbacksCount++
+                refreshActiveLabelsAndSummary()
+            }
+        }
+        throw IllegalStateException("All DnCNN backends failed")
     }
 
     private fun buildFixedWindowSegments(totalLen: Int, windowSize: Int, count: Int): List<Pair<Int, Int>> {
@@ -855,12 +435,11 @@ class OnnxAiInferenceEngine(private val context: Context) {
     }
 
     /**
-     * Genuine AI Super-Resolution + Dedicated Face ROI AI Refinement:
-     * - Preserves 1:1 pixel aspect ratio via BORDER_REFLECT_101 mirror-padding (never squishes tiles)
-     * - Uses Real-ESRGAN x4v3 neural reconstruction directly to [outW] x [outH]
-     * - Supersamples down via INTER_AREA for 1x/2x/3x and outputs true 4x detail for 4x
-     * - Enhances detected faces separately with dedicated face ROI SR + soft elliptical feather mask
-     * - Uses memory-lean CV_8UC3 base + single-channel weight division to keep 4K RAM clean
+     * High-speed Real-ESRGAN Super-Resolution + Face ROI SR Refinement:
+     * - Double-buffered direct FloatBuffer tile packing (tile i+1 packed concurrently while tile i runs)
+     * - Motion-gated Static Tile Temporal Reuse (preserves 100% Clarity neural sharpness)
+     * - Single-channel reciprocal 4K accumulation normalization
+     * - Live fallback along Real-ESRGAN's ranked GPU -> NPU -> CPU session chain
      */
     fun enhanceBgrWithPresetTiles(
         srcBgr: Mat,
@@ -874,6 +453,7 @@ class OnnxAiInferenceEngine(private val context: Context) {
         fallbackSharpnessBoost: Float = 0.28f,
         faces: List<Rect> = emptyList(),
         faceEnhanceStrength: Float = 0.65f,
+        isSceneCut: Boolean = false,
         isCancelled: () -> Boolean,
         logger: EngineDiagnosticsLogger? = null,
         onTileProgress: (done: Int, total: Int, tileSize: Int) -> Unit = { _, _, _ -> }
@@ -883,7 +463,7 @@ class OnnxAiInferenceEngine(private val context: Context) {
         val safeOutW = outW.coerceAtLeast(inW)
         val safeOutH = outH.coerceAtLeast(inH)
 
-        if (forceLightweightFallback || activeSrSession == null) {
+        if (forceLightweightFallback || !isRealEsrganReady) {
             val resizedBase = if (inW != safeOutW || inH != safeOutH) {
                 Mat().also {
                     Imgproc.resize(srcBgr, it, Size(safeOutW.toDouble(), safeOutH.toDouble()), 0.0, 0.0, Imgproc.INTER_CUBIC)
@@ -923,7 +503,6 @@ class OnnxAiInferenceEngine(private val context: Context) {
         val localRgb = srcRgbMat!!
         Imgproc.cvtColor(srcBgr, localRgb, Imgproc.COLOR_BGR2RGB)
 
-        // Pre-compute clean bicubic base for blending (only ~25MB at 4K)
         if (inW == safeOutW && inH == safeOutH) {
             localRgb.copyTo(baseRgb8u!!)
         } else {
@@ -933,75 +512,128 @@ class OnnxAiInferenceEngine(private val context: Context) {
         accumRgbMat!!.setTo(Scalar(0.0, 0.0, 0.0))
         accumWeightMat!!.setTo(Scalar(0.0))
 
-        val fixedTilePixels = safeTileSize * safeTileSize
         val fixedShape = longArrayOf(1L, 3L, safeTileSize.toLong(), safeTileSize.toLong())
-        val chIn = tileChannels!!
-        val paddedTile = tilePaddedMat!!
-        val floatTileHwc = tileFloatHwc!!
         val outResized = outResizedFloat!!
         val weightedTile = weightedTileFloat!!
 
-        var tileTimingSumMs = 0L
-        var timedTiles = 0
+        data class PreparedTile(
+            val tile: AiTilingMath.TileRegion,
+            val reusedFromCache: Boolean,
+            val signature: ByteArray,
+            val validSrW: Int,
+            val validSrH: Int,
+            val bufIndex: Int
+        )
 
-        for (tile in grid.tiles) {
-            if (isCancelled()) throw InterruptedException("Cancelled during AI tile enhancement")
-            val tTile0 = System.currentTimeMillis()
-
-            // 1. Aspect-Preserving Input Tile Preparation
+        fun prepareSingleTile(tile: AiTilingMath.TileRegion, bufIdx: Int): PreparedTile {
             val inRect = Rect(tile.x, tile.y, tile.width, tile.height)
             val roi = Mat(localRgb, inRect)
+            val sig = srTileCache.computeTileSignature(roi)
+            val useSrCache = grid.totalTiles > 1
+            val padMat = if (bufIdx == 0) tilePaddedMatA!! else tilePaddedMatB!!
+            val floatHwc = if (bufIdx == 0) tileFloatHwcA!! else tileFloatHwcB!!
+            val chIn = if (bufIdx == 0) tileChannelsA!! else tileChannelsB!!
+            val planeTmp = if (bufIdx == 0) tileInPlaneTmpA else tileInPlaneTmpB
+            val directBuf = if (bufIdx == 0) tileInBufA!! else tileInBufB!!
+
             val validSrW: Int
             val validSrH: Int
-
             if (tile.width <= safeTileSize && tile.height <= safeTileSize) {
                 if (tile.width == safeTileSize && tile.height == safeTileSize) {
-                    roi.copyTo(paddedTile)
+                    roi.copyTo(padMat)
                 } else {
                     Core.copyMakeBorder(
-                        roi,
-                        paddedTile,
-                        0,
-                        safeTileSize - tile.height,
-                        0,
-                        safeTileSize - tile.width,
+                        roi, padMat,
+                        0, safeTileSize - tile.height,
+                        0, safeTileSize - tile.width,
                         Core.BORDER_REFLECT_101
                     )
                 }
                 validSrW = tile.width * 4
                 validSrH = tile.height * 4
             } else {
-                // Only reached when a single axis exceeds safeTileSize under a hard tile cap:
-                // still resize cleanly with INTER_AREA so high-res detail maps properly.
-                Imgproc.resize(roi, paddedTile, Size(safeTileSize.toDouble(), safeTileSize.toDouble()), 0.0, 0.0, Imgproc.INTER_AREA)
+                Imgproc.resize(roi, padMat, Size(safeTileSize.toDouble(), safeTileSize.toDouble()), 0.0, 0.0, Imgproc.INTER_AREA)
                 validSrW = safeTileSize * 4
                 validSrH = safeTileSize * 4
             }
             roi.release()
 
-            paddedTile.convertTo(floatTileHwc, CvType.CV_32FC3, 1.0 / 255.0)
-            Core.split(floatTileHwc, chIn)
-            chIn[0].get(0, 0, tileInPlaneTmp)
-            System.arraycopy(tileInPlaneTmp, 0, tileInArr, 0, fixedTilePixels)
-            chIn[1].get(0, 0, tileInPlaneTmp)
-            System.arraycopy(tileInPlaneTmp, 0, tileInArr, fixedTilePixels, fixedTilePixels)
-            chIn[2].get(0, 0, tileInPlaneTmp)
-            System.arraycopy(tileInPlaneTmp, 0, tileInArr, 2 * fixedTilePixels, fixedTilePixels)
-            tileInBuf.rewind()
-
-            // 2. Real-ESRGAN x4v3 Neural Inference + Valid Region Crop + Area/Cubic Scaling to outWidth x outHeight
-            val dstSize = Size(tile.outWidth.toDouble(), tile.outHeight.toDouble())
-            runSrTileAndResizeDirect(
-                shape = fixedShape,
-                tileSize = safeTileSize,
+            padMat.convertTo(floatHwc, CvType.CV_32FC3, 1.0 / 255.0)
+            Core.split(floatHwc, chIn)
+            directBuf.clear()
+            for (c in 0 until 3) {
+                chIn[c].get(0, 0, planeTmp)
+                directBuf.put(planeTmp)
+            }
+            directBuf.rewind()
+            return PreparedTile(
+                tile = tile,
+                reusedFromCache = useSrCache && false,
+                signature = sig,
                 validSrW = validSrW,
                 validSrH = validSrH,
-                dstSize = dstSize,
-                outResizedHwc = outResized,
-                logger = logger
+                bufIndex = bufIdx
+            )
+        }
+
+        val prepExec = tilePrepExecutor ?: Executors.newSingleThreadExecutor().also { tilePrepExecutor = it }
+        var tileTimingSumMs = 0L
+        var timedTiles = 0
+        var reusedInFrame = 0
+
+        val tiles = grid.tiles
+        var nextPrepFuture: Future<PreparedTile>? = if (tiles.isNotEmpty()) {
+            prepExec.submit(Callable { prepareSingleTile(tiles[0], 0) })
+        } else {
+            null
+        }
+
+        for (i in tiles.indices) {
+            if (isCancelled()) throw InterruptedException("Cancelled during AI tile enhancement")
+            val tTile0 = System.currentTimeMillis()
+            val prepared = nextPrepFuture!!.get()
+            val tile = prepared.tile
+
+            // Pipeline next tile buffer preparation concurrently on background thread while this tile runs
+            nextPrepFuture = if (i + 1 < tiles.size) {
+                val nextIdx = (prepared.bufIndex + 1) and 1
+                val nextTile = tiles[i + 1]
+                prepExec.submit(Callable { prepareSingleTile(nextTile, nextIdx) })
+            } else {
+                null
+            }
+
+            val reused = grid.totalTiles > 1 && srTileCache.tryReuseTileOutput(
+                tileKey = tile.index,
+                currentSig = prepared.signature,
+                isSceneCut = isSceneCut,
+                dstOutFloat = outResized
             )
 
-            // 3. Cached Overlap Feather Accumulation in Output Coordinate Space
+            if (reused) {
+                reusedInFrame++
+            } else {
+                val dstSize = Size(tile.outWidth.toDouble(), tile.outHeight.toDouble())
+                val activeBuf = if (prepared.bufIndex == 0) tileInBufA!! else tileInBufB!!
+                runSrTileAndResizeDirect(
+                    inputBuf = activeBuf,
+                    shape = fixedShape,
+                    tileSize = safeTileSize,
+                    validSrW = prepared.validSrW,
+                    validSrH = prepared.validSrH,
+                    dstSize = dstSize,
+                    outResizedHwc = outResized,
+                    logger = logger
+                )
+                if (grid.totalTiles > 1) {
+                    srTileCache.storeTileOutput(tile.index, prepared.signature, outResized)
+                }
+
+                val tileElapsed = (System.currentTimeMillis() - tTile0).coerceAtLeast(1L)
+                tileTimingSumMs += tileElapsed
+                timedTiles++
+            }
+
             val featherMat = getOrCreateOutputFeatherMask(tile, grid.outOverlapX, grid.outOverlapY)
             val featherSingle = getOrCreateOutputFeatherSingle(tile, grid.outOverlapX, grid.outOverlapY)
 
@@ -1015,21 +647,18 @@ class OnnxAiInferenceEngine(private val context: Context) {
             Core.add(weightSub, featherSingle, weightSub)
             weightSub.release()
 
-            val tileElapsed = (System.currentTimeMillis() - tTile0).coerceAtLeast(1L)
-            tileTimingSumMs += tileElapsed
-            timedTiles++
             onTileProgress(tile.index + 1, grid.totalTiles, safeTileSize)
 
-            // Only abandon ONNX if hardware/driver is catastrophically hanging (>3000ms per tile)
-            if (timedTiles == 2 && AiSpeedPolicy.shouldEngageLightweightFallback(
+            if (!reused && timedTiles == 2 && AiSpeedPolicy.shouldEngageLightweightFallback(
                     measuredTileMs = tileTimingSumMs / timedTiles,
                     tilesPerFrame = grid.totalTiles,
                     estimatedFrameCount = estimatedTotalFrames
                 )
             ) {
                 val avgTileMs = tileTimingSumMs / timedTiles
-                val reason = "Emergency GPU/SIMD Fallback: ${safeTileSize}px neural tile stalled at ${avgTileMs}ms/tile"
+                val reason = "Emergency Fallback: ${safeTileSize}px neural tile stalled at ${avgTileMs}ms/tile"
                 logger?.warn(reason)
+                nextPrepFuture?.cancel(true)
                 val lw = enhanceFastLightweightCopy(
                     baseRgb8u!!,
                     sharpnessBoost = fallbackSharpnessBoost.coerceIn(0.08f, 0.45f),
@@ -1045,27 +674,26 @@ class OnnxAiInferenceEngine(private val context: Context) {
                     usedLightweightFallback = true,
                     fallbackReason = reason,
                     activeAccelerationLabel = label,
-                    faceAiMs = 0L
+                    faceAiMs = 0L,
+                    staticTilesReused = reusedInFrame
                 )
             }
         }
 
-        // 4. Low-RAM Per-Channel Normalization + Progressive AI Blend with Bicubic Base
-        Core.max(accumWeightMat!!, weightClampFloorMat!!, accumWeightMat!!)
-        val splitCh = accumChSplit!!
-        Core.split(accumRgbMat!!, splitCh)
-        for (c in 0 until 3) {
-            Core.divide(splitCh[c], accumWeightMat!!, splitCh[c])
-            Core.min(splitCh[c], Scalar(1.0), splitCh[c])
-            Core.max(splitCh[c], Scalar(0.0), splitCh[c])
-        }
-        Core.merge(splitCh, accumRgbMat!!)
-        accumRgbMat!!.convertTo(outRgb8u!!, CvType.CV_8UC3, 255.0)
+        // Fast Single-Channel Reciprocal 4K Normalization (eliminates 7 full-frame 4K FP32 passes!)
+        val wMat = accumWeightMat!!
+        val invSingle = invWeightSingleMat!!
+        val invThree = invWeightThreeMat!!
+        Core.max(wMat, weightClampFloorMat!!, wMat)
+        Core.divide(1.0, wMat, invSingle)
+        Core.merge(listOf(invSingle, invSingle, invSingle), invThree)
+        Core.multiply(accumRgbMat!!, invThree, accumRgbMat!!)
+        accumRgbMat!!.convertTo(outRgb8u!!, CvType.CV_8UC3, 255.0) // NEON saturates [0..255]
 
         val aiBlend = aiStrength.toDouble().coerceIn(0.20, 0.96)
         Core.addWeighted(outRgb8u!!, aiBlend, baseRgb8u!!, 1.0 - aiBlend, 0.0, outRgb8u!!)
 
-        // 5. Dedicated Face ROI Neural Super-Resolution Refinement (eyes, lips, beard, hair, skin)
+        // Dedicated Face ROI Neural Super-Resolution Refinement
         var faceMs = 0L
         if (faces.isNotEmpty() && faceEnhanceStrength >= 0.15f) {
             val tf0 = System.currentTimeMillis()
@@ -1093,15 +721,11 @@ class OnnxAiInferenceEngine(private val context: Context) {
             outputBgr = finalBgr,
             usedLightweightFallback = false,
             activeAccelerationLabel = activeProviderDescription,
-            faceAiMs = faceMs
+            faceAiMs = faceMs,
+            staticTilesReused = reusedInFrame
         )
     }
 
-    /**
-     * Runs dedicated full-fidelity Real-ESRGAN x4v3 inference over each detected face ROI
-     * (expanded symmetrically for hair, forehead, ears & beard) and blends softly with
-     * an elliptical raised-cosine mask so facial features gain crisp clarity without seams.
-     */
     private fun enhanceFaceRegionsWithSr(
         srcRgb: Mat,
         targetRgb8u: Mat,
@@ -1116,15 +740,22 @@ class OnnxAiInferenceEngine(private val context: Context) {
         isCancelled: () -> Boolean,
         logger: EngineDiagnosticsLogger?
     ) {
-        val chIn = tileChannels!!
-        val paddedTile = tilePaddedMat!!
-        val floatTileHwc = tileFloatHwc!!
-        val fixedTilePixels = safeTileSize * safeTileSize
+        val chIn = tileChannelsA!!
+        val paddedTile = tilePaddedMatA!!
+        val floatTileHwc = tileFloatHwcA!!
+        val directBuf = tileInBufA!!
+        val planeTmp = tileInPlaneTmpA
         val scaleX = outW.toDouble() / inW.toDouble()
         val scaleY = outH.toDouble() / inH.toDouble()
+
         val faceSrF = faceSrFloatMat ?: Mat().also { faceSrFloatMat = it }
-        val faceSrU8 = faceSr8uMat ?: Mat().also { faceSr8uMat = it }
-        val maskF = faceMaskFloatMat ?: Mat().also { faceMaskFloatMat = it }
+        val templateMask = getOrCreateFaceMaskTemplate128()
+        val maskScaled = faceMaskScaledSingle ?: Mat().also { faceMaskScaledSingle = it }
+        val mask3 = faceMask3C ?: Mat().also { faceMask3C = it }
+        val dstSubF = faceDstSubF ?: Mat().also { faceDstSubF = it }
+        val srWeightedF = faceSrWeightedF ?: Mat().also { faceSrWeightedF = it }
+        val blendOutF = faceBlendF ?: Mat().also { faceBlendF = it }
+        val maxWeight = strength.toDouble().coerceIn(0.25, 0.92)
 
         for (face in faces.take(3)) {
             if (isCancelled()) break
@@ -1146,12 +777,9 @@ class OnnxAiInferenceEngine(private val context: Context) {
             val validSrH: Int
             if (fw <= safeTileSize && fh <= safeTileSize) {
                 Core.copyMakeBorder(
-                    roi,
-                    paddedTile,
-                    0,
-                    safeTileSize - fh,
-                    0,
-                    safeTileSize - fw,
+                    roi, paddedTile,
+                    0, safeTileSize - fh,
+                    0, safeTileSize - fw,
                     Core.BORDER_REFLECT_101
                 )
                 validSrW = fw * 4
@@ -1165,13 +793,12 @@ class OnnxAiInferenceEngine(private val context: Context) {
 
             paddedTile.convertTo(floatTileHwc, CvType.CV_32FC3, 1.0 / 255.0)
             Core.split(floatTileHwc, chIn)
-            chIn[0].get(0, 0, tileInPlaneTmp)
-            System.arraycopy(tileInPlaneTmp, 0, tileInArr, 0, fixedTilePixels)
-            chIn[1].get(0, 0, tileInPlaneTmp)
-            System.arraycopy(tileInPlaneTmp, 0, tileInArr, fixedTilePixels, fixedTilePixels)
-            chIn[2].get(0, 0, tileInPlaneTmp)
-            System.arraycopy(tileInPlaneTmp, 0, tileInArr, 2 * fixedTilePixels, fixedTilePixels)
-            tileInBuf.rewind()
+            directBuf.clear()
+            for (c in 0 until 3) {
+                chIn[c].get(0, 0, planeTmp)
+                directBuf.put(planeTmp)
+            }
+            directBuf.rewind()
 
             val outX0 = floor(fx0 * scaleX).toInt().coerceIn(0, outW - 2)
             val outY0 = floor(fy0 * scaleY).toInt().coerceIn(0, outH - 2)
@@ -1181,6 +808,7 @@ class OnnxAiInferenceEngine(private val context: Context) {
             val outFh = outY1 - outY0
 
             runSrTileAndResizeDirect(
+                inputBuf = directBuf,
                 shape = fixedShape,
                 tileSize = safeTileSize,
                 validSrW = validSrW,
@@ -1190,61 +818,53 @@ class OnnxAiInferenceEngine(private val context: Context) {
                 logger = logger
             )
 
-            faceSrF.convertTo(faceSrU8, CvType.CV_8UC3, 255.0)
-
-            // Elliptical cosine feather blend so face clarity merges seamlessly into neck/hair/bg
-            val weightData = FloatArray(outFw * outFh)
-            val halfW = outFw * 0.5f
-            val halfH = outFh * 0.5f
-            val maxWeight = strength.coerceIn(0.25f, 0.92f)
-            for (y in 0 until outFh) {
-                val dy = (y - halfH) / halfH.coerceAtLeast(1f)
-                val rowOff = y * outFw
-                for (x in 0 until outFw) {
-                    val dx = (x - halfW) / halfW.coerceAtLeast(1f)
-                    val radial = sqrt(dx * dx + dy * dy).coerceIn(0f, 1f)
-                    val w = if (radial < 0.45f) {
-                        maxWeight
-                    } else {
-                        val t = (radial - 0.45f) / 0.55f
-                        maxWeight * 0.5f * (1f + cos(PI.toFloat() * t))
-                    }
-                    weightData[rowOff + x] = w
-                }
+            // Resize cached canonical 128x128 elliptical mask instead of reallocating FloatArrays per face
+            Imgproc.resize(templateMask, maskScaled, Size(outFw.toDouble(), outFh.toDouble()), 0.0, 0.0, Imgproc.INTER_LINEAR)
+            if (abs(maxWeight - 1.0) > 0.01) {
+                maskScaled.convertTo(maskScaled, CvType.CV_32FC1, maxWeight, 0.0)
             }
+            Core.merge(listOf(maskScaled, maskScaled, maskScaled), mask3)
 
-            maskF.create(outFh, outFw, CvType.CV_32FC1)
-            maskF.put(0, 0, weightData)
-            val mask3 = Mat(outFh, outFw, CvType.CV_32FC3)
-            val invMask3 = Mat(outFh, outFw, CvType.CV_32FC3)
             val dstSub = Mat(targetRgb8u, Rect(outX0, outY0, outFw, outFh))
-            val dstSubF = Mat()
-            val srWeightedF = Mat()
-            val dstWeightedF = Mat()
             try {
-                Core.merge(listOf(maskF, maskF, maskF), mask3)
-                Core.subtract(Mat.ones(outFh, outFw, CvType.CV_32FC3), mask3, invMask3)
                 dstSub.convertTo(dstSubF, CvType.CV_32FC3)
                 faceSrF.convertTo(srWeightedF, CvType.CV_32FC3, 255.0)
-                Core.multiply(srWeightedF, mask3, srWeightedF)
-                Core.multiply(dstSubF, invMask3, dstWeightedF)
-                Core.add(srWeightedF, dstWeightedF, dstSubF)
+                // Alpha blend: dst + mask * (sr - dst) -> avoids Mat.ones & invMask3 allocation completely!
+                Core.subtract(srWeightedF, dstSubF, blendOutF)
+                Core.multiply(blendOutF, mask3, blendOutF)
+                Core.add(dstSubF, blendOutF, dstSubF)
                 dstSubF.convertTo(dstSub, CvType.CV_8UC3)
             } finally {
-                mask3.release()
-                invMask3.release()
                 dstSub.release()
-                dstSubF.release()
-                srWeightedF.release()
-                dstWeightedF.release()
             }
         }
     }
 
-    /**
-     * Hardware-first lightweight enhancement fallback:
-     * Uses GLES 3.1 Compute Shader on GPU if supported, else native OpenCV C++ SIMD.
-     */
+    private fun getOrCreateFaceMaskTemplate128(): Mat {
+        faceMaskTemplate128?.let { return it }
+        val size = 128
+        val data = FloatArray(size * size)
+        val half = size * 0.5f
+        for (y in 0 until size) {
+            val dy = (y - half) / half
+            val rowOff = y * size
+            for (x in 0 until size) {
+                val dx = (x - half) / half
+                val radial = sqrt(dx * dx + dy * dy).coerceIn(0f, 1f)
+                data[rowOff + x] = if (radial < 0.45f) {
+                    1f
+                } else {
+                    val t = (radial - 0.45f) / 0.55f
+                    0.5f * (1f + cos(PI.toFloat() * t))
+                }
+            }
+        }
+        return Mat(size, size, CvType.CV_32FC1).also {
+            it.put(0, 0, data)
+            faceMaskTemplate128 = it
+        }
+    }
+
     fun enhanceFastLightweightCopy(
         srcBgr: Mat,
         sharpnessBoost: Float = 0.28f,
@@ -1270,6 +890,7 @@ class OnnxAiInferenceEngine(private val context: Context) {
     }
 
     private fun runSrTileAndResizeDirect(
+        inputBuf: FloatBuffer,
         shape: LongArray,
         tileSize: Int,
         validSrW: Int,
@@ -1278,44 +899,33 @@ class OnnxAiInferenceEngine(private val context: Context) {
         outResizedHwc: Mat,
         logger: EngineDiagnosticsLogger?
     ) {
-        val current = activeSrSession ?: throw IllegalStateException("Real-ESRGAN ONNX model is not loaded.")
-        val inputName = current.inputNames.first()
-        var tensor = OnnxTensor.createTensor(env, tileInBuf, shape)
-        try {
-            current.run(mapOf(inputName to tensor)).use { results ->
-                val outTensor = results[0] as OnnxTensor
-                extractValidPlanesAndResize(outTensor.floatBuffer, tileSize, validSrW, validSrH, dstSize, outResizedHwc)
-            }
-        } catch (t: Throwable) {
-            tensor.close()
-            val cpu = cpuFallbackSession
-            if (current !== cpu && cpu != null) {
-                logger?.warn("NNAPI SR runtime error (${t.message}); switching to CPU XNNPACK")
-                nnapiDisabledDueToRuntimeError = true
-                activeSrSession = cpu
-                activeProviderDescription = "CPU XNNPACK (Runtime fallback)"
-                tileInBuf.rewind()
-                tensor = OnnxTensor.createTensor(env, tileInBuf, shape)
-                try {
-                    cpu.run(mapOf(cpu.inputNames.first() to tensor)).use { results ->
+        while (srActiveIndex < srRankedSessions.size) {
+            val (backendId, current) = srRankedSessions[srActiveIndex]
+            try {
+                val inputName = current.inputNames.first()
+                inputBuf.rewind()
+                OnnxTensor.createTensor(env, inputBuf, shape).use { tensor ->
+                    current.run(mapOf(inputName to tensor)).use { results ->
                         val outTensor = results[0] as OnnxTensor
-                        extractValidPlanesAndResize(outTensor.floatBuffer, tileSize, validSrW, validSrH, dstSize, outResizedHwc)
+                        val outBuf = outTensor.floatBuffer
+                        val probe = outBuf.get(0)
+                        if (probe.isNaN() || probe.isInfinite()) {
+                            throw IllegalStateException("NaN output from ${backendId.displayLabel}")
+                        }
+                        extractValidPlanesAndResize(outBuf, tileSize, validSrW, validSrH, dstSize, outResizedHwc)
                     }
-                } finally {
-                    tensor.close()
                 }
                 return
+            } catch (t: Throwable) {
+                logger?.warn("Real-ESRGAN runtime fallback from ${backendId.displayLabel} (${t.message})")
+                srActiveIndex++
+                runtimeFallbacksCount++
+                refreshActiveLabelsAndSummary()
             }
-            throw t
         }
-        tensor.close()
+        throw IllegalStateException("All Real-ESRGAN ONNX execution backends failed")
     }
 
-    /**
-     * Streams NCHW 4x output planes directly from ORT buffer, slices the valid aspect-preserved
-     * region [validSrW x validSrH] (discarding mirror padding), and resizes cleanly via
-     * INTER_AREA (downscale supersampling) or INTER_CUBIC (upscale) to [dstSize].
-     */
     private fun extractValidPlanesAndResize(
         outBuf: FloatBuffer,
         tileSize: Int,
@@ -1351,10 +961,11 @@ class OnnxAiInferenceEngine(private val context: Context) {
     }
 
     private fun ensureDnCnnBuffers(w: Int, h: Int) {
-        if (dncnnInArr == null) {
-            val arr = FloatArray(dncnnTilePixels)
-            dncnnInArr = arr
-            dncnnInBuf = FloatBuffer.wrap(arr)
+        if (dncnnDirectInBuf == null) {
+            dncnnDirectInBuf = ByteBuffer.allocateDirect(dncnnTilePixels * 4)
+                .order(ByteOrder.nativeOrder())
+                .asFloatBuffer()
+            dncnnInTmpArr = FloatArray(dncnnTilePixels)
             dncnnOutArr = FloatArray(dncnnTilePixels)
             dncnnPadMat = Mat(dncnnTileSize, dncnnTileSize, CvType.CV_8UC1)
             dncnnFloatMat = Mat(dncnnTileSize, dncnnTileSize, CvType.CV_32FC1)
@@ -1377,24 +988,29 @@ class OnnxAiInferenceEngine(private val context: Context) {
         if (allocTileSize != tileSize) {
             allocTileSize = tileSize
             val px = tileSize * tileSize
-            tileInArr = FloatArray(3 * px)
-            tileInBuf = FloatBuffer.wrap(tileInArr)
-            tileInPlaneTmp = FloatArray(px)
+            val bytes = 3 * px * 4
+            tileInBufA = ByteBuffer.allocateDirect(bytes).order(ByteOrder.nativeOrder()).asFloatBuffer()
+            tileInBufB = ByteBuffer.allocateDirect(bytes).order(ByteOrder.nativeOrder()).asFloatBuffer()
+            tileInPlaneTmpA = FloatArray(px)
+            tileInPlaneTmpB = FloatArray(px)
 
             val outDim = tileSize * 4
             val outPx = outDim * outDim
             tileOutPlaneTmp = FloatArray(outPx)
 
-            tileChannels?.forEach { it.release() }
+            tileChannelsA?.forEach { it.release() }
+            tileChannelsB?.forEach { it.release() }
             resizedOutChannels?.forEach { it.release() }
-            tileChannels = List(3) { Mat(tileSize, tileSize, CvType.CV_32FC1) }
+            tileChannelsA = List(3) { Mat(tileSize, tileSize, CvType.CV_32FC1) }
+            tileChannelsB = List(3) { Mat(tileSize, tileSize, CvType.CV_32FC1) }
             resizedOutChannels = List(3) { Mat() }
+
             outFullPlaneMat?.release()
             outFullPlaneMat = Mat(outDim, outDim, CvType.CV_32FC1)
-            tilePaddedMat?.release()
-            tilePaddedMat = Mat(tileSize, tileSize, CvType.CV_8UC3)
-            tileFloatHwc?.release()
-            tileFloatHwc = Mat(tileSize, tileSize, CvType.CV_32FC3)
+            tilePaddedMatA?.release(); tilePaddedMatA = Mat(tileSize, tileSize, CvType.CV_8UC3)
+            tilePaddedMatB?.release(); tilePaddedMatB = Mat(tileSize, tileSize, CvType.CV_8UC3)
+            tileFloatHwcA?.release(); tileFloatHwcA = Mat(tileSize, tileSize, CvType.CV_32FC3)
+            tileFloatHwcB?.release(); tileFloatHwcB = Mat(tileSize, tileSize, CvType.CV_32FC3)
         }
     }
 
@@ -1412,7 +1028,8 @@ class OnnxAiInferenceEngine(private val context: Context) {
             baseRgb8u?.release()
             accumRgbMat?.release()
             accumWeightMat?.release()
-            accumChSplit?.forEach { it.release() }
+            invWeightSingleMat?.release()
+            invWeightThreeMat?.release()
             weightClampFloorMat?.release()
             outRgb8u?.release()
             clearFeatherCache()
@@ -1420,9 +1037,8 @@ class OnnxAiInferenceEngine(private val context: Context) {
             baseRgb8u = Mat(outH, outW, CvType.CV_8UC3)
             accumRgbMat = Mat(outH, outW, CvType.CV_32FC3)
             accumWeightMat = Mat(outH, outW, CvType.CV_32FC1)
-            accumChSplit = ArrayList<Mat>(3).apply {
-                repeat(3) { add(Mat(outH, outW, CvType.CV_32FC1)) }
-            }
+            invWeightSingleMat = Mat(outH, outW, CvType.CV_32FC1)
+            invWeightThreeMat = Mat(outH, outW, CvType.CV_32FC3)
             weightClampFloorMat = Mat(outH, outW, CvType.CV_32FC1, Scalar(1e-5))
             outRgb8u = Mat(outH, outW, CvType.CV_8UC3)
             outResizedFloat = outResizedFloat ?: Mat()
@@ -1523,14 +1139,22 @@ class OnnxAiInferenceEngine(private val context: Context) {
     }
 
     fun releaseWorkBuffers() {
+        srTileCache.reset()
+        dncnnTileCache.reset()
+        yuNetRunner.releaseWorkBuffers()
+
+        tilePrepExecutor?.shutdownNow()
+        tilePrepExecutor = null
+
         allocTileSize = 0
-        tileInArr = FloatArray(0)
-        tileInBuf = FloatBuffer.wrap(tileInArr)
-        tileInPlaneTmp = FloatArray(0)
+        tileInBufA = null
+        tileInBufB = null
+        tileInPlaneTmpA = FloatArray(0)
+        tileInPlaneTmpB = FloatArray(0)
         tileOutPlaneTmp = FloatArray(0)
 
-        dncnnInArr = null
-        dncnnInBuf = null
+        dncnnDirectInBuf = null
+        dncnnInTmpArr = null
         dncnnOutArr = null
         dncnnPadMat?.release(); dncnnPadMat = null
         dncnnFloatMat?.release(); dncnnFloatMat = null
@@ -1540,13 +1164,14 @@ class OnnxAiInferenceEngine(private val context: Context) {
         dncnnWeightedMat?.release(); dncnnWeightedMat = null
         dncnnU8Mat?.release(); dncnnU8Mat = null
 
-        tileChannels?.forEach { it.release() }
-        tileChannels = null
-        resizedOutChannels?.forEach { it.release() }
-        resizedOutChannels = null
+        tileChannelsA?.forEach { it.release() }; tileChannelsA = null
+        tileChannelsB?.forEach { it.release() }; tileChannelsB = null
+        resizedOutChannels?.forEach { it.release() }; resizedOutChannels = null
         outFullPlaneMat?.release(); outFullPlaneMat = null
-        tilePaddedMat?.release(); tilePaddedMat = null
-        tileFloatHwc?.release(); tileFloatHwc = null
+        tilePaddedMatA?.release(); tilePaddedMatA = null
+        tilePaddedMatB?.release(); tilePaddedMatB = null
+        tileFloatHwcA?.release(); tileFloatHwcA = null
+        tileFloatHwcB?.release(); tileFloatHwcB = null
         outResizedFloat?.release(); outResizedFloat = null
         weightedTileFloat?.release(); weightedTileFloat = null
 
@@ -1554,14 +1179,18 @@ class OnnxAiInferenceEngine(private val context: Context) {
         baseRgb8u?.release(); baseRgb8u = null
         accumRgbMat?.release(); accumRgbMat = null
         accumWeightMat?.release(); accumWeightMat = null
-        accumChSplit?.forEach { it.release() }
-        accumChSplit = null
+        invWeightSingleMat?.release(); invWeightSingleMat = null
+        invWeightThreeMat?.release(); invWeightThreeMat = null
         weightClampFloorMat?.release(); weightClampFloorMat = null
         outRgb8u?.release(); outRgb8u = null
 
         faceSrFloatMat?.release(); faceSrFloatMat = null
-        faceSr8uMat?.release(); faceSr8uMat = null
-        faceMaskFloatMat?.release(); faceMaskFloatMat = null
+        faceMaskTemplate128?.release(); faceMaskTemplate128 = null
+        faceMaskScaledSingle?.release(); faceMaskScaledSingle = null
+        faceMask3C?.release(); faceMask3C = null
+        faceDstSubF?.release(); faceDstSubF = null
+        faceSrWeightedF?.release(); faceSrWeightedF = null
+        faceBlendF?.release(); faceBlendF = null
 
         lwBlurMat?.release(); lwBlurMat = null
         lwDetailMat?.release(); lwDetailMat = null
@@ -1580,17 +1209,19 @@ class OnnxAiInferenceEngine(private val context: Context) {
         return destFile
     }
 
+    private fun closeModelSessionsOnly() {
+        srRankedSessions.forEach { runCatching { it.second.close() } }
+        dncnnRankedSessions.forEach { runCatching { it.second.close() } }
+        srRankedSessions = emptyList()
+        dncnnRankedSessions = emptyList()
+        srActiveIndex = 0
+        dncnnActiveIndex = 0
+        yuNetRunner.close()
+    }
+
     fun close() {
         releaseWorkBuffers()
         gpuProcessor.release()
-        try {
-            activeSrSession?.takeIf { it !== cpuFallbackSession }?.close()
-            cpuFallbackSession?.close()
-            dncnnSession?.close()
-        } catch (_: Exception) {
-        }
-        cpuFallbackSession = null
-        activeSrSession = null
-        dncnnSession = null
+        closeModelSessionsOnly()
     }
 }

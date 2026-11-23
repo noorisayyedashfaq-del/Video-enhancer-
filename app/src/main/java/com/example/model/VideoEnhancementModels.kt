@@ -123,6 +123,109 @@ enum class ThermalState(val label: String) {
     CRITICAL("Overheating")
 }
 
+@Serializable
+enum class AcceleratorKind(val label: String, val priorityRank: Int) {
+    GPU("GPU", 0),
+    NPU("NPU", 1),
+    CPU("CPU", 2)
+}
+
+@Serializable
+enum class ModelKind(val id: String, val displayName: String, val shortTag: String) {
+    REAL_ESRGAN("REAL_ESRGAN", "Real-ESRGAN SR", "SR"),
+    DNCNN("DNCNN", "DnCNN Denoise", "DN"),
+    FACE_YUNET("FACE_YUNET", "Face AI (YuNet)", "Face")
+}
+
+@Serializable
+enum class BackendCandidateId(
+    val kind: AcceleratorKind,
+    val displayLabel: String
+) {
+    QNN_GPU(AcceleratorKind.GPU, "Qualcomm QNN GPU"),
+    NNAPI_GPU(AcceleratorKind.GPU, "NNAPI GPU"),
+    OPENCV_OPENCL(AcceleratorKind.GPU, "OpenCL GPU"),
+    OPENCV_VULKAN(AcceleratorKind.GPU, "Vulkan GPU"),
+    GLES_COMPUTE(AcceleratorKind.GPU, "GLES 3.1 GPU"),
+    QNN_HTP(AcceleratorKind.NPU, "Qualcomm QNN HTP NPU"),
+    NNAPI_NPU(AcceleratorKind.NPU, "NNAPI NPU/Accelerator"),
+    NNAPI_AUTO(AcceleratorKind.NPU, "NNAPI Hardware"),
+    ORT_XNNPACK_BIG(AcceleratorKind.CPU, "CPU XNNPACK (Big Cores)"),
+    ORT_XNNPACK_ALL(AcceleratorKind.CPU, "CPU XNNPACK"),
+    ORT_CPU(AcceleratorKind.CPU, "CPU ORT"),
+    OPENCV_CPU(AcceleratorKind.CPU, "OpenCV SIMD CPU")
+}
+
+@Serializable
+data class CpuTopologyInfo(
+    val totalCores: Int,
+    val bigCoreCount: Int,
+    val littleCoreCount: Int,
+    val maxClockMhz: Int,
+    val clusterSummary: String
+)
+
+@Serializable
+data class HardwareProbeSnapshot(
+    val vulkanSupported: Boolean,
+    val vulkanVersionLabel: String,
+    val vulkanComputeSupported: Boolean,
+    val openClSupported: Boolean,
+    val openClSourceLabel: String,
+    val openGlEsMajor: Int,
+    val nnapiSupported: Boolean,
+    val nnapiGpuDetected: Boolean,
+    val nnapiNpuDetected: Boolean,
+    val nnapiDriversSummary: String,
+    val isQualcommSoc: Boolean,
+    val qnnHtpAvailable: Boolean,
+    val qnnGpuAvailable: Boolean,
+    val qnnStatusLabel: String,
+    val cpuTopology: CpuTopologyInfo
+)
+
+@Serializable
+data class ModelBackendBenchmark(
+    val backendId: BackendCandidateId,
+    val kind: AcceleratorKind,
+    val displayLabel: String,
+    val threads: Int = 0,
+    val medianLatencyMs: Long? = null,
+    val verifiedFullOffload: Boolean = false,
+    val numericalParityOk: Boolean = false,
+    val rejectedReason: String? = null
+)
+
+@Serializable
+data class ModelExecutionPlan(
+    val modelKind: ModelKind,
+    val selectedBackend: BackendCandidateId,
+    val selectedKind: AcceleratorKind,
+    val selectedLabel: String,
+    val selectedThreads: Int = 0,
+    val measuredLatencyMs: Long,
+    val fallbackChain: List<BackendCandidateId>,
+    val evaluatedBackends: List<ModelBackendBenchmark>
+)
+
+@Serializable
+data class AdaptiveHardwareProfile(
+    val deviceFingerprint: String,
+    val appVersionCode: Long,
+    val modelSignature: String,
+    val probeSnapshot: HardwareProbeSnapshot,
+    val plans: Map<ModelKind, ModelExecutionPlan>,
+    val benchmarkedAtEpochMs: Long,
+    val fromCache: Boolean = false
+) {
+    fun compactSummaryPill(): String {
+        val sr = plans[ModelKind.REAL_ESRGAN]?.selectedKind?.label ?: "CPU"
+        val dn = plans[ModelKind.DNCNN]?.selectedKind?.label ?: "CPU"
+        val fc = plans[ModelKind.FACE_YUNET]?.selectedKind?.label ?: "CPU"
+        return "SR:$sr • DN:$dn • Face:$fc"
+    }
+}
+
 data class DeviceCapabilities(
     val tierName: String,
     val totalRamMb: Long,
@@ -147,7 +250,12 @@ data class DeviceCapabilities(
     val minRequiredFreeStorageMb: Long,
     val throttleDelayMsOnWarm: Long,
     val throttleDelayMsOnHot: Long,
-    val processingCapacityScore: Int
+    val processingCapacityScore: Int,
+    val vulkanComputeSupported: Boolean = false,
+    val openClSupported: Boolean = false,
+    val qnnSupported: Boolean = false,
+    val cpuTopology: CpuTopologyInfo? = null,
+    val hardwareProbeSnapshot: HardwareProbeSnapshot? = null
 )
 
 data class VideoMetadata(
@@ -294,6 +402,10 @@ data class EngineDiagnosticsReport(
     val dncnnInferenceMs: Long = 0L,
     val faceAiMs: Long = 0L,
     val upscaleScaleLabel: String = "1.0x",
+    val perModelAccelerationSummary: String = "",
+    val staticTilesReused: Int = 0,
+    val framesReusedDuplicate: Int = 0,
+    val runtimeFallbacksCount: Int = 0,
     val warnings: List<String> = emptyList()
 )
 
@@ -321,6 +433,7 @@ data class EngineHealthStatus(
     val dncnnModelReady: Boolean,
     val yunetModelReady: Boolean,
     val activeExecutionProvider: String,
+    val hardwareProfile: AdaptiveHardwareProfile? = null,
     val diagnosticMessage: String? = null
 )
 
@@ -332,6 +445,7 @@ data class MainUiState(
     val selectedMode: EnhancementMode = EnhancementMode.CLARITY_2X,
     val computedOutputDimensions: Map<EnhancementMode, OutputDimensions> = emptyMap(),
     val isProcessing: Boolean = false,
+    val isBenchmarkingHardware: Boolean = false,
     val progress: ProcessingProgress = ProcessingProgress(),
     val enhancementResult: EnhancementResult? = null,
     val isSavingToGallery: Boolean = false,
