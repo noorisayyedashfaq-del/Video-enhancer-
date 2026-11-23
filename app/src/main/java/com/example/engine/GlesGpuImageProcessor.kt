@@ -25,6 +25,8 @@ class GlesGpuImageProcessor {
     private var computeProgram: Int = 0
     private var texIn: Int = 0
     private var texOut: Int = 0
+    private var allocatedTexW: Int = 0
+    private var allocatedTexH: Int = 0
     private var uWidthLoc: Int = -1
     private var uHeightLoc: Int = -1
     private var uSharpnessLoc: Int = -1
@@ -130,6 +132,8 @@ class GlesGpuImageProcessor {
             texIn = textures[0]
             texOut = textures[1]
             GLES31.glGenFramebuffers(1, fboIds, 0)
+            allocatedTexW = 0
+            allocatedTexH = 0
 
             // Detach from init thread so processing thread can bind it smoothly
             EGL14.eglMakeCurrent(display, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT)
@@ -180,17 +184,39 @@ class GlesGpuImageProcessor {
         val h = bgr.rows()
         if (w < 16 || h < 16) return false
 
+        val rgba = rgbaScratchMat?.takeIf { it.cols() == w && it.rows() == h }
+            ?: Mat(h, w, org.opencv.core.CvType.CV_8UC4).also {
+                rgbaScratchMat?.release()
+                rgbaScratchMat = it
+            }
+        Imgproc.cvtColor(bgr, rgba, Imgproc.COLOR_BGR2RGBA)
+        val ok = enhanceRgbaInPlace(rgba, sharpness, contrast, saturation)
+        if (ok) {
+            Imgproc.cvtColor(rgba, bgr, Imgproc.COLOR_RGBA2BGR)
+        }
+        return ok
+    }
+
+    /**
+     * Zero-conversion GLES 3.1 compute shader enhancement directly on a CV_8UC4 RGBA Mat.
+     * Reuses immutable glTexStorage2D textures across same-resolution video frames.
+     */
+    @Synchronized
+    fun enhanceRgbaInPlace(
+        rgba: Mat,
+        sharpness: Float,
+        contrast: Float,
+        saturation: Float
+    ): Boolean {
+        if (!initialized || probeFailed.get()) return false
+        val w = rgba.cols()
+        val h = rgba.rows()
+        if (w < 16 || h < 16) return false
+
         return try {
             if (!EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)) {
                 return false
             }
-
-            val rgba = rgbaScratchMat?.takeIf { it.cols() == w && it.rows() == h }
-                ?: Mat(h, w, org.opencv.core.CvType.CV_8UC4).also {
-                    rgbaScratchMat?.release()
-                    rgbaScratchMat = it
-                }
-            Imgproc.cvtColor(bgr, rgba, Imgproc.COLOR_BGR2RGBA)
 
             val neededBytes = w * h * 4
             val inBuf = inPixelBuf?.takeIf { it.capacity() >= neededBytes }
@@ -212,19 +238,38 @@ class GlesGpuImageProcessor {
             inBuf.put(rawBytes, 0, neededBytes)
             inBuf.flip()
 
+            if (w != allocatedTexW || h != allocatedTexH) {
+                if (texIn != 0 || texOut != 0) {
+                    GLES31.glDeleteTextures(2, intArrayOf(texIn, texOut), 0)
+                }
+                val textures = IntArray(2)
+                GLES31.glGenTextures(2, textures, 0)
+                texIn = textures[0]
+                texOut = textures[1]
+
+                GLES31.glBindTexture(GLES31.GL_TEXTURE_2D, texIn)
+                GLES31.glTexParameteri(GLES31.GL_TEXTURE_2D, GLES31.GL_TEXTURE_MIN_FILTER, GLES31.GL_NEAREST)
+                GLES31.glTexParameteri(GLES31.GL_TEXTURE_2D, GLES31.GL_TEXTURE_MAG_FILTER, GLES31.GL_NEAREST)
+                GLES31.glTexStorage2D(GLES31.GL_TEXTURE_2D, 1, GLES31.GL_RGBA8, w, h)
+
+                GLES31.glBindTexture(GLES31.GL_TEXTURE_2D, texOut)
+                GLES31.glTexParameteri(GLES31.GL_TEXTURE_2D, GLES31.GL_TEXTURE_MIN_FILTER, GLES31.GL_NEAREST)
+                GLES31.glTexParameteri(GLES31.GL_TEXTURE_2D, GLES31.GL_TEXTURE_MAG_FILTER, GLES31.GL_NEAREST)
+                GLES31.glTexStorage2D(GLES31.GL_TEXTURE_2D, 1, GLES31.GL_RGBA8, w, h)
+
+                GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, fboIds[0])
+                GLES31.glFramebufferTexture2D(GLES31.GL_FRAMEBUFFER, GLES31.GL_COLOR_ATTACHMENT0, GLES31.GL_TEXTURE_2D, texOut, 0)
+                GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, 0)
+
+                allocatedTexW = w
+                allocatedTexH = h
+            }
+
             GLES31.glBindTexture(GLES31.GL_TEXTURE_2D, texIn)
-            GLES31.glTexParameteri(GLES31.GL_TEXTURE_2D, GLES31.GL_TEXTURE_MIN_FILTER, GLES31.GL_NEAREST)
-            GLES31.glTexParameteri(GLES31.GL_TEXTURE_2D, GLES31.GL_TEXTURE_MAG_FILTER, GLES31.GL_NEAREST)
-            GLES31.glTexStorage2D(GLES31.GL_TEXTURE_2D, 1, GLES31.GL_RGBA8, w, h)
             GLES31.glTexSubImage2D(
                 GLES31.GL_TEXTURE_2D, 0, 0, 0, w, h,
                 GLES31.GL_RGBA, GLES31.GL_UNSIGNED_BYTE, inBuf
             )
-
-            GLES31.glBindTexture(GLES31.GL_TEXTURE_2D, texOut)
-            GLES31.glTexParameteri(GLES31.GL_TEXTURE_2D, GLES31.GL_TEXTURE_MIN_FILTER, GLES31.GL_NEAREST)
-            GLES31.glTexParameteri(GLES31.GL_TEXTURE_2D, GLES31.GL_TEXTURE_MAG_FILTER, GLES31.GL_NEAREST)
-            GLES31.glTexStorage2D(GLES31.GL_TEXTURE_2D, 1, GLES31.GL_RGBA8, w, h)
 
             GLES31.glUseProgram(computeProgram)
             GLES31.glUniform1i(uWidthLoc, w)
@@ -239,10 +284,9 @@ class GlesGpuImageProcessor {
             val groupsX = (w + 15) / 16
             val groupsY = (h + 15) / 16
             GLES31.glDispatchCompute(groupsX, groupsY, 1)
-            GLES31.glMemoryBarrier(GLES31.GL_FRAMEBUFFER_BARRIER_BIT or GLES31.GL_TEXTURE_FETCH_BARRIER_BIT or GLES31.GL_SHADER_IMAGE_ACCESS_BARRIER_BIT)
+            GLES31.glMemoryBarrier(GLES31.GL_FRAMEBUFFER_BARRIER_BIT or GLES31.GL_SHADER_IMAGE_ACCESS_BARRIER_BIT)
 
             GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, fboIds[0])
-            GLES31.glFramebufferTexture2D(GLES31.GL_FRAMEBUFFER, GLES31.GL_COLOR_ATTACHMENT0, GLES31.GL_TEXTURE_2D, texOut, 0)
             outBuf.clear()
             GLES31.glReadPixels(0, 0, w, h, GLES31.GL_RGBA, GLES31.GL_UNSIGNED_BYTE, outBuf)
             GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, 0)
@@ -250,7 +294,6 @@ class GlesGpuImageProcessor {
             outBuf.rewind()
             outBuf.get(rawBytes, 0, neededBytes)
             rgba.put(0, 0, rawBytes)
-            Imgproc.cvtColor(rgba, bgr, Imgproc.COLOR_RGBA2BGR)
 
             EGL14.eglMakeCurrent(eglDisplay, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT)
             true
@@ -322,6 +365,8 @@ class GlesGpuImageProcessor {
             computeProgram = 0
             texIn = 0
             texOut = 0
+            allocatedTexW = 0
+            allocatedTexH = 0
             fboIds[0] = 0
             initialized = false
         }

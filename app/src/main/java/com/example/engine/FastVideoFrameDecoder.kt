@@ -90,7 +90,8 @@ object FastYuvCopyMath {
         width: Int,
         height: Int,
         dst: ByteArray,
-        dstOffset: Int
+        dstOffset: Int,
+        scratchRowBuf: ByteArray? = null
     ) {
         val buf = bufSource.duplicate()
         var outPos = dstOffset
@@ -115,7 +116,12 @@ object FastYuvCopyMath {
                 outPos += width
             }
         } else {
-            val rowTmp = ByteArray(((width - 1) * pixelStride + 1).coerceAtLeast(1))
+            val neededRow = ((width - 1) * pixelStride + 1).coerceAtLeast(1)
+            val rowTmp = if (scratchRowBuf != null && scratchRowBuf.size >= neededRow) {
+                scratchRowBuf
+            } else {
+                ByteArray(neededRow)
+            }
             for (r in 0 until height) {
                 val srcPos = (cropTop + r) * rowStride + cropLeft * pixelStride
                 val readLen = rowTmp.size.coerceAtMost((limit - srcPos).coerceAtLeast(0))
@@ -144,15 +150,16 @@ class FastVideoFrameDecoder(
     private val rotationDegrees: Int
 ) {
     private var yuvBytes = ByteArray(0)
+    private var stridedRowScratch = ByteArray(0)
     private var yuvMat: Mat? = null
 
     private val poolLock = Any()
-    private val bgrPool = ArrayDeque<Mat>(4)
+    private val bgrPool = ArrayDeque<Mat>(6)
 
     fun recycleMat(mat: Mat?) {
         if (mat == null || mat.empty()) return
         synchronized(poolLock) {
-            if (bgrPool.size < 4) {
+            if (bgrPool.size < 6) {
                 bgrPool.addLast(mat)
             } else {
                 mat.release()
@@ -226,7 +233,7 @@ class FastVideoFrameDecoder(
 
             while (!outputDone && !isCancelled()) {
                 if (!inputDone) {
-                    val inIdx = codec.dequeueInputBuffer(8_000L)
+                    val inIdx = codec.dequeueInputBuffer(4_000L)
                     if (inIdx >= 0) {
                         val inBuf: ByteBuffer? = codec.getInputBuffer(inIdx)
                         val sampleSize = if (inBuf != null) extractor.readSampleData(inBuf, 0) else -1
@@ -241,7 +248,7 @@ class FastVideoFrameDecoder(
                     }
                 }
 
-                val outIdx = codec.dequeueOutputBuffer(bufferInfo, 8_000L)
+                val outIdx = codec.dequeueOutputBuffer(bufferInfo, 4_000L)
                 when {
                     outIdx >= 0 -> {
                         idlePolls = 0
@@ -315,6 +322,10 @@ class FastVideoFrameDecoder(
         }
 
         val planes = image.planes
+        val neededRow = (w * 2).coerceAtLeast(16)
+        if (stridedRowScratch.size < neededRow) {
+            stridedRowScratch = ByteArray(neededRow)
+        }
         FastYuvCopyMath.copyPlanarOrStridedPlane(
             bufSource = planes[0].buffer,
             rowStride = planes[0].rowStride,
@@ -324,7 +335,8 @@ class FastVideoFrameDecoder(
             width = w,
             height = h,
             dst = yuvBytes,
-            dstOffset = 0
+            dstOffset = 0,
+            scratchRowBuf = stridedRowScratch
         )
 
         val uPlane = planes[1]
@@ -392,7 +404,8 @@ class FastVideoFrameDecoder(
                     width = w / 2,
                     height = h / 2,
                     dst = yuvBytes,
-                    dstOffset = ySize
+                    dstOffset = ySize,
+                    scratchRowBuf = stridedRowScratch
                 )
                 FastYuvCopyMath.copyPlanarOrStridedPlane(
                     bufSource = vBuf,
@@ -403,7 +416,8 @@ class FastVideoFrameDecoder(
                     width = w / 2,
                     height = h / 2,
                     dst = yuvBytes,
-                    dstOffset = ySize + uvSize
+                    dstOffset = ySize + uvSize,
+                    scratchRowBuf = stridedRowScratch
                 )
                 Imgproc.COLOR_YUV2BGR_I420
             }

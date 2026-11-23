@@ -71,13 +71,20 @@ object ResolutionCalculator {
 
         val baseTileSize = (if (profile.aiTileSize > 0) profile.aiTileSize else {
             when (mode) {
-                EnhancementMode.CLARITY_1X, EnhancementMode.CLARITY_2X -> 256
-                EnhancementMode.CLARITY_3X -> 320
-                EnhancementMode.CLARITY_4X -> 384
+                EnhancementMode.CLARITY_1X, EnhancementMode.CLARITY_2X -> 192
+                EnhancementMode.CLARITY_3X -> 224
+                EnhancementMode.CLARITY_4X -> 256
             }
-        }).coerceIn(192, 512)
+        }).coerceIn(128, 384)
 
-        val tileBudgetCap = if (profile.targetTilesPerFrame > 0) profile.targetTilesPerFrame else 16
+        val tileBudgetCap = if (profile.targetTilesPerFrame > 0) profile.targetTilesPerFrame else {
+            when (mode) {
+                EnhancementMode.CLARITY_1X -> 1
+                EnhancementMode.CLARITY_2X -> 2
+                EnhancementMode.CLARITY_3X -> 3
+                EnhancementMode.CLARITY_4X -> 4
+            }
+        }
         val neededTiles = computeSmartTileCount(
             inW = evenInW,
             inH = evenInH,
@@ -104,8 +111,8 @@ object ResolutionCalculator {
     }
 
     /**
-     * Computes only the tiles actually needed to cover [inW] x [inH] cleanly near 1:1 native
-     * resolution with ~12% seam overlap, avoiding wasteful 25-tile splits on small videos.
+     * Computes only the tiles actually needed to cover neural working resolution cleanly
+     * with strict [maxTilesCap] enforcement so processing stays within time budgets.
      */
     fun computeSmartTileCount(
         inW: Int,
@@ -115,14 +122,14 @@ object ResolutionCalculator {
     ): Int {
         val safeW = inW.coerceAtLeast(2)
         val safeH = inH.coerceAtLeast(2)
-        val safeTile = tileSize.coerceIn(128, 512)
-        val overlap = (safeTile * 0.12f).roundToInt().coerceIn(16, 48)
+        val safeTile = tileSize.coerceIn(128, 384)
+        val overlap = (safeTile * 0.10f).roundToInt().coerceIn(12, 32)
         val step = (safeTile - overlap).coerceAtLeast(64)
 
         val cols = if (safeW <= safeTile) 1 else ceil((safeW - overlap).toDouble() / step.toDouble()).toInt().coerceAtLeast(2)
         val rows = if (safeH <= safeTile) 1 else ceil((safeH - overlap).toDouble() / step.toDouble()).toInt().coerceAtLeast(2)
         val naturalTiles = (cols * rows).coerceAtLeast(1)
-        return naturalTiles.coerceAtMost(maxTilesCap.coerceAtLeast(naturalTiles))
+        return naturalTiles.coerceAtMost(maxTilesCap.coerceAtLeast(1))
     }
 
     private fun makeEven(value: Int): Int {

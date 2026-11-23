@@ -16,11 +16,11 @@ import kotlin.math.abs
  * and forces a mandatory full AI refresh every [MAX_CONSECUTIVE_REUSES] frames or on scene cuts.
  */
 object TemporalReusePolicy {
-    const val FRAME_DUPLICATE_MAD_THRESHOLD = 0.65f
-    const val TILE_STATIC_MAD_THRESHOLD = 1.10f
+    const val FRAME_DUPLICATE_MAD_THRESHOLD = 1.35f
+    const val TILE_STATIC_MAD_THRESHOLD = 1.85f
     const val SCENE_CUT_MAD_THRESHOLD = 8.50f
-    const val MAX_CONSECUTIVE_REUSES = 2
-    const val FACE_KEYFRAME_INTERVAL = 3
+    const val MAX_CONSECUTIVE_REUSES = 3
+    const val FACE_KEYFRAME_INTERVAL = 12
 
     fun computeMeanAbsDiff(a: ByteArray, b: ByteArray): Float {
         if (a.isEmpty() || a.size != b.size) return 255f
@@ -61,7 +61,7 @@ object TemporalReusePolicy {
     ): Boolean {
         if (frameIndex <= 0) return true
         if (frameMad >= SCENE_CUT_MAD_THRESHOLD) return true
-        if (!hasPreviousBoxes) return frameIndex % 2 == 0
+        if (!hasPreviousBoxes) return frameIndex % FACE_KEYFRAME_INTERVAL == 0
         return frameIndex % FACE_KEYFRAME_INTERVAL == 0
     }
 }
@@ -80,6 +80,8 @@ class StaticTileReuseCache {
 
     private val tileEntries = HashMap<Int, CachedTileEntry>()
     private var prevFrameThumbBytes: ByteArray? = null
+    private var currFrameThumbBytes: ByteArray = ByteArray(48 * 48)
+    private var tileSigScratch: ByteArray = ByteArray(16 * 16)
     private var thumbMat: Mat? = null
     private var grayThumbMat: Mat? = null
 
@@ -89,27 +91,34 @@ class StaticTileReuseCache {
     fun computeFrameThumbnailAndMad(bgrMat: Mat): Pair<ByteArray, Float> {
         val tm = thumbMat ?: Mat().also { thumbMat = it }
         val gm = grayThumbMat ?: Mat().also { grayThumbMat = it }
-        Imgproc.resize(bgrMat, tm, Size(48.0, 48.0), 0.0, 0.0, Imgproc.INTER_AREA)
+        Imgproc.resize(bgrMat, tm, Size(48.0, 48.0), 0.0, 0.0, Imgproc.INTER_LINEAR)
         Imgproc.cvtColor(tm, gm, Imgproc.COLOR_BGR2GRAY)
-        val bytes = ByteArray(48 * 48)
-        gm.get(0, 0, bytes)
-        val mad = prevFrameThumbBytes?.let { TemporalReusePolicy.computeMeanAbsDiff(bytes, it) } ?: 255f
-        prevFrameThumbBytes = bytes
-        return bytes to mad
+        val curr = currFrameThumbBytes
+        gm.get(0, 0, curr)
+        val prev = prevFrameThumbBytes
+        val mad = if (prev != null) {
+            TemporalReusePolicy.computeMeanAbsDiff(curr, prev)
+        } else {
+            prevFrameThumbBytes = ByteArray(48 * 48)
+            255f
+        }
+        // Swap preallocated buffers instead of allocating 2.3KB every frame
+        currFrameThumbBytes = prevFrameThumbBytes!!
+        prevFrameThumbBytes = curr
+        return curr to mad
     }
 
     fun computeTileSignature(tileRgbOrGray: Mat): ByteArray {
         val tm = thumbMat ?: Mat().also { thumbMat = it }
         val gm = grayThumbMat ?: Mat().also { grayThumbMat = it }
-        Imgproc.resize(tileRgbOrGray, tm, Size(16.0, 16.0), 0.0, 0.0, Imgproc.INTER_AREA)
+        Imgproc.resize(tileRgbOrGray, tm, Size(16.0, 16.0), 0.0, 0.0, Imgproc.INTER_LINEAR)
         if (tm.channels() > 1) {
             Imgproc.cvtColor(tm, gm, Imgproc.COLOR_RGB2GRAY)
         } else {
             tm.copyTo(gm)
         }
-        val sig = ByteArray(256)
-        gm.get(0, 0, sig)
-        return sig
+        gm.get(0, 0, tileSigScratch)
+        return tileSigScratch
     }
 
     /**

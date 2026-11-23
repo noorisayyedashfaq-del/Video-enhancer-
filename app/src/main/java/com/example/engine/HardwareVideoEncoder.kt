@@ -201,7 +201,7 @@ class HardwareVideoEncoder(
     private fun drainEncoder(endOfStream: Boolean) {
         val codec = mediaCodec ?: return
         val muxer = mediaMuxer ?: return
-        val timeoutUs = if (endOfStream) 10_000L else 5_000L
+        val timeoutUs = if (endOfStream) 10_000L else 0L
         val safeFps = fps.coerceIn(10.0, 120.0)
         val eosDeadlineNs = if (endOfStream) System.nanoTime() + 10_000_000_000L else Long.MAX_VALUE
         var eosTryAgainCount = 0

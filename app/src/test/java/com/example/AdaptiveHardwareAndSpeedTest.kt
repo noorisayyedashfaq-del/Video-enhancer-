@@ -237,17 +237,17 @@ class AdaptiveHardwareAndSpeedTest {
         assertTrue(TemporalReusePolicy.computeMeanAbsDiff(base, moved) > TemporalReusePolicy.SCENE_CUT_MAD_THRESHOLD)
 
         assertTrue(TemporalReusePolicy.shouldReuseStaticTile(0.4f, 0, isSceneCut = false, hasCachedOutput = true))
-        assertTrue(TemporalReusePolicy.shouldReuseStaticTile(0.4f, 1, isSceneCut = false, hasCachedOutput = true))
-        assertFalse("Must force full AI refresh after max consecutive reuses", TemporalReusePolicy.shouldReuseStaticTile(0.4f, 2, isSceneCut = false, hasCachedOutput = true))
+        assertTrue(TemporalReusePolicy.shouldReuseStaticTile(0.4f, 2, isSceneCut = false, hasCachedOutput = true))
+        assertFalse("Must force full AI refresh after max consecutive reuses", TemporalReusePolicy.shouldReuseStaticTile(0.4f, 3, isSceneCut = false, hasCachedOutput = true))
         assertFalse("Must not reuse on scene cut", TemporalReusePolicy.shouldReuseStaticTile(0.4f, 0, isSceneCut = true, hasCachedOutput = true))
 
         assertTrue(TemporalReusePolicy.shouldReuseDuplicateFrame(0.3f, 0, hasCachedFrame = true))
-        assertFalse(TemporalReusePolicy.shouldReuseDuplicateFrame(0.3f, 2, hasCachedFrame = true))
+        assertFalse(TemporalReusePolicy.shouldReuseDuplicateFrame(0.3f, 3, hasCachedFrame = true))
 
         assertTrue(TemporalReusePolicy.shouldRunFullFaceDetection(0, 1.0f, true))
         assertFalse(TemporalReusePolicy.shouldRunFullFaceDetection(1, 1.0f, true))
-        assertFalse(TemporalReusePolicy.shouldRunFullFaceDetection(2, 1.0f, true))
-        assertTrue(TemporalReusePolicy.shouldRunFullFaceDetection(3, 1.0f, true))
+        assertFalse(TemporalReusePolicy.shouldRunFullFaceDetection(6, 1.0f, true))
+        assertTrue(TemporalReusePolicy.shouldRunFullFaceDetection(12, 1.0f, true))
         assertTrue("Scene cut must immediately refresh face boxes", TemporalReusePolicy.shouldRunFullFaceDetection(1, 12.0f, true))
     }
 

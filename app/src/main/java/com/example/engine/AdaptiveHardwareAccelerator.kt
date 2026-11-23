@@ -96,13 +96,13 @@ class AdaptiveHardwareAccelerator(
         val availableProviders = runCatching { OrtEnvironment.getAvailableProviders() }
             .getOrDefault(EnumSet.of(OrtProvider.CPU))
 
-        // 1. Real-ESRGAN [1, 3, 256, 256]
+        // 1. Real-ESRGAN [1, 3, 192, 192] fast production probe shape
         val srResult = if (srFile.exists() && srFile.length() > 0L) {
             benchmarkOnnxModelCandidates(
                 modelKind = ModelKind.REAL_ESRGAN,
                 modelFile = srFile,
-                tileInputShape = longArrayOf(1L, 3L, 256L, 256L),
-                minExpectedOutputElems = 3 * 256 * 256 * 16,
+                tileInputShape = longArrayOf(1L, 3L, 192L, 192L),
+                minExpectedOutputElems = 3 * 192 * 192 * 16,
                 probe = probe,
                 availableProviders = availableProviders,
                 threadCandidates = threadCandidates,
@@ -405,6 +405,7 @@ class AdaptiveHardwareAccelerator(
                 setInterOpNumThreads(1)
                 addConfigEntry("session.intra_op.allow_spinning", "0")
                 addConfigEntry("session.inter_op.allow_spinning", "0")
+                addConfigEntry("session.set_denormal_as_zero", "1")
 
                 when (backendId) {
                     BackendCandidateId.ORT_XNNPACK_BIG,
@@ -570,9 +571,9 @@ class AdaptiveHardwareAccelerator(
                         ) to null
                     }
 
-                    // Multi-run benchmark for reliable sustained median latency
-                    val runs = ArrayList<Long>(3)
-                    for (r in 0 until 3) {
+                    // 2 timed runs after warmup for fast, deterministic latency selection
+                    val runs = ArrayList<Long>(2)
+                    for (r in 0 until 2) {
                         if (callerTimedOut.get()) break
                         fBuf.rewind()
                         val t0 = System.nanoTime()

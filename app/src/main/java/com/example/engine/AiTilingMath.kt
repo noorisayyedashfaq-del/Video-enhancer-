@@ -3,6 +3,7 @@ package com.example.engine
 import kotlin.math.abs
 import kotlin.math.ceil
 import kotlin.math.floor
+import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
@@ -283,24 +284,267 @@ object AiTilingMath {
         }
         return w.coerceIn(0.05f, 1f)
     }
+
+    /**
+     * Computes optimal neural working input dimensions for Real-ESRGAN x4v3 so that:
+     * 1. It never feeds excessive full-res pixels that x4v3 would inflate 4x only to downsample.
+     * 2. It fits cleanly within [maxTilesCap] tiles of [tileSize] without cutting field-of-view.
+     */
+    fun computeNeuralWorkingSize(
+        inW: Int,
+        inH: Int,
+        outW: Int,
+        outH: Int,
+        tileSize: Int,
+        maxTilesCap: Int
+    ): Pair<Int, Int> {
+        val safeInW = inW.coerceAtLeast(2)
+        val safeInH = inH.coerceAtLeast(2)
+        val safeTile = tileSize.coerceIn(128, 384)
+        val cap = maxTilesCap.coerceAtLeast(1)
+        val overlap = (safeTile * 0.10f).roundToInt().coerceIn(12, 32)
+        val step = (safeTile - overlap).coerceAtLeast(64)
+
+        // Ideal input size for 4x Real-ESRGAN model (~1/4 of target output), never exceeding input
+        val idealW = ceil(outW.coerceAtLeast(safeInW) / 4.0).toInt().coerceAtMost(safeInW)
+        val idealH = ceil(outH.coerceAtLeast(safeInH) / 4.0).toInt().coerceAtMost(safeInH)
+
+        // Maximum span allowed cleanly by tile cap along dominant axis
+        val (colsCap, rowsCap) = when {
+            cap <= 1 -> 1 to 1
+            cap == 2 -> if (safeInW >= safeInH) 2 to 1 else 1 to 2
+            cap == 3 -> if (safeInW >= safeInH) 3 to 1 else 1 to 3
+            cap <= 4 -> 2 to 2
+            else -> if (safeInW >= safeInH) 3 to 2 else 2 to 3
+        }
+        val maxWByTiles = if (colsCap == 1) safeTile else safeTile + (colsCap - 1) * step
+        val maxHByTiles = if (rowsCap == 1) safeTile else safeTile + (rowsCap - 1) * step
+
+        val targetLongFloor = when (cap) {
+            1 -> min(safeInW, safeTile)
+            2 -> min(max(safeInW, idealW), max(maxWByTiles, maxHByTiles))
+            else -> max(idealW, idealH).coerceAtLeast(min(max(safeInW, safeInH), safeTile * 2))
+        }
+
+        val scaleByW = min(safeInW.toDouble(), max(idealW, targetLongFloor).coerceAtMost(maxWByTiles).toDouble()) / safeInW.toDouble()
+        val scaleByH = min(safeInH.toDouble(), max(idealH, targetLongFloor).coerceAtMost(maxHByTiles).toDouble()) / safeInH.toDouble()
+        val scale = min(1.0, min(scaleByW, scaleByH)).coerceAtLeast(0.15)
+
+        val workW = ((safeInW * scale).roundToInt() / 2 * 2).coerceIn(32, safeInW)
+        val workH = ((safeInH * scale).roundToInt() / 2 * 2).coerceIn(32, safeInH)
+        return workW to workH
+    }
+}
+
+enum class SpeedExecutionTier(val label: String) {
+    FULL_NEURAL_PER_FRAME("Full AI Per-Frame"),
+    SINGLE_TILE_NEURAL("1-Tile AI Per-Frame"),
+    KEYFRAME_NEURAL_HYBRID("Keyframe AI + GPU"),
+    GPU_SHADER_FAST_PASS("GPU Shader Fast")
+}
+
+data class FrameSpeedDecision(
+    val runNeuralSrNow: Boolean,
+    val allowDnCnn: Boolean,
+    val allowFaceDetect: Boolean,
+    val allowFaceSr: Boolean,
+    val maxTilesForFrame: Int,
+    val tileSizeForFrame: Int,
+    val tier: SpeedExecutionTier,
+    val fastGpuMode: Boolean
+)
+
+/**
+ * Enforces strict per-minute target ceilings across all 4 Clarity modes:
+ * - 1x <= 150s (2m 30s)
+ * - 2x <= 300s (5m 00s)
+ * - 3x <= 450s (7m 30s)
+ * - 4x <= 600s (10m 00s)
+ * Dynamically tracks real EWMA ms/frame and steps down expensive ops cleanly to stay on budget.
+ */
+class SpeedBudgetGovernor(
+    private val mode: com.example.model.EnhancementMode,
+    durationMs: Long,
+    estimatedFrames: Int,
+    private val presetTileSize: Int,
+    private val presetTilesCap: Int,
+    measuredSrTileMs: Long,
+    deviceCapacityScore: Int
+) {
+    val maxBudgetMs: Long
+    val pacedBudgetMs: Long
+    val targetMsPerFrame: Double
+    private var currentTier: SpeedExecutionTier
+    private var aiKeyframeInterval: Int
+    private var emaFrameMs: Double = 0.0
+
+    init {
+        val maxPerMin = maxBudgetMsPerMinute(mode)
+        val scaleFactor = (durationMs.coerceAtLeast(1_000L).toDouble() / 60_000.0)
+        // Allow at least 12s overhead budget for very short clips (< 5s), scale linearly for longer videos
+        maxBudgetMs = max(12_000L, (maxPerMin * scaleFactor).roundToInt().toLong())
+        pacedBudgetMs = max(10_000L, (maxBudgetMs * 0.88).roundToInt().toLong())
+        targetMsPerFrame = pacedBudgetMs.toDouble() / estimatedFrames.coerceAtLeast(1).toDouble()
+
+        val estSingleTileMs = measuredSrTileMs.coerceIn(8L, 2_500L)
+        val fastGpuOverheadMs = if (deviceCapacityScore >= 60) 12.0 else 22.0
+
+        when {
+            // Fast GPU/NPU fits full multi-tile neural SR cleanly on every frame
+            estSingleTileMs * presetTilesCap + fastGpuOverheadMs <= targetMsPerFrame -> {
+                currentTier = SpeedExecutionTier.FULL_NEURAL_PER_FRAME
+                aiKeyframeInterval = 1
+            }
+            // Fits 1 compact neural tile on every frame
+            estSingleTileMs + fastGpuOverheadMs <= targetMsPerFrame -> {
+                currentTier = SpeedExecutionTier.SINGLE_TILE_NEURAL
+                aiKeyframeInterval = 1
+            }
+            // Mid-speed NPU/CPU: run neural SR every K frames (K = 2..6), GLES/SIMD on frames between
+            estSingleTileMs <= targetMsPerFrame * 5.5 -> {
+                currentTier = SpeedExecutionTier.KEYFRAME_NEURAL_HYBRID
+                val k = ceil((estSingleTileMs - fastGpuOverheadMs) / (targetMsPerFrame - fastGpuOverheadMs).coerceAtLeast(6.0))
+                    .toInt()
+                    .coerceIn(2, 6)
+                aiKeyframeInterval = k
+            }
+            // Slow device CPU fallback: use GLES 3.1 compute shader / SIMD fast pass on all frames
+            else -> {
+                currentTier = SpeedExecutionTier.GPU_SHADER_FAST_PASS
+                aiKeyframeInterval = 9999
+            }
+        }
+    }
+
+    val activeTier: SpeedExecutionTier get() = currentTier
+    val currentKeyframeInterval: Int get() = aiKeyframeInterval
+
+    fun decisionForFrame(frameIndex: Int, isSceneCut: Boolean, forceLightweight: Boolean): FrameSpeedDecision {
+        if (forceLightweight || currentTier == SpeedExecutionTier.GPU_SHADER_FAST_PASS) {
+            return FrameSpeedDecision(
+                runNeuralSrNow = false,
+                allowDnCnn = false,
+                allowFaceDetect = false,
+                allowFaceSr = false,
+                maxTilesForFrame = 0,
+                tileSizeForFrame = presetTileSize,
+                tier = SpeedExecutionTier.GPU_SHADER_FAST_PASS,
+                fastGpuMode = true
+            )
+        }
+
+        val isHighDetailMode = mode == com.example.model.EnhancementMode.CLARITY_3X ||
+            mode == com.example.model.EnhancementMode.CLARITY_4X
+
+        return when (currentTier) {
+            SpeedExecutionTier.FULL_NEURAL_PER_FRAME -> FrameSpeedDecision(
+                runNeuralSrNow = true,
+                allowDnCnn = isHighDetailMode && (frameIndex % 4 == 0 || isSceneCut) && targetMsPerFrame >= 160.0,
+                allowFaceDetect = isHighDetailMode && targetMsPerFrame >= 150.0,
+                allowFaceSr = mode == com.example.model.EnhancementMode.CLARITY_4X && targetMsPerFrame >= 220.0,
+                maxTilesForFrame = presetTilesCap.coerceIn(1, 4),
+                tileSizeForFrame = presetTileSize,
+                tier = currentTier,
+                fastGpuMode = false
+            )
+            SpeedExecutionTier.SINGLE_TILE_NEURAL -> FrameSpeedDecision(
+                runNeuralSrNow = true,
+                allowDnCnn = false,
+                allowFaceDetect = false,
+                allowFaceSr = false,
+                maxTilesForFrame = 1,
+                tileSizeForFrame = presetTileSize.coerceAtMost(192),
+                tier = currentTier,
+                fastGpuMode = false
+            )
+            SpeedExecutionTier.KEYFRAME_NEURAL_HYBRID -> {
+                val interval = aiKeyframeInterval.coerceIn(2, 6)
+                val runNow = (frameIndex % interval == 0) || isSceneCut
+                FrameSpeedDecision(
+                    runNeuralSrNow = runNow,
+                    allowDnCnn = false,
+                    allowFaceDetect = false,
+                    allowFaceSr = false,
+                    maxTilesForFrame = 1,
+                    tileSizeForFrame = presetTileSize.coerceAtMost(192),
+                    tier = currentTier,
+                    fastGpuMode = !runNow
+                )
+            }
+            SpeedExecutionTier.GPU_SHADER_FAST_PASS -> FrameSpeedDecision(
+                runNeuralSrNow = false,
+                allowDnCnn = false,
+                allowFaceDetect = false,
+                allowFaceSr = false,
+                maxTilesForFrame = 0,
+                tileSizeForFrame = presetTileSize,
+                tier = currentTier,
+                fastGpuMode = true
+            )
+        }
+    }
+
+    /**
+     * Updates EMA speed and dynamically tightens cadence if remaining budget/frame shrinks below current speed.
+     */
+    fun onFrameCompleted(elapsedJobMs: Long, processedFrames: Int, totalFrames: Int, lastFrameMs: Long) {
+        val sample = lastFrameMs.coerceAtLeast(1L).toDouble()
+        emaFrameMs = if (emaFrameMs <= 0.0) sample else (emaFrameMs * 0.80 + sample * 0.20)
+        if (processedFrames < 4) return
+
+        val remainingFrames = (totalFrames - processedFrames).coerceAtLeast(1)
+        val remainingBudgetMs = (pacedBudgetMs - elapsedJobMs).coerceAtLeast(0L).toDouble()
+        val allowedPerRemainingFrame = remainingBudgetMs / remainingFrames.toDouble()
+
+        if (emaFrameMs > allowedPerRemainingFrame * 1.08) {
+            when (currentTier) {
+                SpeedExecutionTier.FULL_NEURAL_PER_FRAME -> {
+                    currentTier = SpeedExecutionTier.SINGLE_TILE_NEURAL
+                }
+                SpeedExecutionTier.SINGLE_TILE_NEURAL -> {
+                    currentTier = SpeedExecutionTier.KEYFRAME_NEURAL_HYBRID
+                    aiKeyframeInterval = 3
+                }
+                SpeedExecutionTier.KEYFRAME_NEURAL_HYBRID -> {
+                    if (aiKeyframeInterval < 6) {
+                        aiKeyframeInterval += 2
+                    } else {
+                        currentTier = SpeedExecutionTier.GPU_SHADER_FAST_PASS
+                    }
+                }
+                SpeedExecutionTier.GPU_SHADER_FAST_PASS -> Unit
+            }
+        }
+    }
+
+    companion object {
+        fun maxBudgetMsPerMinute(mode: com.example.model.EnhancementMode): Long = when (mode) {
+            com.example.model.EnhancementMode.CLARITY_1X -> 150_000L // 2m 30s
+            com.example.model.EnhancementMode.CLARITY_2X -> 300_000L // 5m 00s
+            com.example.model.EnhancementMode.CLARITY_3X -> 450_000L // 7m 30s
+            com.example.model.EnhancementMode.CLARITY_4X -> 600_000L // 10m 00s
+        }
+    }
 }
 
 /**
- * Safeguard policy that prioritizes real ONNX AI execution (stepping down hardware fallback chains
- * cleanly before ever considering non-neural emergency recovery on multi-second tile hangs).
+ * Speed-first safeguard policy: protects the strict 150s-600s/min deadlines so heavy CPU stalls
+ * transition rapidly into hardware GPU/SIMD acceleration instead of multi-hour runs.
  */
 object AiSpeedPolicy {
-    const val MAX_ACCEPTABLE_AI_FRAME_MS = 12_000L
-    const val MAX_ACCEPTABLE_SINGLE_TILE_MS_HEAVY = 3_000L
+    const val MAX_ACCEPTABLE_AI_FRAME_MS = 350L
+    const val MAX_ACCEPTABLE_SINGLE_TILE_MS_HEAVY = 300L
 
     fun shouldEngageLightweightFallback(
         measuredTileMs: Long,
         tilesPerFrame: Int,
-        estimatedFrameCount: Int
+        estimatedFrameCount: Int,
+        modeBudgetFrameMs: Long = MAX_ACCEPTABLE_AI_FRAME_MS
     ): Boolean {
         if (tilesPerFrame <= 0 || measuredTileMs <= 0L) return false
         if (measuredTileMs > MAX_ACCEPTABLE_SINGLE_TILE_MS_HEAVY) return true
         val projectedPerFrameMs = measuredTileMs * tilesPerFrame.toLong()
-        return estimatedFrameCount >= 180 && projectedPerFrameMs > MAX_ACCEPTABLE_AI_FRAME_MS
+        val effectiveLimit = modeBudgetFrameMs.coerceIn(80L, MAX_ACCEPTABLE_AI_FRAME_MS)
+        return estimatedFrameCount >= 60 && projectedPerFrameMs > effectiveLimit
     }
 }

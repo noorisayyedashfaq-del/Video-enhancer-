@@ -35,6 +35,7 @@ import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.max
 import kotlin.math.roundToInt
+import kotlin.math.roundToLong
 
 class VideoMediaPipeline(
     private val context: Context,
@@ -188,7 +189,7 @@ class VideoMediaPipeline(
                     videoFile = inputCopy,
                     metadata = metadata,
                     tempDir = workDir,
-                    timeoutMs = 10_000L,
+                    timeoutMs = 6_000L,
                     logger = logger
                 )
                 logger.analysisMs = analysisOutcome.durationMs
@@ -251,8 +252,29 @@ class VideoMediaPipeline(
                     )
                 )
 
+                val srLatencyMs = onnxEngine.adaptiveProfile
+                    ?.plans
+                    ?.get(com.example.model.ModelKind.REAL_ESRGAN)
+                    ?.measuredLatencyMs
+                    ?: 90L
                 val presetTileSize = outDims.aiTileSize
-                val channelCap = if (capabilities.availableRamMb > 1800L) 3 else 2
+                val budgetGovernor = SpeedBudgetGovernor(
+                    mode = mode,
+                    durationMs = metadata.durationMs,
+                    estimatedFrames = metadata.estimatedFrameCount,
+                    presetTileSize = presetTileSize,
+                    presetTilesCap = outDims.tilesPerFrame,
+                    measuredSrTileMs = srLatencyMs,
+                    deviceCapacityScore = capabilities.processingCapacityScore
+                )
+                val modeBudgetFrameMs = budgetGovernor.targetMsPerFrame.roundToLong().coerceAtLeast(15L)
+                logger.info(
+                    "SpeedBudgetGovernor: mode=${mode.label} • max=${budgetGovernor.maxBudgetMs}ms • " +
+                        "target=${String.format(Locale.US, "%.1f", budgetGovernor.targetMsPerFrame)}ms/f • " +
+                        "tier=${budgetGovernor.activeTier.label} (k=${budgetGovernor.currentKeyframeInterval})"
+                )
+
+                val channelCap = if (capabilities.availableRamMb > 1400L) 4 else 3
                 val frameChannel = Channel<DecodedFrame>(capacity = channelCap)
 
                 var totalFacesEnhanced = 0
@@ -338,6 +360,7 @@ class VideoMediaPipeline(
                     // Stage 2 & 3 Overlapped Consumer: Frame Enhance (bitmap[i%2]) -> Async HW Encode(bitmap[(i-1)%2])
                     val enhanceLoopStartMs = System.currentTimeMillis()
                     var lastThermalCheckMs = 0L
+                    var lastProgressEmitMs = 0L
                     var currentThermalState = capabilities.thermalState
                     var encodeSlotIndex = 0
 
@@ -352,20 +375,20 @@ class VideoMediaPipeline(
                             val frameIndex = item.index
                             val dynamicTotal = max(expectedTotalFrames, max(decodedCountAtomic.get(), frameIndex + 1))
 
-                            // Periodic thermal watchdog + adaptive backend step-down if critically hot
+                            // Periodic thermal watchdog + adaptive backend step-down only under severe heat
                             val now = System.currentTimeMillis()
-                            if (now - lastThermalCheckMs >= 800L || frameIndex == 0) {
+                            if (now - lastThermalCheckMs >= 1_200L || frameIndex == 0) {
                                 val thermalPair = capabilityDetector.readThermalInfo()
                                 currentThermalState = thermalPair.first
                                 lastThermalCheckMs = now
                                 onnxEngine.handleThermalPressure(currentThermalState, logger)
 
                                 val freeRamMb = capabilityDetector.currentAvailableRamMb()
-                                if (freeRamMb < 220L) {
+                                if (freeRamMb < 200L) {
                                     System.gc()
-                                    delay(30L)
+                                    delay(20L)
                                     val postGcRam = capabilityDetector.currentAvailableRamMb()
-                                    if (postGcRam < 180L) {
+                                    if (postGcRam < 160L) {
                                         if (item.fromDecoderPool) activeFastDecoder?.recycleMat(item.bgrMat) else item.bgrMat?.release()
                                         item.diskFile?.delete()
                                         throw IllegalStateException("Low device memory (${postGcRam}MB free) during ${mode.label} enhancement.")
@@ -373,10 +396,9 @@ class VideoMediaPipeline(
                                 }
                             }
 
-                            if (currentThermalState == ThermalState.WARM) {
-                                delay(capabilities.throttleDelayMsOnWarm)
-                            } else if (currentThermalState >= ThermalState.THROTTLING) {
-                                delay(capabilities.throttleDelayMsOnHot)
+                            // Never waste job budget sleeping on WARM; brief cooldown only on THROTTLING/CRITICAL every 8 frames
+                            if (currentThermalState >= ThermalState.THROTTLING && frameIndex > 0 && frameIndex % 8 == 0) {
+                                delay(if (currentThermalState == ThermalState.CRITICAL) 24L else 12L)
                             }
 
                             val bgr = item.bgrMat ?: item.diskFile?.let { f -> Imgcodecs.imread(f.absolutePath) } ?: Mat()
@@ -397,21 +419,11 @@ class VideoMediaPipeline(
                             val baseFrameProgress = 0.20f + (frameIndex.toFloat() / dynamicTotal.toFloat()) * 0.70f
                             val frameSlice = 0.70f / dynamicTotal.toFloat()
 
-                            if (frameIndex == 0 || frameIndex % 3 == 0) {
-                                onProgress(
-                                    ProcessingProgress(
-                                        stage = ProcessingStage.ENHANCING,
-                                        processedFrames = frameIndex,
-                                        totalFrames = dynamicTotal,
-                                        overallProgress = baseFrameProgress.coerceIn(0.20f, 0.89f),
-                                        statusDetail = "Enhancing frame ${frameIndex + 1}/$dynamicTotal",
-                                        thermalState = currentThermalState,
-                                        activeAcceleration = activeAccelLabel,
-                                        memoryUsageMb = logger.sampleHeapUsedMb(),
-                                        speedFallbackActive = lightweightFallbackActive
-                                    )
-                                )
-                            }
+                            val speedDecision = budgetGovernor.decisionForFrame(
+                                frameIndex = frameIndex,
+                                isSceneCut = false,
+                                forceLightweight = lightweightFallbackActive
+                            )
 
                             val frameProcStartMs = System.currentTimeMillis()
                             try {
@@ -428,30 +440,36 @@ class VideoMediaPipeline(
                                     logger = logger,
                                     isCancelled = { cancelled.get() },
                                     onUpscaleTileProgress = { tileDone, totalTiles, usedTile ->
-                                        val frac = tileDone.toFloat() / totalTiles.coerceAtLeast(1).toFloat()
-                                        val tileOverall = baseFrameProgress + frac * frameSlice
-                                        onProgress(
-                                            ProcessingProgress(
-                                                stage = ProcessingStage.ENHANCING,
-                                                processedFrames = frameIndex,
-                                                totalFrames = dynamicTotal,
-                                                overallProgress = tileOverall.coerceIn(0.20f, 0.90f),
-                                                statusDetail = "${mode.label} • Frame ${frameIndex + 1}/$dynamicTotal (${outDims.label})",
-                                                thermalState = currentThermalState,
-                                                activeAcceleration = activeAccelLabel,
-                                                memoryUsageMb = logger.sampleHeapUsedMb(),
-                                                tileProgressLabel = "Tile $tileDone/$totalTiles (${usedTile}px)",
-                                                speedFallbackActive = lightweightFallbackActive
+                                        val nowTileMs = System.currentTimeMillis()
+                                        if (nowTileMs - lastProgressEmitMs >= 250L) {
+                                            lastProgressEmitMs = nowTileMs
+                                            val frac = tileDone.toFloat() / totalTiles.coerceAtLeast(1).toFloat()
+                                            val tileOverall = baseFrameProgress + frac * frameSlice
+                                            onProgress(
+                                                ProcessingProgress(
+                                                    stage = ProcessingStage.ENHANCING,
+                                                    processedFrames = frameIndex,
+                                                    totalFrames = dynamicTotal,
+                                                    overallProgress = tileOverall.coerceIn(0.20f, 0.90f),
+                                                    statusDetail = "${mode.label} • Frame ${frameIndex + 1}/$dynamicTotal (${outDims.label})",
+                                                    thermalState = currentThermalState,
+                                                    activeAcceleration = activeAccelLabel,
+                                                    memoryUsageMb = logger.sampleHeapUsedMb(),
+                                                    tileProgressLabel = "Tile $tileDone/$totalTiles (${usedTile}px)",
+                                                    speedFallbackActive = lightweightFallbackActive
+                                                )
                                             )
-                                        )
-                                    }
+                                        }
+                                    },
+                                    speedDecision = speedDecision,
+                                    modeBudgetFrameMs = modeBudgetFrameMs
                                 )
                                 totalFacesEnhanced += frameResult.facesEnhanced
                                 if (frameResult.usedAiDenoise) usedAiDenoiseAny = true
                                 if (frameResult.usedDuplicateFrameReuse) duplicateFramesReused++
                                 if (frameResult.dncnnInferenceMs > 0L) logger.dncnnInferenceMs.addAndGet(frameResult.dncnnInferenceMs)
                                 if (frameResult.faceAiMs > 0L) logger.faceAiMs.addAndGet(frameResult.faceAiMs)
-                                if (frameResult.lightweightFallbackTriggered && !lightweightFallbackActive) {
+                                if (frameResult.lightweightFallbackTriggered && !lightweightFallbackActive && speedDecision.runNeuralSrNow) {
                                     lightweightFallbackActive = true
                                     logger.speedFallbackEngaged = true
                                     logger.speedFallbackReason = frameResult.fallbackReason
@@ -482,42 +500,53 @@ class VideoMediaPipeline(
                                     bgr.release()
                                 }
                                 item.diskFile?.delete()
-                                logger.enhancementMs.addAndGet(System.currentTimeMillis() - frameProcStartMs)
+                                val frameElapsedMs = (System.currentTimeMillis() - frameProcStartMs).coerceAtLeast(1L)
+                                logger.enhancementMs.addAndGet(frameElapsedMs)
+                                budgetGovernor.onFrameCompleted(
+                                    elapsedJobMs = System.currentTimeMillis() - startWallMs,
+                                    processedFrames = processedCount + 1,
+                                    totalFrames = dynamicTotal,
+                                    lastFrameMs = frameElapsedMs
+                                )
                             }
 
                             processedCount++
-                            val elapsedLoopMs = (System.currentTimeMillis() - enhanceLoopStartMs).coerceAtLeast(1L)
-                            val msPerFrame = elapsedLoopMs.toDouble() / processedCount.toDouble()
-                            val fpsSpeed = 1000.0 / msPerFrame.coerceAtLeast(1.0)
-                            val remainingSec = (((dynamicTotal - processedCount).coerceAtLeast(0) * msPerFrame) / 1000.0)
-                                .roundToInt()
-                                .toLong()
-                            val doneProgress = 0.20f + (processedCount.toFloat() / dynamicTotal.toFloat()) * 0.70f
+                            val nowEmitMs = System.currentTimeMillis()
+                            if (nowEmitMs - lastProgressEmitMs >= 120L || processedCount == 1 || processedCount >= dynamicTotal) {
+                                lastProgressEmitMs = nowEmitMs
+                                val elapsedLoopMs = (nowEmitMs - enhanceLoopStartMs).coerceAtLeast(1L)
+                                val msPerFrame = elapsedLoopMs.toDouble() / processedCount.toDouble()
+                                val fpsSpeed = 1000.0 / msPerFrame.coerceAtLeast(1.0)
+                                val remainingSec = (((dynamicTotal - processedCount).coerceAtLeast(0) * msPerFrame) / 1000.0)
+                                    .roundToInt()
+                                    .toLong()
+                                val doneProgress = 0.20f + (processedCount.toFloat() / dynamicTotal.toFloat()) * 0.70f
 
-                            onProgress(
-                                ProcessingProgress(
-                                    stage = ProcessingStage.ENHANCING,
-                                    processedFrames = processedCount,
-                                    totalFrames = dynamicTotal,
-                                    overallProgress = doneProgress.coerceIn(0.20f, 0.90f),
-                                    etaSeconds = remainingSec,
-                                    statusDetail = buildString {
-                                        append("Frame $processedCount / $dynamicTotal • ${outDims.label}")
-                                        if (recoveredFrames > 0) {
-                                            append(" • $recoveredFrames recovered")
-                                        }
-                                    },
-                                    thermalState = currentThermalState,
-                                    activeAcceleration = activeAccelLabel,
-                                    processingSpeedLabel = if (fpsSpeed >= 1.0) {
-                                        String.format(Locale.US, "%.1f fps", fpsSpeed)
-                                    } else {
-                                        "${msPerFrame.roundToInt()} ms/f"
-                                    },
-                                    memoryUsageMb = logger.sampleHeapUsedMb(),
-                                    speedFallbackActive = lightweightFallbackActive
+                                onProgress(
+                                    ProcessingProgress(
+                                        stage = ProcessingStage.ENHANCING,
+                                        processedFrames = processedCount,
+                                        totalFrames = dynamicTotal,
+                                        overallProgress = doneProgress.coerceIn(0.20f, 0.90f),
+                                        etaSeconds = remainingSec,
+                                        statusDetail = buildString {
+                                            append("Frame $processedCount / $dynamicTotal • ${outDims.label} • ${budgetGovernor.activeTier.label}")
+                                            if (recoveredFrames > 0) {
+                                                append(" • $recoveredFrames recovered")
+                                            }
+                                        },
+                                        thermalState = currentThermalState,
+                                        activeAcceleration = activeAccelLabel,
+                                        processingSpeedLabel = if (fpsSpeed >= 1.0) {
+                                            String.format(Locale.US, "%.1f fps", fpsSpeed)
+                                        } else {
+                                            "${msPerFrame.roundToInt()} ms/f"
+                                        },
+                                        memoryUsageMb = logger.sampleHeapUsedMb(),
+                                        speedFallbackActive = lightweightFallbackActive || budgetGovernor.activeTier == SpeedExecutionTier.GPU_SHADER_FAST_PASS
+                                    )
                                 )
-                            )
+                            }
                         }
                     } finally {
                         while (true) {
@@ -601,10 +630,10 @@ class VideoMediaPipeline(
                 )
 
                 logger.info(
-                    "Job completed in ${totalElapsed}ms • frames=$processedCount • dupReuse=$duplicateFramesReused • " +
-                        "staticTileReuse=${diagnostics.staticTilesReused} • fallbacks=${diagnostics.runtimeFallbacksCount} • " +
-                        "scale=$scaleLabel (${outDims.label}) • sr=${diagnostics.aiInferenceMs}ms • " +
-                        "encode=${diagnostics.encodingMs}ms • provider=${diagnostics.executionProvider}"
+                    "Job completed in ${totalElapsed}ms (tier=${budgetGovernor.activeTier.label}, budget=${budgetGovernor.maxBudgetMs}ms) • " +
+                        "frames=$processedCount • dupReuse=$duplicateFramesReused • staticTileReuse=${diagnostics.staticTilesReused} • " +
+                        "fallbacks=${diagnostics.runtimeFallbacksCount} • scale=$scaleLabel (${outDims.label}) • " +
+                        "sr=${diagnostics.aiInferenceMs}ms • encode=${diagnostics.encodingMs}ms • provider=${diagnostics.executionProvider}"
                 )
 
                 onProgress(

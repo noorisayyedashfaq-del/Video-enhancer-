@@ -9,7 +9,12 @@ import android.content.pm.ServiceInfo
 import androidx.core.app.NotificationCompat
 import androidx.test.core.app.ApplicationProvider
 import com.example.engine.AiSpeedPolicy
+import com.example.engine.AiTilingMath
 import com.example.engine.DeviceCapabilityDetector
+import com.example.engine.FastYuvCopyMath
+import com.example.engine.SpeedBudgetGovernor
+import com.example.engine.SpeedExecutionTier
+import com.example.engine.TemporalReusePolicy
 import com.example.model.EnhancementMode
 import com.example.model.ProcessingProgress
 import com.example.model.ProcessingStage
@@ -67,33 +72,114 @@ class ForegroundServiceAndSpeedTest {
     }
 
     @Test
-    fun `AiSpeedPolicy preserves real ONNX AI for normal CPU latencies and only falls back on catastrophic stalls`() {
-        // Real CPU ONNX execution (e.g., 250ms/tile x 4 tiles = 1000ms/frame) -> MUST keep real AI active!
+    fun `AiSpeedPolicy triggers hardware fast path when tile execution threatens mode time deadline`() {
+        // Fast GPU/NPU single-tile (45ms) -> stays on neural AI cleanly
         assertFalse(
             AiSpeedPolicy.shouldEngageLightweightFallback(
-                measuredTileMs = 250L,
-                tilesPerFrame = 4,
-                estimatedFrameCount = 150
+                measuredTileMs = 45L,
+                tilesPerFrame = 2,
+                estimatedFrameCount = 1800,
+                modeBudgetFrameMs = 150L
             )
         )
 
-        // Normal 12-tile Real-ESRGAN CPU execution (220ms/tile) -> MUST stay on real ONNX AI
-        assertFalse(
-            AiSpeedPolicy.shouldEngageLightweightFallback(
-                measuredTileMs = 220L,
-                tilesPerFrame = 12,
-                estimatedFrameCount = 120
-            )
-        )
-
-        // Catastrophic hang > 3000ms per single tile -> emergency fallback protects device
+        // Heavy multi-tile exceeding mode frame deadline (120ms x 4 = 480ms > 300ms) -> triggers fallback
         assertTrue(
             AiSpeedPolicy.shouldEngageLightweightFallback(
-                measuredTileMs = 3500L,
+                measuredTileMs = 120L,
                 tilesPerFrame = 4,
-                estimatedFrameCount = 120
+                estimatedFrameCount = 1800,
+                modeBudgetFrameMs = 300L
             )
         )
+
+        // Slow CPU tile (> 300ms single tile) -> triggers immediate GPU shader / SIMD fallback
+        assertTrue(
+            AiSpeedPolicy.shouldEngageLightweightFallback(
+                measuredTileMs = 340L,
+                tilesPerFrame = 1,
+                estimatedFrameCount = 1800,
+                modeBudgetFrameMs = 300L
+            )
+        )
+    }
+
+    @Test
+    fun `SpeedBudgetGovernor enforces strict 1-minute time ceilings across flagship GPU mid NPU slow CPU and thermal pressure`() {
+        val frames1Min = 1800 // 60s @ 30fps
+
+        // Verify strict 1-minute budgets per mode
+        assertEquals(150_000L, SpeedBudgetGovernor.maxBudgetMsPerMinute(EnhancementMode.CLARITY_1X))
+        assertEquals(300_000L, SpeedBudgetGovernor.maxBudgetMsPerMinute(EnhancementMode.CLARITY_2X))
+        assertEquals(450_000L, SpeedBudgetGovernor.maxBudgetMsPerMinute(EnhancementMode.CLARITY_3X))
+        assertEquals(600_000L, SpeedBudgetGovernor.maxBudgetMsPerMinute(EnhancementMode.CLARITY_4X))
+
+        // 1) Flagship GPU (18ms/tile): fits FULL_NEURAL_PER_FRAME within strict budgets
+        val flagship1x = SpeedBudgetGovernor(EnhancementMode.CLARITY_1X, 60_000L, frames1Min, 192, 1, 18L, 90)
+        val flagship4x = SpeedBudgetGovernor(EnhancementMode.CLARITY_4X, 60_000L, frames1Min, 256, 4, 18L, 90)
+        assertEquals(SpeedExecutionTier.FULL_NEURAL_PER_FRAME, flagship1x.activeTier)
+        assertEquals(SpeedExecutionTier.FULL_NEURAL_PER_FRAME, flagship4x.activeTier)
+        assertTrue(flagship1x.decisionForFrame(0, isSceneCut = true, forceLightweight = false).runNeuralSrNow)
+
+        // 2) Mid-tier NPU (145ms/tile): uses SINGLE_TILE_NEURAL for 2x/4x and KEYFRAME_NEURAL_HYBRID for tight 1x (150s)
+        val mid1x = SpeedBudgetGovernor(EnhancementMode.CLARITY_1X, 60_000L, frames1Min, 192, 1, 145L, 65)
+        val mid2x = SpeedBudgetGovernor(EnhancementMode.CLARITY_2X, 60_000L, frames1Min, 192, 2, 120L, 65)
+        assertEquals(SpeedExecutionTier.KEYFRAME_NEURAL_HYBRID, mid1x.activeTier)
+        assertTrue(mid1x.currentKeyframeInterval in 2..6)
+        assertEquals(SpeedExecutionTier.SINGLE_TILE_NEURAL, mid2x.activeTier)
+
+        // 3) Slow CPU device (450ms/tile) on 1x/2x: shifts to GPU_SHADER_FAST_PASS immediately so 1m never takes hours
+        val slow1x = SpeedBudgetGovernor(EnhancementMode.CLARITY_1X, 60_000L, frames1Min, 192, 1, 450L, 35)
+        assertEquals(SpeedExecutionTier.GPU_SHADER_FAST_PASS, slow1x.activeTier)
+        assertTrue(slow1x.decisionForFrame(0, isSceneCut = false, forceLightweight = false).fastGpuMode)
+
+        // 4) Dynamic mid-job thermal throttling simulation on 4x: starts FULL_NEURAL, sees slow frames, steps down cleanly
+        val dynamic4x = SpeedBudgetGovernor(EnhancementMode.CLARITY_4X, 60_000L, frames1Min, 256, 4, 40L, 85)
+        assertEquals(SpeedExecutionTier.FULL_NEURAL_PER_FRAME, dynamic4x.activeTier)
+        for (i in 1..20) {
+            dynamic4x.onFrameCompleted(elapsedJobMs = i * 650L, processedFrames = i, totalFrames = frames1Min, lastFrameMs = 650L)
+        }
+        assertTrue(
+            "Governor must step down from FULL_NEURAL when EMA exceeds remaining per-frame budget",
+            dynamic4x.activeTier != SpeedExecutionTier.FULL_NEURAL_PER_FRAME
+        )
+    }
+
+    @Test
+    fun `computeNeuralWorkingSize prevents 4x input pixel bloat and guarantees 1 to 4 tile cap across 720p and 1080p`() {
+        val work1x = AiTilingMath.computeNeuralWorkingSize(1280, 720, 1280, 720, tileSize = 192, maxTilesCap = 1)
+        val grid1x = AiTilingMath.planUpscaleTileGrid(work1x.first, work1x.second, 1280, 720, 192, maxTilesCap = 1)
+        assertEquals(1, grid1x.totalTiles)
+        assertTrue(work1x.first <= 192 && work1x.second <= 192)
+
+        val work4x = AiTilingMath.computeNeuralWorkingSize(1920, 1080, 3840, 2160, tileSize = 256, maxTilesCap = 4)
+        val grid4x = AiTilingMath.planUpscaleTileGrid(work4x.first, work4x.second, 3840, 2160, 256, maxTilesCap = 4)
+        assertTrue("Expected <= 4 tiles for 4x mode, got ${grid4x.totalTiles}", grid4x.totalTiles <= 4)
+        assertTrue("Neural working width should stay well under raw 1920px (${work4x.first})", work4x.first <= 512)
+    }
+
+    @Test
+    fun `jvm 1800-frame governor and motion math microbenchmark runs under strict overhead bounds`() {
+        val governor = SpeedBudgetGovernor(EnhancementMode.CLARITY_4X, 60_000L, 1800, 256, 4, 32L, 85)
+        val thumbA = ByteArray(48 * 48) { (it and 0xFF).toByte() }
+        val thumbB = ByteArray(48 * 48) { ((it + 2) and 0xFF).toByte() }
+        val dummyUv = java.nio.ByteBuffer.allocate(320 * 180)
+        val uvOut = ByteArray(320 * 180)
+
+        val t0 = System.nanoTime()
+        var neuralCount = 0
+        for (i in 0 until 1800) {
+            val mad = TemporalReusePolicy.computeMeanAbsDiff(thumbA, thumbB)
+            val dec = governor.decisionForFrame(i, isSceneCut = mad >= TemporalReusePolicy.SCENE_CUT_MAD_THRESHOLD, forceLightweight = false)
+            if (dec.runNeuralSrNow) neuralCount++
+            if (i % 10 == 0) {
+                FastYuvCopyMath.copySemiPlanarUvPlane(dummyUv, 0, 0, 160, 90, 320, uvOut, 0)
+            }
+            governor.onFrameCompleted(elapsedJobMs = i * 45L, processedFrames = i + 1, totalFrames = 1800, lastFrameMs = 45L)
+        }
+        val elapsedMs = (System.nanoTime() - t0) / 1_000_000L
+        assertTrue(neuralCount > 0)
+        assertTrue("1800-frame control & motion overhead took ${elapsedMs}ms (must be < 2000ms)", elapsedMs < 2_000L)
     }
 
     @Test

@@ -57,7 +57,7 @@ class SmartAutoAdjustmentEngine {
         videoFile: File,
         metadata: VideoMetadata,
         tempDir: File,
-        timeoutMs: Long = 10_000L,
+        timeoutMs: Long = 6_000L,
         logger: EngineDiagnosticsLogger? = null
     ): AnalysisOutcome = withContext(Dispatchers.IO) {
         val startMs = System.currentTimeMillis()
@@ -68,7 +68,7 @@ class SmartAutoAdjustmentEngine {
             return@withContext AnalysisOutcome(
                 analysis = cached,
                 reusedFromCache = true,
-                sampledFrames = 5,
+                sampledFrames = 3,
                 durationMs = elapsed
             )
         }
@@ -77,12 +77,12 @@ class SmartAutoAdjustmentEngine {
             var warningMsg: String? = null
             val metricsList = mutableListOf<VideoQualityAnalysis>()
 
-            // Primary fast sampler: MediaMetadataRetriever sync-frame decode at scaled resolution
+            // Fast sampler: 3 evenly-spaced sync frames decoded directly at 320px
             val retriever = MediaMetadataRetriever()
             try {
                 retriever.setDataSource(videoFile.absolutePath)
                 val durUs = (metadata.durationMs.coerceAtLeast(300L)) * 1000L
-                val fractions = listOf(0.10, 0.30, 0.50, 0.70, 0.90)
+                val fractions = listOf(0.15, 0.50, 0.85)
                 for (frac in fractions) {
                     val timeUs = (durUs * frac).toLong().coerceAtLeast(0L)
                     val bmp: Bitmap? = try {
@@ -90,8 +90,8 @@ class SmartAutoAdjustmentEngine {
                             retriever.getScaledFrameAtTime(
                                 timeUs,
                                 MediaMetadataRetriever.OPTION_CLOSEST_SYNC,
-                                480,
-                                480
+                                320,
+                                320
                             )
                         } else {
                             retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
@@ -227,7 +227,7 @@ class SmartAutoAdjustmentEngine {
     }
 
     private fun resizeForAnalysis(srcBgr: Mat, dstBgr: Mat) {
-        val maxAnalyticW = 480.0
+        val maxAnalyticW = 320.0
         if (srcBgr.cols() > maxAnalyticW) {
             val scale = maxAnalyticW / srcBgr.cols()
             Imgproc.resize(

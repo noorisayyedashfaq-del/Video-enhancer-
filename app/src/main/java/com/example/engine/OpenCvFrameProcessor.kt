@@ -152,12 +152,12 @@ class OpenCvFrameProcessor(
     }
 
     /**
-     * Genuine multi-stage adaptive AI enhancement pipeline per frame:
-     * 0. Near-duplicate frame gate (< 0.65 MAD, max 2 consecutive reuses)
-     * 1. Gentle temporal motion-masked grain suppression (zero spatial blur)
-     * 2. DnCNN neural luminance denoising ([1,1,256,256] ONNX) + chroma deblocking + cached CLAHE + tone LUT
-     * 3. Keyframe-scheduled Multi-Backend YuNet face detection with IoU box smoothing
-     * 4. Double-buffered Real-ESRGAN x4v3 static-tile-cached SR + Face ROI AI SR -> [outDims.width x outDims.height]
+     * Speed-first adaptive enhancement pipeline per frame:
+     * 0. Near-duplicate frame gate (ref-swapped zero-copy cache)
+     * 1. Gated temporal motion-masked denoise (full neural mode only)
+     * 2. Fast YCrCb luma mastering (single-pass DnCNN / cached tone LUT; skips slow CLAHE/median on fast modes)
+     * 3. Keyframe-scheduled YuNet face detection (when enabled by SpeedBudgetGovernor)
+     * 4. Budget-governed Real-ESRGAN x4v3 (1-4 tiles) OR zero-conversion GLES 3.1 compute shader -> RGBA Bitmap
      */
     fun processFrame(
         srcBgr: Mat,
@@ -171,11 +171,19 @@ class OpenCvFrameProcessor(
         frameIndex: Int = 0,
         logger: EngineDiagnosticsLogger? = null,
         isCancelled: () -> Boolean,
-        onUpscaleTileProgress: (done: Int, total: Int, tileSize: Int) -> Unit = { _, _, _ -> }
+        onUpscaleTileProgress: (done: Int, total: Int, tileSize: Int) -> Unit = { _, _, _ -> },
+        speedDecision: FrameSpeedDecision? = null,
+        modeBudgetFrameMs: Long = AiSpeedPolicy.MAX_ACCEPTABLE_AI_FRAME_MS
     ): FrameProcessResult {
-        var usedFallback = forceLightweightFallback
+        val fastGpuMode = forceLightweightFallback ||
+            (speedDecision?.fastGpuMode == true) ||
+            (speedDecision != null && !speedDecision.runNeuralSrNow)
+        val runHeavyCpuPreFilters = !fastGpuMode &&
+            (speedDecision == null || (speedDecision.tier == SpeedExecutionTier.FULL_NEURAL_PER_FRAME && modeBudgetFrameMs >= 160L))
+
+        var usedFallback = forceLightweightFallback || fastGpuMode
         var fallbackReason: String? = null
-        var accelLabel = onnxEngine.providerLabel
+        var accelLabel = if (fastGpuMode && onnxEngine.isGlesGpuReady) "GLES 3.1 GPU Fast" else onnxEngine.providerLabel
         var facesEnhanced = 0
         var usedAiDenoise = false
         var dncnnMs = 0L
@@ -185,8 +193,7 @@ class OpenCvFrameProcessor(
         // 0. Measure thumbnail frame MAD once for duplicate-frame check, scene-cut gating & face keyframing
         val (_, frameMad) = frameMotionProbe.computeFrameThumbnailAndMad(srcBgr)
         val cachedRgba = prevEnhancedRgbaMat
-        val canReuseWholeFrame = !forceLightweightFallback &&
-            frameIndex > 0 &&
+        val canReuseWholeFrame = frameIndex > 0 &&
             cachedRgba != null &&
             cachedRgba.cols() == outDims.width &&
             cachedRgba.rows() == outDims.height &&
@@ -201,7 +208,7 @@ class OpenCvFrameProcessor(
             Utils.matToBitmap(cachedRgba, reusableOutBitmap)
             return FrameProcessResult(
                 facesEnhanced = prevFaceBoxes.size,
-                usedAiDenoise = params.useAiDenoise && onnxEngine.isDncnnReady,
+                usedAiDenoise = params.useAiDenoise && onnxEngine.isDncnnReady && !fastGpuMode,
                 activeAccelerationLabel = accelLabel,
                 usedDuplicateFrameReuse = true
             )
@@ -215,72 +222,97 @@ class OpenCvFrameProcessor(
         var ownedAiMat: Mat? = null
 
         try {
-            // 1. Temporal Motion-Stabilized Noise Reduction (never blends across scene cuts)
-            if (!isSceneCut) {
-                applyTemporalMotionStabilizedDenoise(activeMat, params.denoiseStrength)
-            } else {
-                val prev = prevDenoisedFrame
-                if (prev == null || prev.cols() != activeMat.cols() || prev.rows() != activeMat.rows()) {
-                    prevDenoisedFrame?.release()
-                    prevDenoisedFrame = activeMat.clone()
+            // 1. Temporal Motion-Stabilized Noise Reduction (heavy modes only; avoids 6 full-frame ops in fast paths)
+            if (runHeavyCpuPreFilters && params.denoiseStrength >= 0.45f) {
+                if (!isSceneCut) {
+                    applyTemporalMotionStabilizedDenoise(activeMat, params.denoiseStrength)
                 } else {
-                    activeMat.copyTo(prev)
+                    val prev = prevDenoisedFrame
+                    if (prev == null || prev.cols() != activeMat.cols() || prev.rows() != activeMat.rows()) {
+                        prevDenoisedFrame?.release()
+                        prevDenoisedFrame = activeMat.clone()
+                    } else {
+                        activeMat.copyTo(prev)
+                    }
                 }
             }
 
-            // 2. Single Fused Luma Pass: DnCNN Neural Denoise (Adaptive GPU/NPU/CPU + tile cache) + CLAHE + Tone LUT
-            val ycrcbOutcome = applyFusedYCrCbMastering(activeMat, params, isSceneCut, logger)
+            // 2. Fused Luma Pass: skips CLAHE/median/dehaze/YCrCb overhead when in fast speed mode
+            val allowDnCnnNow = !fastGpuMode && (speedDecision?.allowDnCnn ?: true)
+            val ycrcbOutcome = applyFusedYCrCbMastering(
+                bgr = activeMat,
+                params = params,
+                isSceneCut = isSceneCut,
+                allowDnCnn = allowDnCnnNow,
+                runHeavyFilters = runHeavyCpuPreFilters,
+                logger = logger
+            )
             usedAiDenoise = ycrcbOutcome.first
             dncnnMs = ycrcbOutcome.second
 
-            // 3. Neutral Temperature / White Balance & Skin-Safe Saturation
-            if (abs(params.wbGainR - 1f) >= 0.01f || abs(params.wbGainB - 1f) >= 0.01f) {
+            // 3. White Balance & Saturation (offloaded to GLES compute shader in fast paths)
+            if (!fastGpuMode && (abs(params.wbGainR - 1f) >= 0.01f || abs(params.wbGainB - 1f) >= 0.01f)) {
                 applyWhiteBalance(activeMat, params)
             }
-            if (abs(params.saturationGain - 1f) > 0.01f) {
+            if (runHeavyCpuPreFilters && abs(params.saturationGain - 1f) > 0.015f) {
                 applySaturationBoost(activeMat, params.saturationGain, params.skinToneProtection)
             }
 
-            // 4. Keyframe-Scheduled Adaptive Face AI Detection (YuNet on fastest verified GPU/NPU/CPU backend)
-            val runFaceDetNow = TemporalReusePolicy.shouldRunFullFaceDetection(
-                frameIndex = frameIndex,
-                frameMad = frameMad,
-                hasPreviousBoxes = prevFaceBoxes.isNotEmpty()
-            )
-            val stabilizedFaces = if (runFaceDetNow) {
-                val td0 = System.currentTimeMillis()
-                val rawFaces = onnxEngine.yuNetRunner.detectFaces(activeMat, logger)
-                faceAiMs += (System.currentTimeMillis() - td0)
-                val smoothed = smoothFaceBoxes(
-                    if (isSceneCut) emptyList() else prevFaceBoxes,
-                    rawFaces,
-                    activeMat.cols(),
-                    activeMat.rows()
+            // 4. Keyframe-Scheduled Adaptive Face AI Detection (gated cleanly by SpeedBudgetGovernor)
+            val allowFaceDet = !fastGpuMode && (speedDecision?.allowFaceDetect ?: true)
+            val stabilizedFaces = if (allowFaceDet) {
+                val runFaceDetNow = TemporalReusePolicy.shouldRunFullFaceDetection(
+                    frameIndex = frameIndex,
+                    frameMad = frameMad,
+                    hasPreviousBoxes = prevFaceBoxes.isNotEmpty()
                 )
-                prevFaceBoxes = smoothed
-                smoothed
+                if (runFaceDetNow) {
+                    val td0 = System.currentTimeMillis()
+                    val rawFaces = onnxEngine.yuNetRunner.detectFaces(activeMat, logger)
+                    faceAiMs += (System.currentTimeMillis() - td0)
+                    val smoothed = smoothFaceBoxes(
+                        if (isSceneCut) emptyList() else prevFaceBoxes,
+                        rawFaces,
+                        activeMat.cols(),
+                        activeMat.rows()
+                    )
+                    prevFaceBoxes = smoothed
+                    smoothed
+                } else {
+                    prevFaceBoxes
+                }
             } else {
-                prevFaceBoxes
+                emptyList()
             }
             facesEnhanced = stabilizedFaces.size
 
-            // 5. Real-ESRGAN x4v3 Tiled Super-Resolution + Dedicated Face ROI AI Enhancement
-            if (outDims.needsAiSuperResolution && outDims.tilesPerFrame > 0 && outDims.aiTileSize > 0) {
+            // 5. Real-ESRGAN x4v3 Neural SR vs Ultra-Fast Resize + GLES 3.1 Compute Shader
+            val shouldRunNeuralSr = !fastGpuMode &&
+                outDims.needsAiSuperResolution &&
+                outDims.tilesPerFrame > 0 &&
+                outDims.aiTileSize > 0 &&
+                (speedDecision?.runNeuralSrNow ?: true)
+
+            var shaderHandledInPlace = false
+            if (shouldRunNeuralSr) {
                 val tAi0 = System.currentTimeMillis()
-                val activeTileSize = tileSizeOverride ?: outDims.aiTileSize
+                val activeTileSize = speedDecision?.tileSizeForFrame ?: tileSizeOverride ?: outDims.aiTileSize
+                val activeTilesCap = (speedDecision?.maxTilesForFrame ?: outDims.tilesPerFrame).coerceIn(1, 4)
+                val facesForSr = if (speedDecision?.allowFaceSr == false) emptyList() else stabilizedFaces
                 val outcome = onnxEngine.enhanceBgrWithPresetTiles(
                     srcBgr = activeMat,
                     outW = outDims.width,
                     outH = outDims.height,
                     tileSize = activeTileSize,
-                    targetTilesPerFrame = outDims.tilesPerFrame,
+                    targetTilesPerFrame = activeTilesCap,
                     estimatedTotalFrames = estimatedTotalFrames,
                     forceLightweightFallback = forceLightweightFallback,
                     aiStrength = params.aiStrength,
                     fallbackSharpnessBoost = params.sharpnessAmount,
-                    faces = stabilizedFaces,
+                    faces = facesForSr,
                     faceEnhanceStrength = params.faceEnhanceStrength,
                     isSceneCut = isSceneCut,
+                    modeBudgetFrameMs = modeBudgetFrameMs,
                     isCancelled = isCancelled,
                     logger = logger,
                     onTileProgress = onUpscaleTileProgress
@@ -302,22 +334,11 @@ class OpenCvFrameProcessor(
                         Size(outDims.width.toDouble(), outDims.height.toDouble()),
                         0.0,
                         0.0,
-                        Imgproc.INTER_CUBIC
+                        Imgproc.INTER_LINEAR
                     )
                     activeMat = aligned
                 }
-                if (onnxEngine.isGlesGpuReady && (params.sharpnessAmount > 0.03f || params.edgeEnhancementAmount > 0.03f)) {
-                    val sharpness = (params.sharpnessAmount + params.edgeEnhancementAmount * 0.35f).coerceIn(0.05f, 0.45f)
-                    val gpuOk = onnxEngine.gpuProcessor.enhanceBgrInPlace(
-                        bgr = activeMat,
-                        sharpness = sharpness,
-                        contrast = 1.02f,
-                        saturation = 1.0f
-                    )
-                    if (!gpuOk) {
-                        applyFastUnsharpMask(activeMat, params.sharpnessAmount, params.edgeEnhancementAmount)
-                    }
-                } else if (params.sharpnessAmount > 0.03f || params.edgeEnhancementAmount > 0.03f) {
+                if (!onnxEngine.isGlesGpuReady && (params.sharpnessAmount > 0.03f || params.edgeEnhancementAmount > 0.03f)) {
                     applyFastUnsharpMask(activeMat, params.sharpnessAmount, params.edgeEnhancementAmount)
                 }
             }
@@ -343,14 +364,34 @@ class OpenCvFrameProcessor(
                 }
             Imgproc.cvtColor(activeMat, rgbaMat, Imgproc.COLOR_BGR2RGBA)
 
-            val prevOut = prevEnhancedRgbaMat?.takeIf { it.cols() == rgbaMat.cols() && it.rows() == rgbaMat.rows() }
-                ?: Mat(rgbaMat.rows(), rgbaMat.cols(), CvType.CV_8UC4).also {
-                    prevEnhancedRgbaMat?.release()
-                    prevEnhancedRgbaMat = it
+            // Zero-conversion GPU compute pass directly on RGBA Mat
+            if (!shouldRunNeuralSr && onnxEngine.isGlesGpuReady) {
+                val sharpness = (params.sharpnessAmount + params.edgeEnhancementAmount * 0.35f).coerceIn(0.08f, 0.45f)
+                val gpuOk = onnxEngine.gpuProcessor.enhanceRgbaInPlace(
+                    rgba = rgbaMat,
+                    sharpness = sharpness,
+                    contrast = params.contrastGain.coerceIn(0.95f, 1.25f),
+                    saturation = params.saturationGain.coerceIn(0.95f, 1.22f)
+                )
+                shaderHandledInPlace = gpuOk
+                if (!gpuOk && (params.sharpnessAmount > 0.03f || params.edgeEnhancementAmount > 0.03f)) {
+                    applyFastUnsharpMask(rgbaMat, params.sharpnessAmount, params.edgeEnhancementAmount)
                 }
-            rgbaMat.copyTo(prevOut)
+            } else if (shouldRunNeuralSr && !runHeavyCpuPreFilters && onnxEngine.isGlesGpuReady && abs(params.saturationGain - 1f) > 0.02f) {
+                onnxEngine.gpuProcessor.enhanceRgbaInPlace(
+                    rgba = rgbaMat,
+                    sharpness = 0.06f,
+                    contrast = 1.0f,
+                    saturation = params.saturationGain.coerceIn(0.95f, 1.20f)
+                )
+            }
 
             Utils.matToBitmap(rgbaMat, reusableOutBitmap)
+
+            // Zero-copy buffer swap instead of cloning/copying 4K RGBA bytes every frame
+            val oldPrev = prevEnhancedRgbaMat
+            prevEnhancedRgbaMat = rgbaMat
+            reusableRgbaMat = oldPrev
         } finally {
             ownedAiMat?.release()
         }
@@ -394,8 +435,23 @@ class OpenCvFrameProcessor(
         bgr: Mat,
         params: AdaptiveAdjustmentParams,
         isSceneCut: Boolean,
+        allowDnCnn: Boolean,
+        runHeavyFilters: Boolean,
         logger: EngineDiagnosticsLogger?
     ): Pair<Boolean, Long> {
+        val needDnCnn = allowDnCnn && params.useAiDenoise && onnxEngine.isDncnnReady
+        val needToneLut = abs(params.brightnessShift) >= 0.5f ||
+            abs(params.contrastGain - 1f) >= 0.015f ||
+            abs(params.gamma - 1f) >= 0.01f ||
+            params.shadowsLift >= 0.01f ||
+            params.blacksCrush >= 0.01f ||
+            params.whitesGain >= 0.01f ||
+            params.exposureHighlightCompress >= 0.01f
+
+        if (!needDnCnn && !runHeavyFilters && !needToneLut) {
+            return false to 0L
+        }
+
         val ycrcb = ycrcbScratch ?: Mat().also { ycrcbScratch = it }
         val channels = ArrayList<Mat>(3)
         var usedDnCnn = false
@@ -405,8 +461,8 @@ class OpenCvFrameProcessor(
             Core.split(ycrcb, channels)
             val yChan = channels[0]
 
-            // Real DnCNN Neural Luminance Denoising (adaptive backend + static-tile cache)
-            if (params.useAiDenoise && onnxEngine.isDncnnReady) {
+            // Real DnCNN Neural Luminance Denoising (single-pass 256x256 when budget permits)
+            if (needDnCnn) {
                 val td0 = System.currentTimeMillis()
                 usedDnCnn = onnxEngine.denoiseLuminanceYWithDnCnn(
                     yChan = yChan,
@@ -417,34 +473,35 @@ class OpenCvFrameProcessor(
                 dncnnMs = System.currentTimeMillis() - td0
             }
 
-            // Gentle chroma-only median cleanup for color compression blocks without touching Y sharpness
-            if (params.deblockingStrength > 0.28f) {
-                Imgproc.medianBlur(channels[1], channels[1], 3)
-                Imgproc.medianBlur(channels[2], channels[2], 3)
-            }
+            if (runHeavyFilters) {
+                if (params.deblockingStrength > 0.28f) {
+                    Imgproc.medianBlur(channels[1], channels[1], 3)
+                    Imgproc.medianBlur(channels[2], channels[2], 3)
+                }
 
-            // Subtle brilliance black-point lift only when hazy
-            if (params.dehazingStrength > 0.02f) {
-                val minVal = Core.minMaxLoc(yChan).minVal
-                val blackLift = (minVal * params.dehazingStrength * 0.40).coerceIn(0.0, 8.0)
-                if (blackLift > 0.5) {
-                    val scale = 255.0 / (255.0 - blackLift)
-                    yChan.convertTo(yChan, CvType.CV_8UC1, scale, -blackLift * scale)
+                if (params.dehazingStrength > 0.02f) {
+                    val minVal = Core.minMaxLoc(yChan).minVal
+                    val blackLift = (minVal * params.dehazingStrength * 0.40).coerceIn(0.0, 8.0)
+                    if (blackLift > 0.5) {
+                        val scale = 255.0 / (255.0 - blackLift)
+                        yChan.convertTo(yChan, CvType.CV_8UC1, scale, -blackLift * scale)
+                    }
+                }
+
+                if (params.claheClipLimit > 0.22) {
+                    val clahe = getOrCreateClahe(params.claheClipLimit)
+                    val claheOut = claheOutScratch ?: Mat().also { claheOutScratch = it }
+                    clahe.apply(yChan, claheOut)
+                    Core.addWeighted(claheOut, 0.16, yChan, 0.84, 0.0, yChan)
                 }
             }
 
-            // Restrained local clarity via cached CLAHE object
-            if (params.claheClipLimit > 0.22) {
-                val clahe = getOrCreateClahe(params.claheClipLimit)
-                val claheOut = claheOutScratch ?: Mat().also { claheOutScratch = it }
-                clahe.apply(yChan, claheOut)
-                Core.addWeighted(claheOut, 0.16, yChan, 0.84, 0.0, yChan)
+            if (needToneLut) {
+                val lut = getOrCreateToneLut(params)
+                Core.LUT(yChan, lut, yChan)
             }
 
-            val lut = getOrCreateToneLut(params)
-            Core.LUT(yChan, lut, yChan)
-
-            if (params.flickerReductionAlpha > 0.01f) {
+            if (runHeavyFilters && params.flickerReductionAlpha > 0.01f) {
                 val currentMean = Core.mean(yChan).`val`[0]
                 val prev = prevLumaMean
                 if (prev == null || isSceneCut) {
