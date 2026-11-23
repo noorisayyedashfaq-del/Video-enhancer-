@@ -32,7 +32,8 @@ data class FrameProcessResult(
     val fallbackReason: String? = null,
     val activeAccelerationLabel: String = "",
     val staticTilesReused: Int = 0,
-    val usedDuplicateFrameReuse: Boolean = false
+    val usedDuplicateFrameReuse: Boolean = false,
+    val colorEnhanced: Boolean = true
 )
 
 class OpenCvFrameProcessor(
@@ -42,6 +43,10 @@ class OpenCvFrameProcessor(
     private var openCvInitialized = false
     private var faceDetectorPath: String? = null
     private var prevFaceBoxes: List<Rect> = emptyList()
+
+    // Dedicated Color & Smoothness sub-engines
+    val colorEngine: ColorEnhancementEngine = ColorEnhancementEngine()
+    val motionEngine: MotionSmoothnessEngine = MotionSmoothnessEngine()
 
     // Duplicate-frame & scene-cut detector (48x48 thumbnail MAD)
     private val frameMotionProbe = StaticTileReuseCache()
@@ -149,6 +154,8 @@ class OpenCvFrameProcessor(
         satLutMat?.release(); satLutMat = null
         halfSatLutMat?.release(); halfSatLutMat = null
         cachedSatKey = ""
+        colorEngine.release()
+        motionEngine.release()
     }
 
     /**
@@ -221,8 +228,20 @@ class OpenCvFrameProcessor(
         var activeMat = workScratch
         var ownedAiMat: Mat? = null
 
+        val shouldRunNeuralSr = !fastGpuMode &&
+            outDims.needsAiSuperResolution &&
+            outDims.tilesPerFrame > 0 &&
+            outDims.aiTileSize > 0 &&
+            (speedDecision?.runNeuralSrNow ?: true)
+        val useSinglePassGpuColorShader = !shouldRunNeuralSr && onnxEngine.isGlesGpuReady
+
+        var shaderHandledInPlace = false
+
         try {
-            // 1. Temporal Motion-Stabilized Noise Reduction (heavy modes only; avoids 6 full-frame ops in fast paths)
+            // 1. Temporal Micro-Jitter Stabilization & Motion-Masked Denoise
+            if (params.enableSmoothness && !isSceneCut) {
+                motionEngine.stabilizeTemporalMicroJitter(activeMat, params.motionSmoothStrength, isSceneCut)
+            }
             if (runHeavyCpuPreFilters && params.denoiseStrength >= 0.45f) {
                 if (!isSceneCut) {
                     applyTemporalMotionStabilizedDenoise(activeMat, params.denoiseStrength)
@@ -237,7 +256,8 @@ class OpenCvFrameProcessor(
                 }
             }
 
-            // 2. Fused Luma Pass: skips CLAHE/median/dehaze/YCrCb overhead when in fast speed mode
+            // 2. Luminance Quality Pass (DnCNN Neural Denoise + Deblock + CLAHE + Shadows/Highlights/Contrast Tone LUT)
+            // Note: on single-pass GPU shader frames, contrast/brightness/highlights run directly inside GLSL below.
             val allowDnCnnNow = !fastGpuMode && (speedDecision?.allowDnCnn ?: true)
             val ycrcbOutcome = applyFusedYCrCbMastering(
                 bgr = activeMat,
@@ -245,17 +265,20 @@ class OpenCvFrameProcessor(
                 isSceneCut = isSceneCut,
                 allowDnCnn = allowDnCnnNow,
                 runHeavyFilters = runHeavyCpuPreFilters,
+                skipToneLutForGpuShader = useSinglePassGpuColorShader,
                 logger = logger
             )
             usedAiDenoise = ycrcbOutcome.first
             dncnnMs = ycrcbOutcome.second
 
-            // 3. White Balance & Saturation (offloaded to GLES compute shader in fast paths)
-            if (!fastGpuMode && (abs(params.wbGainR - 1f) >= 0.01f || abs(params.wbGainB - 1f) >= 0.01f)) {
-                applyWhiteBalance(activeMat, params)
-            }
-            if (runHeavyCpuPreFilters && abs(params.saturationGain - 1f) > 0.015f) {
-                applySaturationBoost(activeMat, params.saturationGain, params.skinToneProtection)
+            // 3. Color Enhancement (White Balance + Skin-Protected Vibrance + Saturation) — ALWAYS runs on every tier!
+            if (!useSinglePassGpuColorShader) {
+                // Run on smaller input canvas BEFORE SR upscaling for maximum speed!
+                colorEngine.applyFastColorEnhancementBgr(
+                    bgr = activeMat,
+                    params = params,
+                    applyToneLut = false // Tone LUT already applied in step 2
+                )
             }
 
             // 4. Keyframe-Scheduled Adaptive Face AI Detection (gated cleanly by SpeedBudgetGovernor)
@@ -286,14 +309,7 @@ class OpenCvFrameProcessor(
             }
             facesEnhanced = stabilizedFaces.size
 
-            // 5. Real-ESRGAN x4v3 Neural SR vs Ultra-Fast Resize + GLES 3.1 Compute Shader
-            val shouldRunNeuralSr = !fastGpuMode &&
-                outDims.needsAiSuperResolution &&
-                outDims.tilesPerFrame > 0 &&
-                outDims.aiTileSize > 0 &&
-                (speedDecision?.runNeuralSrNow ?: true)
-
-            var shaderHandledInPlace = false
+            // 5. Real-ESRGAN x4v3 Neural SR (with Frequency-Aware Detail Fusion + Deblur) vs Ultra-Fast Resize + GLES 3.1 Compute Shader
             if (shouldRunNeuralSr) {
                 val tAi0 = System.currentTimeMillis()
                 val activeTileSize = speedDecision?.tileSizeForFrame ?: tileSizeOverride ?: outDims.aiTileSize
@@ -308,6 +324,9 @@ class OpenCvFrameProcessor(
                     estimatedTotalFrames = estimatedTotalFrames,
                     forceLightweightFallback = forceLightweightFallback,
                     aiStrength = params.aiStrength,
+                    detailRecovery = params.detailRecovery,
+                    deblurStrength = params.deblurStrength,
+                    aiSharpening = params.aiSharpening,
                     fallbackSharpnessBoost = params.sharpnessAmount,
                     faces = facesForSr,
                     faceEnhanceStrength = params.faceEnhanceStrength,
@@ -334,12 +353,14 @@ class OpenCvFrameProcessor(
                         Size(outDims.width.toDouble(), outDims.height.toDouble()),
                         0.0,
                         0.0,
-                        Imgproc.INTER_LINEAR
+                        Imgproc.INTER_CUBIC
                     )
                     activeMat = aligned
                 }
-                if (!onnxEngine.isGlesGpuReady && (params.sharpnessAmount > 0.03f || params.edgeEnhancementAmount > 0.03f)) {
-                    applyFastUnsharpMask(activeMat, params.sharpnessAmount, params.edgeEnhancementAmount)
+                if (!useSinglePassGpuColorShader && (params.sharpnessAmount > 0.03f || params.deblurStrength > 0.1f)) {
+                    val totalSharp = (params.sharpnessAmount + params.edgeEnhancementAmount * 0.35f + params.deblurStrength * 0.22f)
+                        .coerceIn(0.08f, 0.48f)
+                    applyFastUnsharpMask(activeMat, totalSharp, params.edgeEnhancementAmount)
                 }
             }
 
@@ -352,7 +373,7 @@ class OpenCvFrameProcessor(
                     Size(outDims.width.toDouble(), outDims.height.toDouble()),
                     0.0,
                     0.0,
-                    Imgproc.INTER_LINEAR
+                    Imgproc.INTER_CUBIC
                 )
                 activeMat = aligned
             }
@@ -364,26 +385,28 @@ class OpenCvFrameProcessor(
                 }
             Imgproc.cvtColor(activeMat, rgbaMat, Imgproc.COLOR_BGR2RGBA)
 
-            // Zero-conversion GPU compute pass directly on RGBA Mat
-            if (!shouldRunNeuralSr && onnxEngine.isGlesGpuReady) {
-                val sharpness = (params.sharpnessAmount + params.edgeEnhancementAmount * 0.35f).coerceIn(0.08f, 0.45f)
+            // Zero-conversion GPU compute pass directly on RGBA Mat (Color + Vibrance + WB + Deblur)
+            if (useSinglePassGpuColorShader) {
+                val sharpness = (params.sharpnessAmount + params.edgeEnhancementAmount * 0.35f + params.deblurStrength * 0.25f)
+                    .coerceIn(0.12f, 0.65f)
                 val gpuOk = onnxEngine.gpuProcessor.enhanceRgbaInPlace(
                     rgba = rgbaMat,
                     sharpness = sharpness,
                     contrast = params.contrastGain.coerceIn(0.95f, 1.25f),
-                    saturation = params.saturationGain.coerceIn(0.95f, 1.22f)
+                    saturation = params.saturationGain.coerceIn(0.95f, 1.24f),
+                    vibrance = params.vibranceGain,
+                    brightnessShift = params.brightnessShift,
+                    wbR = params.wbGainR,
+                    wbB = params.wbGainB,
+                    highlightCompress = params.exposureHighlightCompress
                 )
                 shaderHandledInPlace = gpuOk
-                if (!gpuOk && (params.sharpnessAmount > 0.03f || params.edgeEnhancementAmount > 0.03f)) {
-                    applyFastUnsharpMask(rgbaMat, params.sharpnessAmount, params.edgeEnhancementAmount)
+                if (!gpuOk) {
+                    // CPU safety fallback if GLES failed mid-frame
+                    colorEngine.applyFastColorEnhancementBgr(activeMat, params, applyToneLut = true)
+                    applyFastUnsharpMask(activeMat, sharpness, params.edgeEnhancementAmount)
+                    Imgproc.cvtColor(activeMat, rgbaMat, Imgproc.COLOR_BGR2RGBA)
                 }
-            } else if (shouldRunNeuralSr && !runHeavyCpuPreFilters && onnxEngine.isGlesGpuReady && abs(params.saturationGain - 1f) > 0.02f) {
-                onnxEngine.gpuProcessor.enhanceRgbaInPlace(
-                    rgba = rgbaMat,
-                    sharpness = 0.06f,
-                    contrast = 1.0f,
-                    saturation = params.saturationGain.coerceIn(0.95f, 1.20f)
-                )
             }
 
             Utils.matToBitmap(rgbaMat, reusableOutBitmap)
@@ -405,7 +428,8 @@ class OpenCvFrameProcessor(
             fallbackReason = fallbackReason,
             activeAccelerationLabel = accelLabel,
             staticTilesReused = staticTilesReused,
-            usedDuplicateFrameReuse = false
+            usedDuplicateFrameReuse = false,
+            colorEnhanced = true
         )
     }
 
@@ -437,16 +461,19 @@ class OpenCvFrameProcessor(
         isSceneCut: Boolean,
         allowDnCnn: Boolean,
         runHeavyFilters: Boolean,
+        skipToneLutForGpuShader: Boolean,
         logger: EngineDiagnosticsLogger?
     ): Pair<Boolean, Long> {
         val needDnCnn = allowDnCnn && params.useAiDenoise && onnxEngine.isDncnnReady
-        val needToneLut = abs(params.brightnessShift) >= 0.5f ||
-            abs(params.contrastGain - 1f) >= 0.015f ||
-            abs(params.gamma - 1f) >= 0.01f ||
-            params.shadowsLift >= 0.01f ||
-            params.blacksCrush >= 0.01f ||
-            params.whitesGain >= 0.01f ||
-            params.exposureHighlightCompress >= 0.01f
+        val needToneLut = !skipToneLutForGpuShader && (
+            abs(params.brightnessShift) >= 0.4f ||
+                abs(params.contrastGain - 1f) >= 0.01f ||
+                abs(params.gamma - 1f) >= 0.01f ||
+                params.shadowsLift >= 0.01f ||
+                params.blacksCrush >= 0.01f ||
+                params.whitesGain >= 0.01f ||
+                params.exposureHighlightCompress >= 0.01f
+            )
 
         if (!needDnCnn && !runHeavyFilters && !needToneLut) {
             return false to 0L

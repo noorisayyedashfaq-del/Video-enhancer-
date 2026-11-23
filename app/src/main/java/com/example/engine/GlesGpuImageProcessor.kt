@@ -32,6 +32,11 @@ class GlesGpuImageProcessor {
     private var uSharpnessLoc: Int = -1
     private var uContrastLoc: Int = -1
     private var uSaturationLoc: Int = -1
+    private var uVibranceLoc: Int = -1
+    private var uBrightnessLoc: Int = -1
+    private var uWbRLoc: Int = -1
+    private var uWbBLoc: Int = -1
+    private var uHighlightCompressLoc: Int = -1
 
     private var initialized = false
     private val probeFailed = AtomicBoolean(false)
@@ -126,6 +131,11 @@ class GlesGpuImageProcessor {
             uSharpnessLoc = GLES31.glGetUniformLocation(prog, "uSharpness")
             uContrastLoc = GLES31.glGetUniformLocation(prog, "uContrast")
             uSaturationLoc = GLES31.glGetUniformLocation(prog, "uSaturation")
+            uVibranceLoc = GLES31.glGetUniformLocation(prog, "uVibrance")
+            uBrightnessLoc = GLES31.glGetUniformLocation(prog, "uBrightness")
+            uWbRLoc = GLES31.glGetUniformLocation(prog, "uWbR")
+            uWbBLoc = GLES31.glGetUniformLocation(prog, "uWbB")
+            uHighlightCompressLoc = GLES31.glGetUniformLocation(prog, "uHighlightCompress")
 
             val textures = IntArray(2)
             GLES31.glGenTextures(2, textures, 0)
@@ -177,7 +187,12 @@ class GlesGpuImageProcessor {
         bgr: Mat,
         sharpness: Float,
         contrast: Float,
-        saturation: Float
+        saturation: Float,
+        vibrance: Float = 0.25f,
+        brightnessShift: Float = 0f,
+        wbR: Float = 1f,
+        wbB: Float = 1f,
+        highlightCompress: Float = 0.06f
     ): Boolean {
         if (!initialized || probeFailed.get()) return false
         val w = bgr.cols()
@@ -190,7 +205,17 @@ class GlesGpuImageProcessor {
                 rgbaScratchMat = it
             }
         Imgproc.cvtColor(bgr, rgba, Imgproc.COLOR_BGR2RGBA)
-        val ok = enhanceRgbaInPlace(rgba, sharpness, contrast, saturation)
+        val ok = enhanceRgbaInPlace(
+            rgba = rgba,
+            sharpness = sharpness,
+            contrast = contrast,
+            saturation = saturation,
+            vibrance = vibrance,
+            brightnessShift = brightnessShift,
+            wbR = wbR,
+            wbB = wbB,
+            highlightCompress = highlightCompress
+        )
         if (ok) {
             Imgproc.cvtColor(rgba, bgr, Imgproc.COLOR_RGBA2BGR)
         }
@@ -206,7 +231,12 @@ class GlesGpuImageProcessor {
         rgba: Mat,
         sharpness: Float,
         contrast: Float,
-        saturation: Float
+        saturation: Float,
+        vibrance: Float = 0.25f,
+        brightnessShift: Float = 0f,
+        wbR: Float = 1f,
+        wbB: Float = 1f,
+        highlightCompress: Float = 0.06f
     ): Boolean {
         if (!initialized || probeFailed.get()) return false
         val w = rgba.cols()
@@ -274,9 +304,14 @@ class GlesGpuImageProcessor {
             GLES31.glUseProgram(computeProgram)
             GLES31.glUniform1i(uWidthLoc, w)
             GLES31.glUniform1i(uHeightLoc, h)
-            GLES31.glUniform1f(uSharpnessLoc, sharpness.coerceIn(0f, 0.8f))
-            GLES31.glUniform1f(uContrastLoc, contrast.coerceIn(0.9f, 1.35f))
+            GLES31.glUniform1f(uSharpnessLoc, sharpness.coerceIn(0f, 0.90f))
+            GLES31.glUniform1f(uContrastLoc, contrast.coerceIn(0.90f, 1.35f))
             GLES31.glUniform1f(uSaturationLoc, saturation.coerceIn(0.85f, 1.35f))
+            if (uVibranceLoc >= 0) GLES31.glUniform1f(uVibranceLoc, vibrance.coerceIn(0f, 0.75f))
+            if (uBrightnessLoc >= 0) GLES31.glUniform1f(uBrightnessLoc, (brightnessShift / 255f).coerceIn(-0.08f, 0.08f))
+            if (uWbRLoc >= 0) GLES31.glUniform1f(uWbRLoc, wbR.coerceIn(0.85f, 1.18f))
+            if (uWbBLoc >= 0) GLES31.glUniform1f(uWbBLoc, wbB.coerceIn(0.85f, 1.18f))
+            if (uHighlightCompressLoc >= 0) GLES31.glUniform1f(uHighlightCompressLoc, highlightCompress.coerceIn(0f, 0.36f))
 
             GLES31.glBindImageTexture(0, texIn, 0, false, 0, GLES31.GL_READ_ONLY, GLES31.GL_RGBA8)
             GLES31.glBindImageTexture(1, texOut, 0, false, 0, GLES31.GL_WRITE_ONLY, GLES31.GL_RGBA8)
@@ -383,26 +418,61 @@ class GlesGpuImageProcessor {
             uniform float uSharpness;
             uniform float uContrast;
             uniform float uSaturation;
+            uniform float uVibrance;
+            uniform float uBrightness;
+            uniform float uWbR;
+            uniform float uWbB;
+            uniform float uHighlightCompress;
 
             void main() {
                 ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
                 if (pos.x >= uWidth || pos.y >= uHeight) return;
 
-                vec4 c = imageLoad(uInput, pos);
-                vec4 n = imageLoad(uInput, ivec2(pos.x, max(pos.y - 1, 0)));
-                vec4 s = imageLoad(uInput, ivec2(pos.x, min(pos.y + 1, uHeight - 1)));
-                vec4 w = imageLoad(uInput, ivec2(max(pos.x - 1, 0), pos.y));
-                vec4 e = imageLoad(uInput, ivec2(min(pos.x + 1, uWidth - 1), pos.y));
+                vec3 c = imageLoad(uInput, pos).rgb;
+                vec3 n = imageLoad(uInput, ivec2(pos.x, max(pos.y - 1, 0))).rgb;
+                vec3 s = imageLoad(uInput, ivec2(pos.x, min(pos.y + 1, uHeight - 1))).rgb;
+                vec3 w = imageLoad(uInput, ivec2(max(pos.x - 1, 0), pos.y)).rgb;
+                vec3 e = imageLoad(uInput, ivec2(min(pos.x + 1, uWidth - 1), pos.y)).rgb;
 
-                vec3 blur = (n.rgb + s.rgb + w.rgb + e.rgb) * 0.25;
-                vec3 detail = c.rgb - blur;
-                vec3 res = clamp(c.rgb + detail * uSharpness, 0.0, 1.0);
+                // 1. Halo-clamped directional detail sharpening / deblurring
+                vec3 minN = min(c, min(min(n, s), min(w, e)));
+                vec3 maxN = max(c, max(max(n, s), max(w, e)));
+                vec3 blur = (n + s + w + e) * 0.25;
+                vec3 detail = c - blur;
+                vec3 res = clamp(c + detail * uSharpness, minN, maxN);
 
-                // Micro-contrast around mid-gray + luminance-preserving saturation boost
-                res = clamp((res - 0.5) * uContrast + 0.5, 0.0, 1.0);
+                // 2. Auto White Balance correction
+                res.r *= uWbR;
+                res.b *= uWbB;
+                res = clamp(res, 0.0, 1.25);
+
+                // 3. Tone S-curve contrast + brightness + highlight soft shoulder
+                float lumIn = max(dot(res, vec3(0.299, 0.587, 0.114)), 0.0001);
+                float lumOut = ((lumIn - 0.5) * uContrast + 0.5) + uBrightness;
+                if (lumOut > 0.76 && uHighlightCompress > 0.001) {
+                    lumOut = 0.76 + (lumOut - 0.76) * (1.0 - uHighlightCompress);
+                }
+                lumOut = clamp(lumOut, 0.0, 1.0);
+                res = clamp(res * (lumOut / lumIn), 0.0, 1.0);
+
+                // 4. Selective Vibrance + Skin-Tone Protected Saturation
                 float luma = dot(res, vec3(0.299, 0.587, 0.114));
-                res = clamp(mix(vec3(luma), res, uSaturation), 0.0, 1.0);
+                float maxC = max(res.r, max(res.g, res.b));
+                float minC = min(res.r, min(res.g, res.b));
+                float localSat = (maxC > 0.0001) ? clamp((maxC - minC) / maxC, 0.0, 1.0) : 0.0;
 
+                float cr = (res.r - luma) * 0.713 + 0.5;
+                float cb = (res.b - luma) * 0.564 + 0.5;
+                float crDist = max(0.0, max(0.525 - cr, cr - 0.675)) / 0.04;
+                float cbDist = max(0.0, max(0.300 - cb, cb - 0.495)) / 0.04;
+                float outsideSkin = clamp(max(crDist, cbDist), 0.0, 1.0);
+                float skinShield = mix(0.28, 1.0, outsideSkin);
+
+                float vibTerm = uVibrance * pow(1.0 - localSat, 1.25);
+                float satTerm = (uSaturation - 1.0) * (1.0 - 0.55 * localSat * localSat);
+                float chromaGain = 1.0 + (vibTerm + satTerm) * skinShield;
+
+                res = clamp(mix(vec3(luma), res, chromaGain), 0.0, 1.0);
                 imageStore(uOutput, pos, vec4(res, 1.0));
             }
         """

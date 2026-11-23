@@ -44,6 +44,10 @@ class HardwareVideoEncoder(
         private set
 
     private var outputFrameCounter: Long = 0L
+    private var lastMuxedPtsUs: Long = -1L
+    private var lastQueuedPtsUs: Long = -1L
+    private val ptsLock = Any()
+    private val ptsQueueUs = ArrayDeque<Long>()
     private val totalEncodeTimeMsAtomic = AtomicLong(0L)
     val totalEncodeTimeMs: Long get() = totalEncodeTimeMsAtomic.get()
 
@@ -115,6 +119,9 @@ class HardwareVideoEncoder(
         videoTrackIndex = -1
         muxerStarted = false
         outputFrameCounter = 0L
+        lastMuxedPtsUs = -1L
+        lastQueuedPtsUs = -1L
+        synchronized(ptsLock) { ptsQueueUs.clear() }
         totalEncodeTimeMsAtomic.set(0L)
         asyncError.set(null)
         return true
@@ -125,15 +132,20 @@ class HardwareVideoEncoder(
      * Waits only if the previous asynchronous encode has not yet finished drawing to the encoder Surface.
      */
     fun enqueueFrameAsync(bitmap: Bitmap, frameIndex: Int) {
+        val derivedPts = ((frameIndex.toLong() * 1_000_000.0) / fps.coerceIn(10.0, 120.0)).toLong()
+        enqueueFrameAsyncWithPts(bitmap, derivedPts)
+    }
+
+    fun enqueueFrameAsyncWithPts(bitmap: Bitmap, ptsUs: Long) {
         awaitPendingEncode()
         val exec = encodeExecutor
         if (exec == null || exec.isShutdown) {
-            encodeFrameInternal(bitmap)
+            encodeFrameInternal(bitmap, ptsUs)
             return
         }
         pendingEncodeFuture = exec.submit {
             try {
-                encodeFrameInternal(bitmap)
+                encodeFrameInternal(bitmap, ptsUs)
             } catch (t: Throwable) {
                 asyncError.compareAndSet(null, t)
             }
@@ -154,12 +166,26 @@ class HardwareVideoEncoder(
     }
 
     fun encodeFrame(bitmap: Bitmap, frameIndex: Int) {
-        awaitPendingEncode()
-        encodeFrameInternal(bitmap)
+        val derivedPts = ((frameIndex.toLong() * 1_000_000.0) / fps.coerceIn(10.0, 120.0)).toLong()
+        encodeFrameWithPts(bitmap, derivedPts)
     }
 
-    private fun encodeFrameInternal(bitmap: Bitmap) {
+    fun encodeFrameWithPts(bitmap: Bitmap, ptsUs: Long) {
+        awaitPendingEncode()
+        encodeFrameInternal(bitmap, ptsUs)
+    }
+
+    private fun encodeFrameInternal(bitmap: Bitmap, ptsUs: Long) {
         val t0 = System.currentTimeMillis()
+        synchronized(ptsLock) {
+            val safePts = if (ptsUs >= 0L) {
+                if (lastQueuedPtsUs < 0L) ptsUs else maxOf(ptsUs, lastQueuedPtsUs + 1_000L)
+            } else {
+                if (lastQueuedPtsUs < 0L) 0L else lastQueuedPtsUs + (1_000_000.0 / fps.coerceIn(10.0, 120.0)).toLong()
+            }
+            lastQueuedPtsUs = safePts
+            ptsQueueUs.addLast(safePts)
+        }
         val surface = inputSurface ?: throw IllegalStateException("Encoder surface not initialized")
         val canvas = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             surface.lockHardwareCanvas()
@@ -231,7 +257,17 @@ class HardwareVideoEncoder(
                     if (bufferInfo.size > 0 && muxerStarted && encodedData != null) {
                         encodedData.position(bufferInfo.offset)
                         encodedData.limit(bufferInfo.offset + bufferInfo.size)
-                        bufferInfo.presentationTimeUs = ((outputFrameCounter * 1_000_000.0) / safeFps).toLong()
+                        val poppedPts = synchronized(ptsLock) {
+                            if (ptsQueueUs.isNotEmpty()) ptsQueueUs.removeFirst() else -1L
+                        }
+                        val basePts = if (poppedPts >= 0L) {
+                            poppedPts
+                        } else {
+                            ((outputFrameCounter * 1_000_000.0) / safeFps).toLong()
+                        }
+                        val monoPts = if (lastMuxedPtsUs < 0L) basePts else maxOf(basePts, lastMuxedPtsUs + 1_000L)
+                        lastMuxedPtsUs = monoPts
+                        bufferInfo.presentationTimeUs = monoPts
                         outputFrameCounter++
                         muxer.writeSampleData(videoTrackIndex, encodedData, bufferInfo)
                     }

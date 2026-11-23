@@ -323,6 +323,7 @@ data class AdaptiveAdjustmentParams(
     val claheClipLimit: Double,       // 0.0..1.6
     val gamma: Float,                 // 0.80..1.25
     val saturationGain: Float,        // 0.90..1.35
+    val vibranceGain: Float = 0.25f,  // 0.0..0.75 selective boost for faded colors
     val wbGainR: Float,               // 0.85..1.18
     val wbGainG: Float,               // ~1.0
     val wbGainB: Float,               // 0.85..1.18
@@ -345,6 +346,9 @@ data class AdaptiveAdjustmentParams(
     val aiSharpening: Float = 0.40f,
     val dncnnStrength: Float = 0.48f, // 0.0..0.95 DnCNN neural luminance denoise blend
     val skinToneProtection: Boolean = true,
+    val enableSmoothness: Boolean = true,
+    val motionSmoothStrength: Float = 0.45f,
+    val allowFrameInterpolation: Boolean = true,
     val adjustmentSummary: String
 )
 
@@ -406,6 +410,10 @@ data class EngineDiagnosticsReport(
     val staticTilesReused: Int = 0,
     val framesReusedDuplicate: Int = 0,
     val runtimeFallbacksCount: Int = 0,
+    val interpolatedFramesCount: Int = 0,
+    val stutterRepairsCount: Int = 0,
+    val colorEnhancedFrames: Int = 0,
+    val smoothnessModeLabel: String = "Flow + VFR Stabilized",
     val warnings: List<String> = emptyList()
 )
 

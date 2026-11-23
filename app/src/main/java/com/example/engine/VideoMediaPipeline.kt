@@ -48,6 +48,7 @@ class VideoMediaPipeline(
         val index: Int,
         val bgrMat: Mat? = null,
         val diskFile: File? = null,
+        val ptsUs: Long = -1L,
         val fromDecoderPool: Boolean = false
     )
 
@@ -223,11 +224,36 @@ class VideoMediaPipeline(
                 }
 
                 val safeFps = metadata.fps.coerceIn(10.0, 120.0)
+                val medianStepUs = (1_000_000.0 / safeFps).roundToLong().coerceAtLeast(8_333L)
+
+                val srLatencyMs = onnxEngine.adaptiveProfile
+                    ?.plans
+                    ?.get(com.example.model.ModelKind.REAL_ESRGAN)
+                    ?.measuredLatencyMs
+                    ?: 90L
+                val presetTileSize = outDims.aiTileSize
+                val budgetGovernor = SpeedBudgetGovernor(
+                    mode = mode,
+                    durationMs = metadata.durationMs,
+                    estimatedFrames = metadata.estimatedFrameCount,
+                    presetTileSize = presetTileSize,
+                    presetTilesCap = outDims.tilesPerFrame,
+                    measuredSrTileMs = srLatencyMs,
+                    deviceCapacityScore = capabilities.processingCapacityScore
+                )
+                val modeBudgetFrameMs = budgetGovernor.targetMsPerFrame.roundToLong().coerceAtLeast(15L)
+
+                val cadenceInterpolate = MotionSmoothMath.shouldInterpolateCadence(
+                    sourceFps = safeFps,
+                    allowInterpolation = adaptiveParams.allowFrameInterpolation && budgetGovernor.allowInterpolationByBaseline()
+                )
+                val encoderFps = MotionSmoothMath.targetOutputFps(safeFps, cadenceInterpolate)
+
                 val activeEncoder = HardwareVideoEncoder(
                     outputFile = rawVideoMp4,
                     width = outDims.width,
                     height = outDims.height,
-                    fps = safeFps,
+                    fps = encoderFps,
                     bitrateBps = outDims.targetBitrateBps,
                     preferH265 = outDims.useH265
                 ).apply { start() }
@@ -252,26 +278,11 @@ class VideoMediaPipeline(
                     )
                 )
 
-                val srLatencyMs = onnxEngine.adaptiveProfile
-                    ?.plans
-                    ?.get(com.example.model.ModelKind.REAL_ESRGAN)
-                    ?.measuredLatencyMs
-                    ?: 90L
-                val presetTileSize = outDims.aiTileSize
-                val budgetGovernor = SpeedBudgetGovernor(
-                    mode = mode,
-                    durationMs = metadata.durationMs,
-                    estimatedFrames = metadata.estimatedFrameCount,
-                    presetTileSize = presetTileSize,
-                    presetTilesCap = outDims.tilesPerFrame,
-                    measuredSrTileMs = srLatencyMs,
-                    deviceCapacityScore = capabilities.processingCapacityScore
-                )
-                val modeBudgetFrameMs = budgetGovernor.targetMsPerFrame.roundToLong().coerceAtLeast(15L)
                 logger.info(
                     "SpeedBudgetGovernor: mode=${mode.label} • max=${budgetGovernor.maxBudgetMs}ms • " +
                         "target=${String.format(Locale.US, "%.1f", budgetGovernor.targetMsPerFrame)}ms/f • " +
-                        "tier=${budgetGovernor.activeTier.label} (k=${budgetGovernor.currentKeyframeInterval})"
+                        "tier=${budgetGovernor.activeTier.label} (k=${budgetGovernor.currentKeyframeInterval}) • " +
+                        "smooth=${if (cadenceInterpolate) "Flow 2x (${encoderFps.roundToInt()}fps)" else "VFR Stabilized (${safeFps.roundToInt()}fps)"}"
                 )
 
                 val channelCap = if (capabilities.availableRamMb > 1400L) 4 else 3
@@ -282,6 +293,9 @@ class VideoMediaPipeline(
                 var recoveredFrames = 0
                 var processedCount = 0
                 var duplicateFramesReused = 0
+                var interpolatedFramesCount = 0
+                var stutterRepairsCount = 0
+                var colorEnhancedFramesCount = 0
                 var lightweightFallbackActive = false
                 var activeAccelLabel = onnxEngine.providerLabel
                 val expectedTotalFrames = metadata.estimatedFrameCount.coerceAtLeast(1)
@@ -302,12 +316,13 @@ class VideoMediaPipeline(
 
                             val count = fastDecoder.decodeAllFrames(
                                 isCancelled = { cancelled.get() || !isActive },
-                                onFrame = { idx, bgrMat, _ ->
+                                onFrame = { idx, bgrMat, ptsUs ->
                                     sentAny = true
                                     decodedCountAtomic.set(idx + 1)
                                     val frameMsg = DecodedFrame(
                                         index = idx,
                                         bgrMat = bgrMat,
+                                        ptsUs = ptsUs,
                                         fromDecoderPool = true
                                     )
                                     val sendOk = frameChannel.trySend(frameMsg).isSuccess
@@ -357,12 +372,15 @@ class VideoMediaPipeline(
                         }
                     }
 
-                    // Stage 2 & 3 Overlapped Consumer: Frame Enhance (bitmap[i%2]) -> Async HW Encode(bitmap[(i-1)%2])
+                    // Stage 2 & 3 Overlapped Consumer: Motion Smoothness + AI Enhance(N) -> Async HW Encode
                     val enhanceLoopStartMs = System.currentTimeMillis()
                     var lastThermalCheckMs = 0L
                     var lastProgressEmitMs = 0L
                     var currentThermalState = capabilities.thermalState
                     var encodeSlotIndex = 0
+                    var prevRawBgr: Mat? = null
+                    var prevFramePtsUs: Long = -1L
+                    val interpScratchBgr = if (adaptiveParams.enableSmoothness) Mat() else null
 
                     try {
                         for (item in frameChannel) {
@@ -374,6 +392,8 @@ class VideoMediaPipeline(
 
                             val frameIndex = item.index
                             val dynamicTotal = max(expectedTotalFrames, max(decodedCountAtomic.get(), frameIndex + 1))
+                            val rawPts = if (item.ptsUs >= 0L) item.ptsUs else frameIndex.toLong() * medianStepUs
+                            val currPtsUs = if (prevFramePtsUs < 0L) rawPts else max(rawPts, prevFramePtsUs + 2_000L)
 
                             // Periodic thermal watchdog + adaptive backend step-down only under severe heat
                             val now = System.currentTimeMillis()
@@ -396,7 +416,6 @@ class VideoMediaPipeline(
                                 }
                             }
 
-                            // Never waste job budget sleeping on WARM; brief cooldown only on THROTTLING/CRITICAL every 8 frames
                             if (currentThermalState >= ThermalState.THROTTLING && frameIndex > 0 && frameIndex % 8 == 0) {
                                 delay(if (currentThermalState == ThermalState.CRITICAL) 24L else 12L)
                             }
@@ -408,13 +427,11 @@ class VideoMediaPipeline(
                                 recoveredFrames++
                                 logger.warn("Recovered empty/corrupted frame #$frameIndex")
                                 if (frameIndex > 0) {
-                                    activeEncoder.encodeFrame(lastCompletedBitmap, frameIndex)
+                                    activeEncoder.encodeFrameWithPts(lastCompletedBitmap, currPtsUs)
+                                    prevFramePtsUs = currPtsUs
                                 }
                                 continue
                             }
-
-                            val targetBitmap = if ((encodeSlotIndex and 1) == 0) bmpA else bmpB
-                            encodeSlotIndex++
 
                             val baseFrameProgress = 0.20f + (frameIndex.toFloat() / dynamicTotal.toFloat()) * 0.70f
                             val frameSlice = 0.70f / dynamicTotal.toFloat()
@@ -427,6 +444,50 @@ class VideoMediaPipeline(
 
                             val frameProcStartMs = System.currentTimeMillis()
                             try {
+                                // Smoothness Enhancement: VFR dropped-frame repair & optional 2x optical-flow interpolation
+                                val prevMat = prevRawBgr
+                                if (adaptiveParams.enableSmoothness && frameIndex > 0 && prevMat != null && interpScratchBgr != null) {
+                                    val droppedGap = MotionSmoothMath.detectDroppedFrameGap(prevFramePtsUs, currPtsUs, medianStepUs)
+                                    val needMidpoint = (droppedGap > 0) || (cadenceInterpolate && budgetGovernor.allowInterpolationByBaseline())
+                                    if (needMidpoint) {
+                                        val flowOk = frameProcessor.motionEngine.interpolateMidpointBgr(
+                                            prevBgr = prevMat,
+                                            nextBgr = bgr,
+                                            outBgr = interpScratchBgr,
+                                            alpha = 0.5
+                                        )
+                                        if (flowOk || droppedGap > 0) {
+                                            val midPtsUs = prevFramePtsUs + ((currPtsUs - prevFramePtsUs) / 2L).coerceAtLeast(1_000L)
+                                            val interpBitmap = if ((encodeSlotIndex and 1) == 0) bmpA else bmpB
+                                            encodeSlotIndex++
+                                            val interpDecision = speedDecision.copy(allowFaceDetect = false, allowDnCnn = false)
+                                            frameProcessor.processFrame(
+                                                srcBgr = interpScratchBgr,
+                                                outDims = outDims,
+                                                params = adaptiveParams,
+                                                capabilities = capabilities,
+                                                reusableOutBitmap = interpBitmap,
+                                                estimatedTotalFrames = dynamicTotal,
+                                                forceLightweightFallback = lightweightFallbackActive,
+                                                tileSizeOverride = if (presetTileSize > 0) presetTileSize else null,
+                                                frameIndex = frameIndex,
+                                                logger = logger,
+                                                isCancelled = { cancelled.get() },
+                                                speedDecision = interpDecision,
+                                                modeBudgetFrameMs = modeBudgetFrameMs
+                                            )
+                                            lastCompletedBitmap = interpBitmap
+                                            activeEncoder.enqueueFrameAsyncWithPts(interpBitmap, midPtsUs)
+                                            interpolatedFramesCount++
+                                            colorEnhancedFramesCount++
+                                            if (droppedGap > 0) stutterRepairsCount++
+                                        }
+                                    }
+                                }
+
+                                val targetBitmap = if ((encodeSlotIndex and 1) == 0) bmpA else bmpB
+                                encodeSlotIndex++
+
                                 val frameResult = frameProcessor.processFrame(
                                     srcBgr = bgr,
                                     outDims = outDims,
@@ -467,6 +528,7 @@ class VideoMediaPipeline(
                                 totalFacesEnhanced += frameResult.facesEnhanced
                                 if (frameResult.usedAiDenoise) usedAiDenoiseAny = true
                                 if (frameResult.usedDuplicateFrameReuse) duplicateFramesReused++
+                                if (frameResult.colorEnhanced) colorEnhancedFramesCount++
                                 if (frameResult.dncnnInferenceMs > 0L) logger.dncnnInferenceMs.addAndGet(frameResult.dncnnInferenceMs)
                                 if (frameResult.faceAiMs > 0L) logger.faceAiMs.addAndGet(frameResult.faceAiMs)
                                 if (frameResult.lightweightFallbackTriggered && !lightweightFallbackActive && speedDecision.runNeuralSrNow) {
@@ -478,8 +540,18 @@ class VideoMediaPipeline(
                                     activeAccelLabel = frameResult.activeAccelerationLabel
                                 }
                                 lastCompletedBitmap = targetBitmap
-                                // Async overlap: submits encoding of targetBitmap while loop immediately advances to next frame
-                                activeEncoder.enqueueFrameAsync(targetBitmap, frameIndex)
+                                activeEncoder.enqueueFrameAsyncWithPts(targetBitmap, currPtsUs)
+                                prevFramePtsUs = currPtsUs
+
+                                if (adaptiveParams.enableSmoothness) {
+                                    val cachePrev = prevRawBgr
+                                    if (cachePrev == null || cachePrev.cols() != bgr.cols() || cachePrev.rows() != bgr.rows()) {
+                                        prevRawBgr?.release()
+                                        prevRawBgr = bgr.clone()
+                                    } else {
+                                        bgr.copyTo(cachePrev)
+                                    }
+                                }
                             } catch (e: InterruptedException) {
                                 throw e
                             } catch (oom: OutOfMemoryError) {
@@ -489,7 +561,8 @@ class VideoMediaPipeline(
                                 logger.error("Frame $frameIndex processing error", t)
                                 recoveredFrames++
                                 if (frameIndex > 0) {
-                                    activeEncoder.encodeFrame(lastCompletedBitmap, frameIndex)
+                                    activeEncoder.encodeFrameWithPts(lastCompletedBitmap, currPtsUs)
+                                    prevFramePtsUs = currPtsUs
                                 } else {
                                     throw t
                                 }
@@ -549,6 +622,8 @@ class VideoMediaPipeline(
                             }
                         }
                     } finally {
+                        prevRawBgr?.release()
+                        interpScratchBgr?.release()
                         while (true) {
                             val leftover = frameChannel.tryReceive().getOrNull() ?: break
                             if (leftover.fromDecoderPool) {
@@ -612,6 +687,12 @@ class VideoMediaPipeline(
 
                 val totalElapsed = System.currentTimeMillis() - startWallMs
                 val scaleLabel = String.format(Locale.US, "%.1fx", outDims.targetScaleFactor)
+                val smoothLabel = when {
+                    cadenceInterpolate -> "DIS Optical Flow 2x (${encoderFps.roundToInt()}fps)"
+                    stutterRepairsCount > 0 -> "DIS Optical Flow VFR Repair ($stutterRepairsCount)"
+                    adaptiveParams.enableSmoothness -> "Flow + Micro-Jitter Stabilized"
+                    else -> "Original Cadence"
+                }
                 val diagnostics = logger.buildReport(
                     totalMs = totalElapsed,
                     executionProvider = activeAccelLabel,
@@ -619,19 +700,24 @@ class VideoMediaPipeline(
                     codecUsed = usedCodecLabel,
                     initialTileSize = presetTileSize,
                     finalTileSize = if (lightweightFallbackActive) 0 else presetTileSize,
-                    framesProcessed = processedCount,
+                    framesProcessed = processedCount + interpolatedFramesCount,
                     recoveredFrames = recoveredFrames,
                     analysisReusedFromCache = analysisOutcome.reusedFromCache,
                     upscaleScaleLabel = scaleLabel,
                     perModelAccelerationSummary = onnxEngine.currentPerModelSummary(),
                     staticTilesReused = onnxEngine.totalStaticTilesReused,
                     framesReusedDuplicate = duplicateFramesReused,
-                    runtimeFallbacksCount = onnxEngine.runtimeFallbacksCount
+                    runtimeFallbacksCount = onnxEngine.runtimeFallbacksCount,
+                    interpolatedFramesCount = interpolatedFramesCount,
+                    stutterRepairsCount = stutterRepairsCount,
+                    colorEnhancedFrames = colorEnhancedFramesCount,
+                    smoothnessModeLabel = smoothLabel
                 )
 
                 logger.info(
                     "Job completed in ${totalElapsed}ms (tier=${budgetGovernor.activeTier.label}, budget=${budgetGovernor.maxBudgetMs}ms) • " +
-                        "frames=$processedCount • dupReuse=$duplicateFramesReused • staticTileReuse=${diagnostics.staticTilesReused} • " +
+                        "frames=$processedCount (+$interpolatedFramesCount interp, $stutterRepairsCount VFR repairs) • colorFrames=$colorEnhancedFramesCount • " +
+                        "dupReuse=$duplicateFramesReused • staticTileReuse=${diagnostics.staticTilesReused} • " +
                         "fallbacks=${diagnostics.runtimeFallbacksCount} • scale=$scaleLabel (${outDims.label}) • " +
                         "sr=${diagnostics.aiInferenceMs}ms • encode=${diagnostics.encodingMs}ms • provider=${diagnostics.executionProvider}"
                 )
@@ -754,11 +840,15 @@ class VideoMediaPipeline(
                 if (fileReady) {
                     lastActivityMs.set(System.currentTimeMillis())
                     stalledEmitted = false
-                    frameChannel.send(DecodedFrame(index = nextFileNum - 1, diskFile = currentFile))
+                    val idx = nextFileNum - 1
+                    val estPts = ((idx.toLong() * 1_000_000.0) / safeFps).roundToLong()
+                    frameChannel.send(DecodedFrame(index = idx, diskFile = currentFile, ptsUs = estPts))
                     nextFileNum++
                 } else if (extractionDone.get()) {
                     if (currentFile.exists() && currentFile.length() > 0L) {
-                        frameChannel.send(DecodedFrame(index = nextFileNum - 1, diskFile = currentFile))
+                        val idx = nextFileNum - 1
+                        val estPts = ((idx.toLong() * 1_000_000.0) / safeFps).roundToLong()
+                        frameChannel.send(DecodedFrame(index = idx, diskFile = currentFile, ptsUs = estPts))
                         nextFileNum++
                     } else {
                         break

@@ -229,9 +229,14 @@ class EnhancementLogicUnitTest {
         assertTrue(p1.faceEnhanceStrength < p2.faceEnhanceStrength && p2.faceEnhanceStrength < p3.faceEnhanceStrength && p3.faceEnhanceStrength < p4.faceEnhanceStrength)
         assertTrue(p1.useAiDenoise && p2.useAiDenoise && p3.useAiDenoise && p4.useAiDenoise)
 
-        // Genuine enhancement, NOT fake filter over-processing
-        assertTrue("Brightness shift should stay subtle", p4.brightnessShift <= 2.5f)
-        assertTrue("Saturation boost must preserve natural colors", p4.saturationGain <= 1.08f)
+        // Genuine visible yet natural color mastering + active detail recovery & smoothness parameters
+        assertTrue("Brightness shift should stay calibrated and non-blown (${p4.brightnessShift})", p4.brightnessShift in 2.5f..5.5f)
+        assertTrue("Saturation boost must visibly enrich without clipping (${p4.saturationGain})", p4.saturationGain in 1.10f..1.22f)
+        assertTrue("Vibrance must ramp progressively across 1x->4x", p1.vibranceGain < p4.vibranceGain && p4.vibranceGain in 0.25f..0.65f)
+        assertTrue("Detail recovery must ramp progressively", p1.detailRecovery < p2.detailRecovery && p2.detailRecovery < p3.detailRecovery && p3.detailRecovery < p4.detailRecovery)
+        assertTrue("Deblur strength must ramp progressively", p1.deblurStrength < p2.deblurStrength && p2.deblurStrength < p3.deblurStrength && p3.deblurStrength < p4.deblurStrength)
+        assertTrue("AI sharpening must stay progressive and halo-safe", p1.aiSharpening < p2.aiSharpening && p2.aiSharpening < p3.aiSharpening && p3.aiSharpening < p4.aiSharpening && p4.aiSharpening <= 0.68f)
+        assertTrue("Motion smoothness must be active", p1.enableSmoothness && p4.enableSmoothness && p4.allowFrameInterpolation)
         assertEquals(1.0f, p2.wbGainR, 0.001f)
         assertEquals(1.0f, p2.wbGainB, 0.001f)
         assertTrue(p2.skinToneProtection)

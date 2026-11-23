@@ -419,6 +419,10 @@ class SpeedBudgetGovernor(
     val activeTier: SpeedExecutionTier get() = currentTier
     val currentKeyframeInterval: Int get() = aiKeyframeInterval
 
+    fun allowInterpolationByBaseline(): Boolean {
+        return currentTier != SpeedExecutionTier.GPU_SHADER_FAST_PASS || targetMsPerFrame >= 45.0
+    }
+
     fun decisionForFrame(frameIndex: Int, isSceneCut: Boolean, forceLightweight: Boolean): FrameSpeedDecision {
         if (forceLightweight || currentTier == SpeedExecutionTier.GPU_SHADER_FAST_PASS) {
             return FrameSpeedDecision(
@@ -437,19 +441,23 @@ class SpeedBudgetGovernor(
             mode == com.example.model.EnhancementMode.CLARITY_4X
 
         return when (currentTier) {
-            SpeedExecutionTier.FULL_NEURAL_PER_FRAME -> FrameSpeedDecision(
-                runNeuralSrNow = true,
-                allowDnCnn = isHighDetailMode && (frameIndex % 4 == 0 || isSceneCut) && targetMsPerFrame >= 160.0,
-                allowFaceDetect = isHighDetailMode && targetMsPerFrame >= 150.0,
-                allowFaceSr = mode == com.example.model.EnhancementMode.CLARITY_4X && targetMsPerFrame >= 220.0,
-                maxTilesForFrame = presetTilesCap.coerceIn(1, 4),
-                tileSizeForFrame = presetTileSize,
-                tier = currentTier,
-                fastGpuMode = false
-            )
+            SpeedExecutionTier.FULL_NEURAL_PER_FRAME -> {
+                val dnCnnCadence = if (isHighDetailMode) 3 else 6
+                val runDnCnn = (frameIndex % dnCnnCadence == 0 || isSceneCut) && targetMsPerFrame >= 95.0
+                FrameSpeedDecision(
+                    runNeuralSrNow = true,
+                    allowDnCnn = runDnCnn,
+                    allowFaceDetect = isHighDetailMode && targetMsPerFrame >= 140.0,
+                    allowFaceSr = mode == com.example.model.EnhancementMode.CLARITY_4X && targetMsPerFrame >= 200.0,
+                    maxTilesForFrame = presetTilesCap.coerceIn(1, 4),
+                    tileSizeForFrame = presetTileSize,
+                    tier = currentTier,
+                    fastGpuMode = false
+                )
+            }
             SpeedExecutionTier.SINGLE_TILE_NEURAL -> FrameSpeedDecision(
                 runNeuralSrNow = true,
-                allowDnCnn = false,
+                allowDnCnn = (frameIndex % 6 == 0 || isSceneCut) && targetMsPerFrame >= 105.0,
                 allowFaceDetect = false,
                 allowFaceSr = false,
                 maxTilesForFrame = 1,
@@ -462,7 +470,7 @@ class SpeedBudgetGovernor(
                 val runNow = (frameIndex % interval == 0) || isSceneCut
                 FrameSpeedDecision(
                     runNeuralSrNow = runNow,
-                    allowDnCnn = false,
+                    allowDnCnn = runNow && isSceneCut && targetMsPerFrame >= 90.0,
                     allowFaceDetect = false,
                     allowFaceSr = false,
                     maxTilesForFrame = 1,

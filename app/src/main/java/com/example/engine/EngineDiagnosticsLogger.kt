@@ -89,7 +89,11 @@ class EngineDiagnosticsLogger(
         perModelAccelerationSummary: String = executionProvider,
         staticTilesReused: Int = 0,
         framesReusedDuplicate: Int = 0,
-        runtimeFallbacksCount: Int = 0
+        runtimeFallbacksCount: Int = 0,
+        interpolatedFramesCount: Int = 0,
+        stutterRepairsCount: Int = 0,
+        colorEnhancedFrames: Int = framesProcessed,
+        smoothnessModeLabel: String = "Flow + VFR Stabilized"
     ): EngineDiagnosticsReport {
         return EngineDiagnosticsReport(
             modelInitMs = modelInitMs,
@@ -119,6 +123,10 @@ class EngineDiagnosticsLogger(
             staticTilesReused = staticTilesReused,
             framesReusedDuplicate = framesReusedDuplicate,
             runtimeFallbacksCount = runtimeFallbacksCount,
+            interpolatedFramesCount = interpolatedFramesCount,
+            stutterRepairsCount = stutterRepairsCount,
+            colorEnhancedFrames = colorEnhancedFrames,
+            smoothnessModeLabel = smoothnessModeLabel,
             warnings = warnings.toList()
         )
     }

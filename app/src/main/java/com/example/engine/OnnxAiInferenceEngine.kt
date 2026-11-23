@@ -93,6 +93,9 @@ class OnnxAiInferenceEngine(private val context: Context) {
     private var dncnnWeightMat: Mat? = null
     private var dncnnWeightedMat: Mat? = null
     private var dncnnU8Mat: Mat? = null
+    private var dncnnResidualF: Mat? = null
+    private var dncnnResidualUpF: Mat? = null
+    private var dncnnYFloatMat: Mat? = null
 
     // Static tile temporal reuse caches
     private val srTileCache = StaticTileReuseCache()
@@ -102,6 +105,9 @@ class OnnxAiInferenceEngine(private val context: Context) {
     private var srcRgbMat: Mat? = null
     private var srWorkRgbMat: Mat? = null
     private var baseRgb8u: Mat? = null
+    private var baseLowBlur8u: Mat? = null
+    private var baseHighDetailS16: Mat? = null
+    private var outRgbS16: Mat? = null
     private var tilePaddedMatA: Mat? = null
     private var tilePaddedMatB: Mat? = null
     private var tileFloatHwcA: Mat? = null
@@ -131,6 +137,9 @@ class OnnxAiInferenceEngine(private val context: Context) {
     // Lightweight OpenCV fallback scratch Mats
     private var lwBlurMat: Mat? = null
     private var lwDetailMat: Mat? = null
+    private var lwBlurFineMat: Mat? = null
+    private var lwMinNMat: Mat? = null
+    private var lwMaxNMat: Mat? = null
 
     // Feather weight Mat cache keyed by tile dimensions & overlap
     private val featherMaskCache = HashMap<Long, Mat>()
@@ -264,9 +273,10 @@ class OnnxAiInferenceEngine(private val context: Context) {
     fun currentPerModelSummary(): String = activeProviderDescription
 
     /**
-     * Single-pass high-speed DnCNN neural luminance denoising ([1, 1, 256, 256] ONNX).
-     * Eliminates 24-45 sequential per-frame tile inferences by running 1 pass at <=256x256
-     * and smoothly interpolating denoised luma delta onto full frame.
+     * Edge-preserving DnCNN neural luminance denoising ([1, 1, 256, 256] ONNX).
+     * When input luminance exceeds 256x256, extracts ONLY the smooth DnCNN noise-removal
+     * residual delta at 256x256 and upsamples the correction + applies light edge-preserving
+     * smoothing on flat blocks — keeping full-resolution sharp textures intact!
      */
     fun denoiseLuminanceYWithDnCnn(
         yChan: Mat,
@@ -275,7 +285,7 @@ class OnnxAiInferenceEngine(private val context: Context) {
         logger: EngineDiagnosticsLogger? = null
     ): Boolean {
         if (!isDncnnReady) return false
-        val blend = strength.toDouble().coerceIn(0.08, 0.85)
+        val blend = strength.toDouble().coerceIn(0.10, 0.90)
         val w = yChan.cols()
         val h = yChan.rows()
         if (w < 8 || h < 8) return false
@@ -321,8 +331,8 @@ class OnnxAiInferenceEngine(private val context: Context) {
                 return true
             }
 
-            // Downscale luma to 256x256 -> 1 single DnCNN inference -> upsample cleanly
-            Imgproc.resize(yChan, padMat, Size(dncnnTileSize.toDouble(), dncnnTileSize.toDouble()), 0.0, 0.0, Imgproc.INTER_LINEAR)
+            // High-res frame: extract low-freq DnCNN noise residual (denoised256 - orig256) so fine detail never blurs!
+            Imgproc.resize(yChan, padMat, Size(dncnnTileSize.toDouble(), dncnnTileSize.toDouble()), 0.0, 0.0, Imgproc.INTER_AREA)
             padMat.convertTo(floatMat, CvType.CV_32FC1, 1.0 / 255.0)
             floatMat.get(0, 0, inTmp)
             inBuf.clear()
@@ -332,11 +342,27 @@ class OnnxAiInferenceEngine(private val context: Context) {
             runDnCnnWithFallback(shape, inBuf, outArr, logger)
             outTileMat.put(0, 0, outArr)
 
-            outTileMat.convertTo(padMat, CvType.CV_8UC1, 255.0)
-            Imgproc.resize(padMat, u8Out, Size(w.toDouble(), h.toDouble()), 0.0, 0.0, Imgproc.INTER_LINEAR)
-            // Keep sharp high-frequency details from yChan while blending denoised luma
-            val effectiveBlend = (blend * 0.65).coerceIn(0.10, 0.55)
-            Core.addWeighted(u8Out, effectiveBlend, yChan, 1.0 - effectiveBlend, 0.0, yChan)
+            val resF = dncnnResidualF ?: Mat(dncnnTileSize, dncnnTileSize, CvType.CV_32FC1).also { dncnnResidualF = it }
+            val resUpF = dncnnResidualUpF ?: Mat().also { dncnnResidualUpF = it }
+            val yFloat = dncnnYFloatMat ?: Mat().also { dncnnYFloatMat = it }
+
+            Core.subtract(outTileMat, floatMat, resF)
+            Imgproc.resize(resF, resUpF, Size(w.toDouble(), h.toDouble()), 0.0, 0.0, Imgproc.INTER_LINEAR)
+            yChan.convertTo(yFloat, CvType.CV_32FC1, 1.0 / 255.0)
+            Core.scaleAdd(resUpF, blend, yFloat, yFloat)
+
+            // Suppress fine high-frequency grain gently via fast edge-gated 3x3 smooth on flat areas only
+            yFloat.convertTo(u8Out, CvType.CV_8UC1, 255.0)
+            val grainSigmaBlend = (blend * 0.28).coerceIn(0.04, 0.24)
+            Imgproc.GaussianBlur(u8Out, dncnnAccumMat!!, Size(3.0, 3.0), 0.75)
+            // Keep crisp gradient edges untouched using absdiff edge mask
+            Core.absdiff(u8Out, dncnnAccumMat!!, u8Out)
+            val flatMask = dncnnWeightMat!!
+            Imgproc.threshold(u8Out, flatMask, 9.0, 255.0, Imgproc.THRESH_BINARY_INV)
+            flatMask.convertTo(u8Out, CvType.CV_8UC1)
+            yFloat.convertTo(yChan, CvType.CV_8UC1, 255.0)
+            Core.addWeighted(dncnnAccumMat!!, grainSigmaBlend, yChan, 1.0 - grainSigmaBlend, 0.0, dncnnAccumMat!!)
+            dncnnAccumMat!!.copyTo(yChan, u8Out)
             true
         } catch (t: Throwable) {
             logger?.warn("DnCNN fast skip (${t.message})")
@@ -409,6 +435,9 @@ class OnnxAiInferenceEngine(private val context: Context) {
         estimatedTotalFrames: Int,
         forceLightweightFallback: Boolean,
         aiStrength: Float = 0.65f,
+        detailRecovery: Float = 0.65f,
+        deblurStrength: Float = 0.50f,
+        aiSharpening: Float = 0.32f,
         fallbackSharpnessBoost: Float = 0.28f,
         faces: List<Rect> = emptyList(),
         faceEnhanceStrength: Float = 0.65f,
@@ -426,16 +455,16 @@ class OnnxAiInferenceEngine(private val context: Context) {
         if (forceLightweightFallback || !isRealEsrganReady) {
             val resizedBase = if (inW != safeOutW || inH != safeOutH) {
                 Mat().also {
-                    Imgproc.resize(srcBgr, it, Size(safeOutW.toDouble(), safeOutH.toDouble()), 0.0, 0.0, Imgproc.INTER_LINEAR)
+                    Imgproc.resize(srcBgr, it, Size(safeOutW.toDouble(), safeOutH.toDouble()), 0.0, 0.0, Imgproc.INTER_CUBIC)
                 }
             } else {
                 srcBgr.clone()
             }
             val lw = enhanceFastLightweightCopy(
                 resizedBase,
-                sharpnessBoost = fallbackSharpnessBoost.coerceIn(0.08f, 0.45f),
-                contrastBoost = 1.02f,
-                satBoost = 1.01f
+                sharpnessBoost = (fallbackSharpnessBoost + deblurStrength * 0.25f).coerceIn(0.12f, 0.58f),
+                contrastBoost = 1.03f,
+                satBoost = 1.02f
             )
             resizedBase.release()
             val label = if (glesGpuAvailable) "GLES 3.1 GPU Fast" else "OpenCV SIMD Fast"
@@ -542,15 +571,20 @@ class OnnxAiInferenceEngine(private val context: Context) {
             onTileProgress(1, 1, safeTileSize)
 
             outResized.convertTo(outRgb8u!!, CvType.CV_8UC3, 255.0)
-            val aiBlend = aiStrength.toDouble().coerceIn(0.25, 0.96)
-            if (aiBlend < 0.85) {
-                if (inW == safeOutW && inH == safeOutH) {
-                    localRgb.copyTo(baseRgb8u!!)
-                } else {
-                    Imgproc.resize(localRgb, baseRgb8u!!, Size(safeOutW.toDouble(), safeOutH.toDouble()), 0.0, 0.0, Imgproc.INTER_LINEAR)
-                }
-                Core.addWeighted(outRgb8u!!, aiBlend, baseRgb8u!!, 1.0 - aiBlend, 0.0, outRgb8u!!)
-            }
+            fuseHighResDetailAndDeblur(
+                localRgb = localRgb,
+                targetRgb8u = outRgb8u!!,
+                inW = inW,
+                inH = inH,
+                srInW = srInW,
+                srInH = srInH,
+                outW = safeOutW,
+                outH = safeOutH,
+                aiStrength = aiStrength,
+                detailRecovery = detailRecovery,
+                deblurStrength = deblurStrength,
+                aiSharpening = aiSharpening
+            )
 
             val hitLimit = AiSpeedPolicy.shouldEngageLightweightFallback(
                 measuredTileMs = tileMs,
@@ -760,9 +794,20 @@ class OnnxAiInferenceEngine(private val context: Context) {
         Core.multiply(accumRgbMat!!, invThree, accumRgbMat!!)
         accumRgbMat!!.convertTo(outRgb8u!!, CvType.CV_8UC3, 255.0)
 
-        if (aiBlend < 0.88) {
-            Core.addWeighted(outRgb8u!!, aiBlend, baseRgb8u!!, 1.0 - aiBlend, 0.0, outRgb8u!!)
-        }
+        fuseHighResDetailAndDeblur(
+            localRgb = localRgb,
+            targetRgb8u = outRgb8u!!,
+            inW = inW,
+            inH = inH,
+            srInW = srInW,
+            srInH = srInH,
+            outW = safeOutW,
+            outH = safeOutH,
+            aiStrength = aiStrength,
+            detailRecovery = detailRecovery,
+            deblurStrength = deblurStrength,
+            aiSharpening = aiSharpening
+        )
 
         var faceMs = 0L
         if (faces.isNotEmpty() && faceEnhanceStrength >= 0.25f) {
@@ -794,6 +839,89 @@ class OnnxAiInferenceEngine(private val context: Context) {
             faceAiMs = faceMs,
             staticTilesReused = reusedInFrame
         )
+    }
+
+    /**
+     * Frequency-Aware Detail-Preserving Neural Fusion + Deblurring:
+     * 1. When Real-ESRGAN ran on a downscaled working canvas (srInW < inW) on 720p/1080p inputs,
+     *    injects the native high-frequency micro-texture from the original high-res frame so
+     *    neural super-resolution never smudges crisp textures down to working-canvas resolution!
+     * 2. Applies halo-clamped adaptive unsharp/deblurring driven by [detailRecovery],
+     *    [deblurStrength], and [aiSharpening].
+     */
+    private fun fuseHighResDetailAndDeblur(
+        localRgb: Mat,
+        targetRgb8u: Mat,
+        inW: Int,
+        inH: Int,
+        srInW: Int,
+        srInH: Int,
+        outW: Int,
+        outH: Int,
+        aiStrength: Float,
+        detailRecovery: Float,
+        deblurStrength: Float,
+        aiSharpening: Float
+    ) {
+        val aiBlend = aiStrength.toDouble().coerceIn(0.28, 0.96)
+        val base = baseRgb8u!!
+        if (inW == outW && inH == outH) {
+            localRgb.copyTo(base)
+        } else {
+            Imgproc.resize(localRgb, base, Size(outW.toDouble(), outH.toDouble()), 0.0, 0.0, Imgproc.INTER_CUBIC)
+        }
+
+        if (aiBlend < 0.88) {
+            Core.addWeighted(targetRgb8u, aiBlend, base, 1.0 - aiBlend, 0.0, targetRgb8u)
+        }
+
+        // Inject native high-frequency details whenever SR input was downscaled relative to input
+        if (srInW < (inW * 0.85).toInt()) {
+            val baseBlur = baseLowBlur8u ?: Mat().also { baseLowBlur8u = it }
+            val highS16 = baseHighDetailS16 ?: Mat().also { baseHighDetailS16 = it }
+            val targetS16 = outRgbS16 ?: Mat().also { outRgbS16 = it }
+            val baseS16Tmp = Mat()
+            val blurS16Tmp = Mat()
+            try {
+                Imgproc.GaussianBlur(base, baseBlur, Size(0.0, 0.0), 1.6)
+                base.convertTo(baseS16Tmp, CvType.CV_16SC3)
+                baseBlur.convertTo(blurS16Tmp, CvType.CV_16SC3)
+                Core.subtract(baseS16Tmp, blurS16Tmp, highS16)
+
+                targetRgb8u.convertTo(targetS16, CvType.CV_16SC3)
+                val hfGain = (0.45 + detailRecovery * 0.55).coerceIn(0.45, 1.05)
+                Core.scaleAdd(highS16, hfGain, targetS16, targetS16)
+                targetS16.convertTo(targetRgb8u, CvType.CV_8UC3)
+            } finally {
+                baseS16Tmp.release()
+                blurS16Tmp.release()
+            }
+        }
+
+        // Apply Halo-Clamped Multi-Scale Deblur + AI Sharpening (activates previously dead params!)
+        val deblurAmt = (deblurStrength * 0.28 + aiSharpening * 0.34).coerceIn(0.06, 0.52)
+        if (deblurAmt > 0.05) {
+            applyHaloClampedSharpen(targetRgb8u, amount = deblurAmt, sigma = if (outW > 1920) 1.35 else 1.05)
+        }
+    }
+
+    private fun applyHaloClampedSharpen(mat8u: Mat, amount: Double, sigma: Double) {
+        val blur = lwBlurMat ?: Mat().also { lwBlurMat = it }
+        val detail = lwDetailMat ?: Mat().also { lwDetailMat = it }
+        val minN = lwMinNMat ?: Mat().also { lwMinNMat = it }
+        val maxN = lwMaxNMat ?: Mat().also { lwMaxNMat = it }
+        val kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(3.0, 3.0))
+        try {
+            Imgproc.erode(mat8u, minN, kernel)
+            Imgproc.dilate(mat8u, maxN, kernel)
+            Imgproc.GaussianBlur(mat8u, blur, Size(0.0, 0.0), sigma)
+            Core.addWeighted(mat8u, 1.0 + amount, blur, -amount, 0.0, detail)
+            // Clamp overshoot to 3x3 neighborhood bounds to avoid white/black halo ringing
+            Core.max(detail, minN, detail)
+            Core.min(detail, maxN, mat8u)
+        } finally {
+            kernel.release()
+        }
     }
 
     private fun enhanceFaceRegionsWithSr(
@@ -951,11 +1079,7 @@ class OnnxAiInferenceEngine(private val context: Context) {
             )
             if (gpuOk) return out
         }
-        val blur = lwBlurMat ?: Mat().also { lwBlurMat = it }
-        val detail = lwDetailMat ?: Mat().also { lwDetailMat = it }
-        Imgproc.GaussianBlur(out, blur, Size(0.0, 0.0), 1.0)
-        Core.addWeighted(out, 1.0 + sharpnessBoost, blur, -sharpnessBoost.toDouble(), 0.0, detail)
-        detail.copyTo(out)
+        applyHaloClampedSharpen(out, amount = sharpnessBoost.toDouble().coerceIn(0.08, 0.52), sigma = 1.05)
         return out
     }
 
@@ -1244,6 +1368,9 @@ class OnnxAiInferenceEngine(private val context: Context) {
         dncnnWeightMat?.release(); dncnnWeightMat = null
         dncnnWeightedMat?.release(); dncnnWeightedMat = null
         dncnnU8Mat?.release(); dncnnU8Mat = null
+        dncnnResidualF?.release(); dncnnResidualF = null
+        dncnnResidualUpF?.release(); dncnnResidualUpF = null
+        dncnnYFloatMat?.release(); dncnnYFloatMat = null
 
         tileChannelsA?.forEach { it.release() }; tileChannelsA = null
         tileChannelsB?.forEach { it.release() }; tileChannelsB = null
@@ -1259,6 +1386,9 @@ class OnnxAiInferenceEngine(private val context: Context) {
         srcRgbMat?.release(); srcRgbMat = null
         srWorkRgbMat?.release(); srWorkRgbMat = null
         baseRgb8u?.release(); baseRgb8u = null
+        baseLowBlur8u?.release(); baseLowBlur8u = null
+        baseHighDetailS16?.release(); baseHighDetailS16 = null
+        outRgbS16?.release(); outRgbS16 = null
         accumRgbMat?.release(); accumRgbMat = null
         accumWeightMat?.release(); accumWeightMat = null
         invWeightSingleMat?.release(); invWeightSingleMat = null
@@ -1276,6 +1406,9 @@ class OnnxAiInferenceEngine(private val context: Context) {
 
         lwBlurMat?.release(); lwBlurMat = null
         lwDetailMat?.release(); lwDetailMat = null
+        lwBlurFineMat?.release(); lwBlurFineMat = null
+        lwMinNMat?.release(); lwMinNMat = null
+        lwMaxNMat?.release(); lwMaxNMat = null
         clearFeatherCache()
     }
 
