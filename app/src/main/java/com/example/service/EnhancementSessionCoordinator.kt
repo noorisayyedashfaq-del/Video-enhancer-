@@ -155,7 +155,7 @@ class EnhancementSessionCoordinator private constructor(
                 val caps = _uiState.value.deviceCapabilities ?: capabilityDetector.detect()
                 val profiles = _uiState.value.profiles.ifEmpty { profileRepository.loadProfiles() }
                 val dimsMap = EnhancementMode.entries.associateWith { mode ->
-                    ResolutionCalculator.calculate(metadata, mode, profiles.getValue(mode), caps)
+                    ResolutionCalculator.calculate(metadata, mode, resolveProfile(profiles, mode), caps)
                 }
                 _uiState.update { state ->
                     if (state.selectedVideo != null) state else state.copy(
@@ -191,7 +191,7 @@ class EnhancementSessionCoordinator private constructor(
                         prefs.edit().putString(KEY_SELECTED_VIDEO_URI, uri.toString()).apply()
                         val profiles = _uiState.value.profiles.ifEmpty { profileRepository.loadProfiles() }
                         val dimsMap = EnhancementMode.entries.associateWith { mode ->
-                            ResolutionCalculator.calculate(metadata, mode, profiles.getValue(mode), caps)
+                            ResolutionCalculator.calculate(metadata, mode, resolveProfile(profiles, mode), caps)
                         }
                         _uiState.update {
                             it.copy(
@@ -292,7 +292,7 @@ class EnhancementSessionCoordinator private constructor(
 
         val mode = current.selectedMode
         val profiles = current.profiles.ifEmpty { profileRepository.loadProfiles() }
-        val profile = profiles.getValue(mode)
+        val profile = resolveProfile(profiles, mode)
         val caps = capabilityDetector.detect()
 
         val initialProgress = ProcessingProgress(
@@ -508,8 +508,8 @@ class EnhancementSessionCoordinator private constructor(
 
     fun onTrimMemory() {
         if (!jobRunningLock.get()) {
-            onnxEngine.releaseWorkBuffers()
-            frameProcessor.resetTemporalState()
+            runCatching { onnxEngine.releaseWorkBuffers() }
+            runCatching { frameProcessor.resetTemporalState() }
         }
     }
 
@@ -532,6 +532,13 @@ class EnhancementSessionCoordinator private constructor(
 
     private fun clearInterruptedNotice() {
         prefs.edit().remove(KEY_INTERRUPTED_NOTICE).apply()
+    }
+
+    private fun resolveProfile(
+        profiles: Map<EnhancementMode, com.example.model.EnhancementProfile>,
+        mode: EnhancementMode
+    ): com.example.model.EnhancementProfile {
+        return profiles[mode] ?: profileRepository.loadProfiles().getValue(mode)
     }
 
     companion object {

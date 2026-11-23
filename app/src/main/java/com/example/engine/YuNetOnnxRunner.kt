@@ -174,14 +174,38 @@ class YuNetOnnxRunner(private val env: OrtEnvironment) {
         vulkanAvailable: Boolean,
         logger: EngineDiagnosticsLogger? = null
     ): ModelExecutionPlan {
+        return benchmarkAndSelectBestFactories(
+            yunetPath = yunetPath,
+            candidateFactories = candidateOrtSessions.map { (id, threads, sess) ->
+                Triple(id, threads) { sess }
+            },
+            openClAvailable = openClAvailable,
+            vulkanAvailable = vulkanAvailable,
+            logger = logger
+        )
+    }
+
+    @Synchronized
+    fun benchmarkAndSelectBestFactories(
+        yunetPath: String,
+        candidateFactories: List<Triple<BackendCandidateId, Int, () -> OrtSession?>>,
+        openClAvailable: Boolean,
+        vulkanAvailable: Boolean,
+        logger: EngineDiagnosticsLogger? = null
+    ): ModelExecutionPlan {
         close()
         modelPath = yunetPath
         val benchmarks = ArrayList<ModelBackendBenchmark>()
         var cpuReferenceLogits: FloatArray? = null
 
-        // 1. Evaluate CPU XNNPACK / ORT baseline first (captures reference tensor for numerical parity)
-        val orderedOrt = candidateOrtSessions.sortedBy { it.first.kind != AcceleratorKind.CPU }
-        for ((backendId, threads, sess) in orderedOrt) {
+        // 1. Evaluate CPU XNNPACK / ORT baseline first (sequentially one-at-a-time to avoid RAM spikes)
+        val orderedFactories = candidateFactories.sortedBy { it.first.kind != AcceleratorKind.CPU }
+        for ((backendId, threads, factory) in orderedFactories) {
+            val sess = runCatching { factory() }.getOrNull()
+            if (sess == null) {
+                logger?.info("YuNet: ${backendId.displayLabel} skipped during init")
+                continue
+            }
             val res = benchmarkOrtYuNet(sess, backendId, threads, cpuReferenceLogits, logger)
             if (res.first.verifiedFullOffload && res.first.numericalParityOk && backendId.kind == AcceleratorKind.CPU && cpuReferenceLogits == null) {
                 cpuReferenceLogits = res.second
@@ -380,9 +404,11 @@ class YuNetOnnxRunner(private val env: OrtEnvironment) {
         targetId: Int,
         logger: EngineDiagnosticsLogger?
     ): Long? {
-        val mat = Mat(probeSize, probeSize, CvType.CV_8UC3)
-        val out = Mat()
+        var mat: Mat? = null
+        var out: Mat? = null
         return try {
+            mat = Mat(probeSize, probeSize, CvType.CV_8UC3)
+            out = Mat()
             mat.setTo(org.opencv.core.Scalar(110.0, 125.0, 140.0))
             val det = FaceDetectorYN.create(
                 yunetPath,
@@ -406,8 +432,8 @@ class YuNetOnnxRunner(private val env: OrtEnvironment) {
             logger?.info("OpenCV FaceDetectorYN target=$targetId skipped (${t.message})")
             null
         } finally {
-            mat.release()
-            out.release()
+            runCatching { mat?.release() }
+            runCatching { out?.release() }
         }
     }
 

@@ -45,9 +45,11 @@ data class TileProcessOutcome(
 
 class OnnxAiInferenceEngine(private val context: Context) {
 
-    private val env: OrtEnvironment by lazy { OrtEnvironment.getEnvironment() }
+    private val envLazy = lazy { OrtEnvironment.getEnvironment() }
+    private val env: OrtEnvironment get() = envLazy.value
     val gpuProcessor: GlesGpuImageProcessor = GlesGpuImageProcessor()
-    val yuNetRunner: YuNetOnnxRunner by lazy { YuNetOnnxRunner(env) }
+    private val yuNetRunnerLazy = lazy { YuNetOnnxRunner(env) }
+    val yuNetRunner: YuNetOnnxRunner get() = yuNetRunnerLazy.value
     private val hwAccelerator: AdaptiveHardwareAccelerator by lazy {
         AdaptiveHardwareAccelerator(context, env)
     }
@@ -151,19 +153,25 @@ class OnnxAiInferenceEngine(private val context: Context) {
         }
         val t0 = System.currentTimeMillis()
         val modelDir = File(context.filesDir, "ai_models").apply { mkdirs() }
-        val srFile = ensureAssetCopied(
+        fun copySafe(assetPath: String, dest: File): File = runCatching {
+            ensureAssetCopied(assetPath, dest)
+        }.onFailure { err ->
+            logger?.warn("Asset copy failed for $assetPath: ${err.message}")
+        }.getOrDefault(dest)
+
+        val srFile = copySafe(
             "ai_models/realesrgan/realesr_general_x4v3.onnx",
             File(modelDir, "realesrgan/realesr_general_x4v3.onnx")
         )
-        val dncnnFile = ensureAssetCopied(
+        val dncnnFile = copySafe(
             "ai_models/denoise/dncnn.onnx",
             File(modelDir, "denoise/dncnn.onnx")
         )
-        ensureAssetCopied(
+        copySafe(
             "ai_models/denoise/dncnn.data",
             File(modelDir, "denoise/dncnn.data")
         )
-        val yunetFile = ensureAssetCopied(
+        val yunetFile = copySafe(
             "ai_models/face_enhancement/face_detection_yunet_2023mar.onnx",
             File(modelDir, "face_enhancement/face_detection_yunet_2023mar.onnx")
         )
@@ -1141,7 +1149,9 @@ class OnnxAiInferenceEngine(private val context: Context) {
     fun releaseWorkBuffers() {
         srTileCache.reset()
         dncnnTileCache.reset()
-        yuNetRunner.releaseWorkBuffers()
+        if (yuNetRunnerLazy.isInitialized()) {
+            yuNetRunner.releaseWorkBuffers()
+        }
 
         tilePrepExecutor?.shutdownNow()
         tilePrepExecutor = null
@@ -1230,7 +1240,9 @@ class OnnxAiInferenceEngine(private val context: Context) {
         dncnnRankedSessions = emptyList()
         srActiveIndex = 0
         dncnnActiveIndex = 0
-        yuNetRunner.close()
+        if (yuNetRunnerLazy.isInitialized()) {
+            yuNetRunner.close()
+        }
     }
 
     fun close() {

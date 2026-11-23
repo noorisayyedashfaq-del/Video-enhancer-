@@ -373,7 +373,7 @@ private fun SelectVideoSection(
                     )
                     Text(
                         text = if (selectedVideo != null) {
-                            "${selectedVideo.resolutionLabel} • ${String.format("%.1f", selectedVideo.fps)} fps • " +
+                            "${selectedVideo.resolutionLabel} • ${String.format(java.util.Locale.US, "%.1f", selectedVideo.fps)} fps • " +
                                 "${selectedVideo.durationMs / 1000}s • ${if (selectedVideo.hasAudio) "Audio" else "Muted"}"
                         } else {
                             "MP4, MOV, MKV, WebM • Zero cloud upload"

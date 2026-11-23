@@ -21,6 +21,7 @@ import java.nio.ByteOrder
 import java.util.EnumSet
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.min
 
 /**
@@ -129,17 +130,20 @@ class AdaptiveHardwareAccelerator(
 
         // 3. Face AI (YuNet) [1, 3, 320, 320] across ORT (GPU/NPU/XNNPACK) & OpenCV (OpenCL/Vulkan/CPU)
         val facePlan = if (yunetFile.exists() && yunetFile.length() > 0L) {
-            val faceOrtCandidates = buildCandidateSessions(
-                modelKind = ModelKind.FACE_YUNET,
-                modelFile = yunetFile,
+            val faceSpecs = buildCandidateSpecs(
                 probe = probe,
                 availableProviders = availableProviders,
-                threadCandidates = threadCandidates,
-                logger = logger
+                threadCandidates = threadCandidates
             )
-            yunetRunner.benchmarkAndSelectBest(
+            val faceFactories = faceSpecs.map { (backendId, threads) ->
+                Triple(backendId, threads) {
+                    createSessionForBackend(yunetFile, ModelKind.FACE_YUNET, backendId, threads, availableProviders)
+                }
+            }
+            yuNetRunnerSafeBenchmark(
+                yunetRunner = yunetRunner,
                 yunetPath = yunetFile.absolutePath,
-                candidateOrtSessions = faceOrtCandidates,
+                candidateFactories = faceFactories,
                 openClAvailable = probe.openClSupported,
                 vulkanAvailable = probe.vulkanComputeSupported,
                 logger = logger
@@ -196,10 +200,10 @@ class AdaptiveHardwareAccelerator(
                 .getOrDefault(EnumSet.of(OrtProvider.CPU))
 
             val srSessions = recreateRankedSessions(srFile, ModelKind.REAL_ESRGAN, srPlan, probe, availableProviders)
-            if (srFile.exists() && srSessions.isEmpty()) return null
+            if (srFile.exists() && srPlan.fallbackChain.isNotEmpty() && srSessions.isEmpty()) return null
 
             val dnSessions = recreateRankedSessions(dncnnFile, ModelKind.DNCNN, dnPlan, probe, availableProviders)
-            if (dncnnFile.exists() && dnSessions.isEmpty()) {
+            if (dncnnFile.exists() && dnPlan.fallbackChain.isNotEmpty() && dnSessions.isEmpty()) {
                 srSessions.forEach { runCatching { it.second.close() } }
                 return null
             }
@@ -259,6 +263,28 @@ class AdaptiveHardwareAccelerator(
         return list
     }
 
+    private fun yuNetRunnerSafeBenchmark(
+        yunetRunner: YuNetOnnxRunner,
+        yunetPath: String,
+        candidateFactories: List<Triple<BackendCandidateId, Int, () -> OrtSession?>>,
+        openClAvailable: Boolean,
+        vulkanAvailable: Boolean,
+        logger: EngineDiagnosticsLogger?
+    ): ModelExecutionPlan {
+        return try {
+            yunetRunner.benchmarkAndSelectBestFactories(
+                yunetPath = yunetPath,
+                candidateFactories = candidateFactories,
+                openClAvailable = openClAvailable,
+                vulkanAvailable = vulkanAvailable,
+                logger = logger
+            )
+        } catch (t: Throwable) {
+            logger?.warn("YuNet benchmark fallback (${t.message})")
+            AdaptiveHardwareSelector.selectPlanForModel(ModelKind.FACE_YUNET, emptyList())
+        }
+    }
+
     private fun benchmarkOnnxModelCandidates(
         modelKind: ModelKind,
         modelFile: File,
@@ -269,22 +295,24 @@ class AdaptiveHardwareAccelerator(
         threadCandidates: List<Pair<BackendCandidateId, Int>>,
         logger: EngineDiagnosticsLogger?
     ): Pair<ModelExecutionPlan, List<Pair<BackendCandidateId, OrtSession>>> {
-        val built = buildCandidateSessions(
-            modelKind = modelKind,
-            modelFile = modelFile,
+        val specs = buildCandidateSpecs(
             probe = probe,
             availableProviders = availableProviders,
-            threadCandidates = threadCandidates,
-            logger = logger
+            threadCandidates = threadCandidates
         )
 
-        val benchmarks = ArrayList<ModelBackendBenchmark>(built.size)
+        val benchmarks = ArrayList<ModelBackendBenchmark>(specs.size)
         val verifiedSessions = LinkedHashMap<BackendCandidateId, Pair<ModelBackendBenchmark, OrtSession>>()
         var cpuRefSamples: FloatArray? = null
 
-        // Run CPU candidates first to lock FP32 reference baseline for hardware parity validation
-        val ordered = built.sortedBy { it.first.kind != AcceleratorKind.CPU }
-        for ((backendId, threads, sess) in ordered) {
+        // Evaluate strictly one session at a time (CPU first to lock FP32 parity baseline)
+        val ordered = specs.sortedBy { it.first.kind != AcceleratorKind.CPU }
+        for ((backendId, threads) in ordered) {
+            val sess = createSessionForBackend(modelFile, modelKind, backendId, threads, availableProviders)
+            if (sess == null) {
+                logger?.info("${modelKind.shortTag}: ${backendId.displayLabel} skipped during init")
+                continue
+            }
             val eval = evaluateOrtModelSession(
                 session = sess,
                 backendId = backendId,
@@ -295,19 +323,22 @@ class AdaptiveHardwareAccelerator(
                 timeoutSec = 8L,
                 logger = logger
             )
-            if (eval.first.verifiedFullOffload && eval.first.numericalParityOk && backendId.kind == AcceleratorKind.CPU && cpuRefSamples == null) {
-                cpuRefSamples = eval.second
+            if (eval.bench.verifiedFullOffload && eval.bench.numericalParityOk && backendId.kind == AcceleratorKind.CPU && cpuRefSamples == null) {
+                cpuRefSamples = eval.samples
             }
-            benchmarks.add(eval.first)
-            if (eval.first.verifiedFullOffload && eval.first.numericalParityOk && eval.first.medianLatencyMs != null) {
+            benchmarks.add(eval.bench)
+            val medMs = eval.bench.medianLatencyMs
+            if (eval.bench.verifiedFullOffload && eval.bench.numericalParityOk && medMs != null) {
                 val existing = verifiedSessions[backendId]
-                if (existing == null || eval.first.medianLatencyMs!! < existing.first.medianLatencyMs!!) {
+                val existingMed = existing?.first?.medianLatencyMs
+                if (existing == null || existingMed == null || medMs < existingMed) {
                     existing?.second?.let { runCatching { it.close() } }
-                    verifiedSessions[backendId] = eval.first to sess
+                    verifiedSessions[backendId] = eval.bench to sess
                 } else {
                     runCatching { sess.close() }
                 }
-            } else {
+            } else if (!eval.deferredCloseArmed) {
+                // Only close immediately when native session.run() is no longer active
                 runCatching { sess.close() }
             }
         }
@@ -325,46 +356,25 @@ class AdaptiveHardwareAccelerator(
         return plan to rankedSessions
     }
 
-    private fun buildCandidateSessions(
-        modelKind: ModelKind,
-        modelFile: File,
+    private fun buildCandidateSpecs(
         probe: HardwareProbeSnapshot,
         availableProviders: EnumSet<OrtProvider>,
-        threadCandidates: List<Pair<BackendCandidateId, Int>>,
-        logger: EngineDiagnosticsLogger?
-    ): List<Triple<BackendCandidateId, Int, OrtSession>> {
-        val list = ArrayList<Triple<BackendCandidateId, Int, OrtSession>>()
-
-        // CPU XNNPACK candidates (Big-core pinned + multi-thread)
+        threadCandidates: List<Pair<BackendCandidateId, Int>>
+    ): List<Pair<BackendCandidateId, Int>> {
+        val list = ArrayList<Pair<BackendCandidateId, Int>>()
         for ((cpuId, threads) in threadCandidates) {
-            createSessionForBackend(modelFile, modelKind, cpuId, threads, availableProviders)?.let {
-                list.add(Triple(cpuId, threads, it))
-            }
+            list.add(cpuId to threads)
         }
         if (list.isEmpty()) {
-            createSessionForBackend(modelFile, modelKind, BackendCandidateId.ORT_CPU, 4, availableProviders)?.let {
-                list.add(Triple(BackendCandidateId.ORT_CPU, 4, it))
-            }
+            list.add(BackendCandidateId.ORT_CPU to 4)
         }
-
-        // Hardware GPU / NPU candidates
-        val hwTargets = buildList {
-            if (probe.qnnGpuAvailable) add(BackendCandidateId.QNN_GPU)
-            if (probe.qnnHtpAvailable) add(BackendCandidateId.QNN_HTP)
-            if (probe.nnapiSupported && availableProviders.contains(OrtProvider.NNAPI)) {
-                if (probe.nnapiGpuDetected) add(BackendCandidateId.NNAPI_GPU)
-                if (probe.nnapiNpuDetected) add(BackendCandidateId.NNAPI_NPU)
-                add(BackendCandidateId.NNAPI_AUTO)
-            }
-        }
-        val hwHelperThreads = probe.cpuTopology.bigCoreCount.coerceIn(2, 4)
-        for (hwId in hwTargets) {
-            val sess = createSessionForBackend(modelFile, modelKind, hwId, hwHelperThreads, availableProviders)
-            if (sess != null) {
-                list.add(Triple(hwId, hwHelperThreads, sess))
-            } else {
-                logger?.info("${modelKind.shortTag}: ${hwId.displayLabel} skipped during init")
-            }
+        if (probe.qnnGpuAvailable) list.add(BackendCandidateId.QNN_GPU to probe.cpuTopology.bigCoreCount.coerceIn(2, 4))
+        if (probe.qnnHtpAvailable) list.add(BackendCandidateId.QNN_HTP to probe.cpuTopology.bigCoreCount.coerceIn(2, 4))
+        if (probe.nnapiSupported && availableProviders.contains(OrtProvider.NNAPI)) {
+            val hwHelperThreads = probe.cpuTopology.bigCoreCount.coerceIn(2, 4)
+            if (probe.nnapiGpuDetected) list.add(BackendCandidateId.NNAPI_GPU to hwHelperThreads)
+            if (probe.nnapiNpuDetected) list.add(BackendCandidateId.NNAPI_NPU to hwHelperThreads)
+            list.add(BackendCandidateId.NNAPI_AUTO to hwHelperThreads)
         }
         return list
     }
@@ -376,7 +386,17 @@ class AdaptiveHardwareAccelerator(
         threads: Int,
         availableProviders: EnumSet<OrtProvider>
     ): OrtSession? {
-        return try {
+        val isXnnpackCpu = backendId == BackendCandidateId.ORT_XNNPACK_BIG ||
+            backendId == BackendCandidateId.ORT_XNNPACK_ALL
+        val cacheFile = if (isXnnpackCpu && modelKind != ModelKind.DNCNN) {
+            File(ortCacheDir, "${modelKind.id.lowercase()}_${backendId.name.lowercase()}_t${threads}_v${resolveAppVersionCode()}.ort").also {
+                if (it.exists() && it.length() == 0L) it.delete()
+            }
+        } else {
+            null
+        }
+
+        fun buildAndCreate(ortCache: File?): OrtSession {
             val opts = OrtSession.SessionOptions().apply {
                 setExecutionMode(OrtSession.SessionOptions.ExecutionMode.SEQUENTIAL)
                 setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
@@ -435,18 +455,26 @@ class AdaptiveHardwareAccelerator(
                     else -> throw IllegalStateException("Unsupported ORT candidate $backendId")
                 }
 
-                // Persist optimized compiled graph once for CPU/XNNPACK so subsequent cold-starts skip graph passes
-                if (backendId == BackendCandidateId.ORT_XNNPACK_BIG || backendId == BackendCandidateId.ORT_XNNPACK_ALL) {
-                    val cacheFile = File(ortCacheDir, "${modelKind.id.lowercase()}_${backendId.name.lowercase()}.ort")
-                    // DnCNN uses external weights (.data); skip .ort rewrite for external-data models safely
-                    if (modelKind != ModelKind.DNCNN) {
-                        setOptimizedModelFilePath(cacheFile.absolutePath)
-                    }
+                if (ortCache != null) {
+                    setOptimizedModelFilePath(ortCache.absolutePath)
                 }
             }
-            env.createSession(modelFile.absolutePath, opts)
+            return try {
+                env.createSession(modelFile.absolutePath, opts)
+            } finally {
+                runCatching { opts.close() }
+            }
+        }
+
+        return try {
+            buildAndCreate(cacheFile)
         } catch (_: Throwable) {
-            null
+            if (cacheFile != null) {
+                runCatching { cacheFile.delete() }
+                runCatching { buildAndCreate(null) }.getOrNull()
+            } else {
+                null
+            }
         }
     }
 
@@ -469,6 +497,12 @@ class AdaptiveHardwareAccelerator(
         }
     }
 
+    private data class SessionEvalOutcome(
+        val bench: ModelBackendBenchmark,
+        val samples: FloatArray?,
+        val deferredCloseArmed: Boolean = false
+    )
+
     private fun evaluateOrtModelSession(
         session: OrtSession,
         backendId: BackendCandidateId,
@@ -478,93 +512,110 @@ class AdaptiveHardwareAccelerator(
         referenceSamples: FloatArray?,
         timeoutSec: Long,
         logger: EngineDiagnosticsLogger?
-    ): Pair<ModelBackendBenchmark, FloatArray?> {
+    ): SessionEvalOutcome {
         val executor = Executors.newSingleThreadExecutor()
+        val nativeActive = AtomicBoolean(true)
+        val callerTimedOut = AtomicBoolean(false)
         return try {
             val future = executor.submit<Pair<ModelBackendBenchmark, FloatArray?>> {
-                val inputName = session.inputNames.first()
-                val totalFloats = shape.fold(1L) { acc, v -> acc * v }.toInt()
-                val direct = ByteBuffer.allocateDirect(totalFloats * 4).order(ByteOrder.nativeOrder())
-                val fBuf = direct.asFloatBuffer()
-                for (i in 0 until totalFloats) {
-                    fBuf.put(i, ((i * 29) % 255) / 255f)
-                }
-                fBuf.rewind()
-
-                var extractedSample: FloatArray? = null
-
-                // Warmup + Shape + Numerical Parity Verification
-                OnnxTensor.createTensor(env, fBuf, shape).use { tWarm ->
-                    session.run(mapOf(inputName to tWarm)).use { res ->
-                        val outTensor = res[0] as? OnnxTensor
-                            ?: return@submit ModelBackendBenchmark(
-                                backendId, backendId.kind, backendId.displayLabel, threads,
-                                rejectedReason = "Non-tensor output"
-                            ) to null
-                        val outBuf = outTensor.floatBuffer
-                        if (outBuf.remaining() < minOutputElems) {
-                            return@submit ModelBackendBenchmark(
-                                backendId, backendId.kind, backendId.displayLabel, threads,
-                                rejectedReason = "Output size ${outBuf.remaining()} < $minOutputElems"
-                            ) to null
-                        }
-                        val sampleStep = (outBuf.remaining() / 512).coerceAtLeast(1)
-                        val arr = FloatArray(min(512, outBuf.remaining()))
-                        for (idx in arr.indices) {
-                            arr[idx] = outBuf.get((idx * sampleStep).coerceAtMost(outBuf.remaining() - 1))
-                        }
-                        extractedSample = arr
+                try {
+                    val inputName = session.inputNames.first()
+                    val totalFloats = shape.fold(1L) { acc, v -> acc * v }.toInt()
+                    val direct = ByteBuffer.allocateDirect(totalFloats * 4).order(ByteOrder.nativeOrder())
+                    val fBuf = direct.asFloatBuffer()
+                    for (i in 0 until totalFloats) {
+                        fBuf.put(i, ((i * 29) % 255) / 255f)
                     }
-                }
+                    fBuf.rewind()
 
-                val parity = AdaptiveHardwareSelector.verifyNumericalOutput(
-                    candidateSamples = extractedSample ?: FloatArray(0),
-                    referenceSamples = referenceSamples
-                )
-                if (!parity.valid) {
-                    return@submit ModelBackendBenchmark(
+                    var extractedSample: FloatArray? = null
+
+                    // Warmup + Shape + Numerical Parity Verification
+                    OnnxTensor.createTensor(env, fBuf, shape).use { tWarm ->
+                        session.run(mapOf(inputName to tWarm)).use { res ->
+                            val outTensor = res[0] as? OnnxTensor
+                                ?: return@submit ModelBackendBenchmark(
+                                    backendId, backendId.kind, backendId.displayLabel, threads,
+                                    rejectedReason = "Non-tensor output"
+                                ) to null
+                            val outBuf = outTensor.floatBuffer
+                            if (outBuf.remaining() < minOutputElems) {
+                                return@submit ModelBackendBenchmark(
+                                    backendId, backendId.kind, backendId.displayLabel, threads,
+                                    rejectedReason = "Output size ${outBuf.remaining()} < $minOutputElems"
+                                ) to null
+                            }
+                            val sampleStep = (outBuf.remaining() / 512).coerceAtLeast(1)
+                            val arr = FloatArray(min(512, outBuf.remaining()))
+                            for (idx in arr.indices) {
+                                arr[idx] = outBuf.get((idx * sampleStep).coerceAtMost(outBuf.remaining() - 1))
+                            }
+                            extractedSample = arr
+                        }
+                    }
+
+                    val parity = AdaptiveHardwareSelector.verifyNumericalOutput(
+                        candidateSamples = extractedSample ?: FloatArray(0),
+                        referenceSamples = referenceSamples
+                    )
+                    if (!parity.valid) {
+                        return@submit ModelBackendBenchmark(
+                            backendId = backendId,
+                            kind = backendId.kind,
+                            displayLabel = backendId.displayLabel,
+                            threads = threads,
+                            verifiedFullOffload = true,
+                            numericalParityOk = false,
+                            rejectedReason = parity.reason
+                        ) to null
+                    }
+
+                    // Multi-run benchmark for reliable sustained median latency
+                    val runs = ArrayList<Long>(3)
+                    for (r in 0 until 3) {
+                        if (callerTimedOut.get()) break
+                        fBuf.rewind()
+                        val t0 = System.nanoTime()
+                        OnnxTensor.createTensor(env, fBuf, shape).use { tRun ->
+                            session.run(mapOf(inputName to tRun)).use { }
+                        }
+                        runs.add(((System.nanoTime() - t0) / 1_000_000L).coerceAtLeast(1L))
+                    }
+
+                    val med = AdaptiveHardwareSelector.medianMs(runs)
+                    ModelBackendBenchmark(
                         backendId = backendId,
                         kind = backendId.kind,
                         displayLabel = backendId.displayLabel,
                         threads = threads,
+                        medianLatencyMs = med,
                         verifiedFullOffload = true,
-                        numericalParityOk = false,
-                        rejectedReason = parity.reason
-                    ) to null
-                }
-
-                // Multi-run benchmark for reliable sustained median latency
-                val runs = ArrayList<Long>(3)
-                for (r in 0 until 3) {
-                    fBuf.rewind()
-                    val t0 = System.nanoTime()
-                    OnnxTensor.createTensor(env, fBuf, shape).use { tRun ->
-                        session.run(mapOf(inputName to tRun)).use { }
+                        numericalParityOk = true
+                    ) to extractedSample
+                } finally {
+                    nativeActive.set(false)
+                    if (callerTimedOut.get()) {
+                        // Safe deferred close after native session.run() unwinds, preventing SIGSEGV use-after-free
+                        runCatching { session.close() }
                     }
-                    runs.add(((System.nanoTime() - t0) / 1_000_000L).coerceAtLeast(1L))
                 }
-
-                val med = AdaptiveHardwareSelector.medianMs(runs)
-                ModelBackendBenchmark(
+            }
+            val result = future.get(timeoutSec, TimeUnit.SECONDS)
+            SessionEvalOutcome(result.first, result.second, deferredCloseArmed = false)
+        } catch (t: Throwable) {
+            callerTimedOut.set(nativeActive.get())
+            logger?.info("${backendId.displayLabel} rejected during verification (${t.message})")
+            SessionEvalOutcome(
+                bench = ModelBackendBenchmark(
                     backendId = backendId,
                     kind = backendId.kind,
                     displayLabel = backendId.displayLabel,
                     threads = threads,
-                    medianLatencyMs = med,
-                    verifiedFullOffload = true,
-                    numericalParityOk = true
-                ) to extractedSample
-            }
-            future.get(timeoutSec, TimeUnit.SECONDS)
-        } catch (t: Throwable) {
-            logger?.info("${backendId.displayLabel} rejected during verification (${t.message})")
-            ModelBackendBenchmark(
-                backendId = backendId,
-                kind = backendId.kind,
-                displayLabel = backendId.displayLabel,
-                threads = threads,
-                rejectedReason = t.message ?: "Execution failed or timed out"
-            ) to null
+                    rejectedReason = t.message ?: "Execution failed or timed out"
+                ),
+                samples = null,
+                deferredCloseArmed = nativeActive.get()
+            )
         } finally {
             executor.shutdownNow()
         }
