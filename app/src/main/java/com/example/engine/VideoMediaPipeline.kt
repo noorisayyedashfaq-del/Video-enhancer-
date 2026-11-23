@@ -231,6 +231,11 @@ class VideoMediaPipeline(
                     ?.get(com.example.model.ModelKind.REAL_ESRGAN)
                     ?.measuredLatencyMs
                     ?: 90L
+                val dnLatencyMs = onnxEngine.adaptiveProfile
+                    ?.plans
+                    ?.get(com.example.model.ModelKind.DNCNN)
+                    ?.measuredLatencyMs
+                    ?: 10L
                 val presetTileSize = outDims.aiTileSize
                 val budgetGovernor = SpeedBudgetGovernor(
                     mode = mode,
@@ -239,7 +244,8 @@ class VideoMediaPipeline(
                     presetTileSize = presetTileSize,
                     presetTilesCap = outDims.tilesPerFrame,
                     measuredSrTileMs = srLatencyMs,
-                    deviceCapacityScore = capabilities.processingCapacityScore
+                    deviceCapacityScore = capabilities.processingCapacityScore,
+                    measuredDnCnnMs = dnLatencyMs
                 )
                 val modeBudgetFrameMs = budgetGovernor.targetMsPerFrame.roundToLong().coerceAtLeast(15L)
 
@@ -290,6 +296,8 @@ class VideoMediaPipeline(
 
                 var totalFacesEnhanced = 0
                 var usedAiDenoiseAny = false
+                var dncnnFramesProcessed = 0
+                var dncnnAsyncPrefetchHits = 0
                 var recoveredFrames = 0
                 var processedCount = 0
                 var duplicateFramesReused = 0
@@ -381,9 +389,13 @@ class VideoMediaPipeline(
                     var prevRawBgr: Mat? = null
                     var prevFramePtsUs: Long = -1L
                     val interpScratchBgr = if (adaptiveParams.enableSmoothness) Mat() else null
+                    var pendingDnCnnPrefetch: OnnxAiInferenceEngine.DnCnnPrefetchToken? = null
+                    var queuedNextItem: DecodedFrame? = frameChannel.receiveCatching().getOrNull()
 
                     try {
-                        for (item in frameChannel) {
+                        while (queuedNextItem != null) {
+                            val item = queuedNextItem
+                            queuedNextItem = frameChannel.tryReceive().getOrNull()
                             if (cancelled.get()) {
                                 if (item.fromDecoderPool) activeFastDecoder?.recycleMat(item.bgrMat) else item.bgrMat?.release()
                                 item.diskFile?.delete()
@@ -460,8 +472,8 @@ class VideoMediaPipeline(
                                             val midPtsUs = prevFramePtsUs + ((currPtsUs - prevFramePtsUs) / 2L).coerceAtLeast(1_000L)
                                             val interpBitmap = if ((encodeSlotIndex and 1) == 0) bmpA else bmpB
                                             encodeSlotIndex++
-                                            val interpDecision = speedDecision.copy(allowFaceDetect = false, allowDnCnn = false)
-                                            frameProcessor.processFrame(
+                                            val interpDecision = speedDecision.copy(allowFaceDetect = false, allowDnCnn = true)
+                                            val interpResult = frameProcessor.processFrame(
                                                 srcBgr = interpScratchBgr,
                                                 outDims = outDims,
                                                 params = adaptiveParams,
@@ -476,6 +488,13 @@ class VideoMediaPipeline(
                                                 speedDecision = interpDecision,
                                                 modeBudgetFrameMs = modeBudgetFrameMs
                                             )
+                                            if (interpResult.usedAiDenoise) {
+                                                usedAiDenoiseAny = true
+                                                dncnnFramesProcessed++
+                                            }
+                                            if (interpResult.dncnnInferenceMs > 0L) {
+                                                logger.dncnnInferenceMs.addAndGet(interpResult.dncnnInferenceMs)
+                                            }
                                             lastCompletedBitmap = interpBitmap
                                             activeEncoder.enqueueFrameAsyncWithPts(interpBitmap, midPtsUs)
                                             interpolatedFramesCount++
@@ -487,6 +506,9 @@ class VideoMediaPipeline(
 
                                 val targetBitmap = if ((encodeSlotIndex and 1) == 0) bmpA else bmpB
                                 encodeSlotIndex++
+
+                                val currentPrefetchToken = pendingDnCnnPrefetch
+                                pendingDnCnnPrefetch = null
 
                                 val frameResult = frameProcessor.processFrame(
                                     srcBgr = bgr,
@@ -523,10 +545,33 @@ class VideoMediaPipeline(
                                         }
                                     },
                                     speedDecision = speedDecision,
-                                    modeBudgetFrameMs = modeBudgetFrameMs
+                                    modeBudgetFrameMs = modeBudgetFrameMs,
+                                    prefetchedDnCnnToken = currentPrefetchToken,
+                                    onDnCnnStageComplete = {
+                                        if (queuedNextItem == null) {
+                                            queuedNextItem = frameChannel.tryReceive().getOrNull()
+                                        }
+                                        val nextBgr = queuedNextItem?.bgrMat
+                                        if (adaptiveParams.useAiDenoise &&
+                                            nextBgr != null &&
+                                            !nextBgr.empty() &&
+                                            !cancelled.get()
+                                        ) {
+                                            pendingDnCnnPrefetch = onnxEngine.prefetchDnCnnAsync(
+                                                frameIndex = queuedNextItem!!.index,
+                                                srcBgr = nextBgr,
+                                                strength = adaptiveParams.dncnnStrength,
+                                                logger = logger
+                                            )
+                                        }
+                                    }
                                 )
                                 totalFacesEnhanced += frameResult.facesEnhanced
-                                if (frameResult.usedAiDenoise) usedAiDenoiseAny = true
+                                if (frameResult.usedAiDenoise) {
+                                    usedAiDenoiseAny = true
+                                    dncnnFramesProcessed++
+                                }
+                                if (frameResult.usedAsyncDnCnnPrefetch) dncnnAsyncPrefetchHits++
                                 if (frameResult.usedDuplicateFrameReuse) duplicateFramesReused++
                                 if (frameResult.colorEnhanced) colorEnhancedFramesCount++
                                 if (frameResult.dncnnInferenceMs > 0L) logger.dncnnInferenceMs.addAndGet(frameResult.dncnnInferenceMs)
@@ -620,8 +665,23 @@ class VideoMediaPipeline(
                                     )
                                 )
                             }
+
+                            if (queuedNextItem == null) {
+                                queuedNextItem = frameChannel.receiveCatching().getOrNull()
+                            }
                         }
                     } finally {
+                        pendingDnCnnPrefetch?.future?.let { runCatching { it.cancel(false) } }
+                        pendingDnCnnPrefetch = null
+                        queuedNextItem?.let { leftover ->
+                            if (leftover.fromDecoderPool) {
+                                activeFastDecoder?.recycleMat(leftover.bgrMat)
+                            } else {
+                                leftover.bgrMat?.release()
+                            }
+                            leftover.diskFile?.delete()
+                        }
+                        queuedNextItem = null
                         prevRawBgr?.release()
                         interpScratchBgr?.release()
                         while (true) {
@@ -711,15 +771,18 @@ class VideoMediaPipeline(
                     interpolatedFramesCount = interpolatedFramesCount,
                     stutterRepairsCount = stutterRepairsCount,
                     colorEnhancedFrames = colorEnhancedFramesCount,
-                    smoothnessModeLabel = smoothLabel
+                    smoothnessModeLabel = smoothLabel,
+                    dncnnFramesProcessed = dncnnFramesProcessed,
+                    dncnnAsyncPrefetchHits = dncnnAsyncPrefetchHits
                 )
 
                 logger.info(
                     "Job completed in ${totalElapsed}ms (tier=${budgetGovernor.activeTier.label}, budget=${budgetGovernor.maxBudgetMs}ms) • " +
-                        "frames=$processedCount (+$interpolatedFramesCount interp, $stutterRepairsCount VFR repairs) • colorFrames=$colorEnhancedFramesCount • " +
+                        "frames=$processedCount (+$interpolatedFramesCount interp, $stutterRepairsCount VFR repairs) • " +
+                        "dncnnFrames=$dncnnFramesProcessed (asyncHits=$dncnnAsyncPrefetchHits) • colorFrames=$colorEnhancedFramesCount • " +
                         "dupReuse=$duplicateFramesReused • staticTileReuse=${diagnostics.staticTilesReused} • " +
                         "fallbacks=${diagnostics.runtimeFallbacksCount} • scale=$scaleLabel (${outDims.label}) • " +
-                        "sr=${diagnostics.aiInferenceMs}ms • encode=${diagnostics.encodingMs}ms • provider=${diagnostics.executionProvider}"
+                        "sr=${diagnostics.aiInferenceMs}ms • dncnn=${diagnostics.dncnnInferenceMs}ms • encode=${diagnostics.encodingMs}ms • provider=${diagnostics.executionProvider}"
                 )
 
                 onProgress(

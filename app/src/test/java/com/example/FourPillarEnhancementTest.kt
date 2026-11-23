@@ -238,7 +238,7 @@ class FourPillarEnhancementTest {
         assertTrue(adj1.deblurStrength < adj2.deblurStrength && adj2.deblurStrength < adj3.deblurStrength && adj3.deblurStrength < adj4.deblurStrength)
         assertTrue(adj1.aiSharpening < adj2.aiSharpening && adj2.aiSharpening < adj3.aiSharpening && adj3.aiSharpening < adj4.aiSharpening)
 
-        // SpeedBudgetGovernor must schedule periodic DnCNN denoising on FULL_NEURAL & SINGLE_TILE tiers when ms budget permits
+        // SpeedBudgetGovernor must schedule DnCNN denoising on 100% of frames without frame skipping on FULL_NEURAL & SINGLE_TILE tiers
         val gov4x = SpeedBudgetGovernor(
             mode = EnhancementMode.CLARITY_4X,
             durationMs = 60_000L,
@@ -250,7 +250,7 @@ class FourPillarEnhancementTest {
         )
         assertEquals(SpeedExecutionTier.FULL_NEURAL_PER_FRAME, gov4x.activeTier)
         assertTrue(gov4x.decisionForFrame(0, isSceneCut = false, forceLightweight = false).allowDnCnn)
-        assertFalse(gov4x.decisionForFrame(1, isSceneCut = false, forceLightweight = false).allowDnCnn)
+        assertTrue(gov4x.decisionForFrame(1, isSceneCut = false, forceLightweight = false).allowDnCnn)
         assertTrue(gov4x.decisionForFrame(3, isSceneCut = false, forceLightweight = false).allowDnCnn)
 
         val govMid2x = SpeedBudgetGovernor(
@@ -264,6 +264,7 @@ class FourPillarEnhancementTest {
         )
         assertEquals(SpeedExecutionTier.SINGLE_TILE_NEURAL, govMid2x.activeTier)
         assertTrue(govMid2x.decisionForFrame(0, isSceneCut = false, forceLightweight = false).allowDnCnn)
+        assertTrue(govMid2x.decisionForFrame(1, isSceneCut = false, forceLightweight = false).allowDnCnn)
         assertTrue(govMid2x.decisionForFrame(6, isSceneCut = false, forceLightweight = false).allowDnCnn)
     }
 

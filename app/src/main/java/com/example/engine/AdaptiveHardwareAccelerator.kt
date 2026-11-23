@@ -396,7 +396,7 @@ class AdaptiveHardwareAccelerator(
             null
         }
 
-        fun buildAndCreate(ortCache: File?): OrtSession {
+        fun buildAndCreate(ortCache: File?, nnapiUseNchw: Boolean = true): OrtSession {
             val opts = OrtSession.SessionOptions().apply {
                 setExecutionMode(OrtSession.SessionOptions.ExecutionMode.SEQUENTIAL)
                 setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
@@ -406,6 +406,7 @@ class AdaptiveHardwareAccelerator(
                 addConfigEntry("session.intra_op.allow_spinning", "0")
                 addConfigEntry("session.inter_op.allow_spinning", "0")
                 addConfigEntry("session.set_denormal_as_zero", "1")
+                addConfigEntry("session.disable_prepacking", "0")
 
                 when (backendId) {
                     BackendCandidateId.ORT_XNNPACK_BIG,
@@ -419,8 +420,14 @@ class AdaptiveHardwareAccelerator(
                     BackendCandidateId.NNAPI_GPU -> {
                         if (!availableProviders.contains(OrtProvider.NNAPI)) throw IllegalStateException("NNAPI missing")
                         setIntraOpNumThreads(threads.coerceIn(2, 4))
-                        // CPU_DISABLED enforces strict hardware operator verification (prevents silent CPU fallback)
-                        addNnapi(EnumSet.of(NNAPIFlags.USE_FP16, NNAPIFlags.USE_NCHW, NNAPIFlags.CPU_DISABLED))
+                        // CPU_DISABLED enforces strict hardware operator verification (prevents silent CPU fallback).
+                        // Retry without USE_NCHW if Adreno/Mali NNAPI driver prefers NHWC layout for Conv2D graphs.
+                        val flags = if (nnapiUseNchw) {
+                            EnumSet.of(NNAPIFlags.USE_FP16, NNAPIFlags.USE_NCHW, NNAPIFlags.CPU_DISABLED)
+                        } else {
+                            EnumSet.of(NNAPIFlags.USE_FP16, NNAPIFlags.CPU_DISABLED)
+                        }
+                        addNnapi(flags)
                     }
                     BackendCandidateId.NNAPI_NPU -> {
                         if (!availableProviders.contains(OrtProvider.NNAPI)) throw IllegalStateException("NNAPI missing")
@@ -468,11 +475,13 @@ class AdaptiveHardwareAccelerator(
         }
 
         return try {
-            buildAndCreate(cacheFile)
+            buildAndCreate(cacheFile, nnapiUseNchw = true)
         } catch (_: Throwable) {
-            if (cacheFile != null) {
+            if (backendId == BackendCandidateId.NNAPI_GPU) {
+                runCatching { buildAndCreate(null, nnapiUseNchw = false) }.getOrNull()
+            } else if (cacheFile != null) {
                 runCatching { cacheFile.delete() }
-                runCatching { buildAndCreate(null) }.getOrNull()
+                runCatching { buildAndCreate(null, nnapiUseNchw = true) }.getOrNull()
             } else {
                 null
             }

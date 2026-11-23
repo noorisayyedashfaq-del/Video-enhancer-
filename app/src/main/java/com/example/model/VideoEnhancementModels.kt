@@ -414,6 +414,8 @@ data class EngineDiagnosticsReport(
     val stutterRepairsCount: Int = 0,
     val colorEnhancedFrames: Int = 0,
     val smoothnessModeLabel: String = "Flow + VFR Stabilized",
+    val dncnnFramesProcessed: Int = 0,
+    val dncnnAsyncPrefetchHits: Int = 0,
     val warnings: List<String> = emptyList()
 )
 

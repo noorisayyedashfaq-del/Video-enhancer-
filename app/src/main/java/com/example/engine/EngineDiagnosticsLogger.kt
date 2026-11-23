@@ -93,7 +93,9 @@ class EngineDiagnosticsLogger(
         interpolatedFramesCount: Int = 0,
         stutterRepairsCount: Int = 0,
         colorEnhancedFrames: Int = framesProcessed,
-        smoothnessModeLabel: String = "Flow + VFR Stabilized"
+        smoothnessModeLabel: String = "Flow + VFR Stabilized",
+        dncnnFramesProcessed: Int = 0,
+        dncnnAsyncPrefetchHits: Int = 0
     ): EngineDiagnosticsReport {
         return EngineDiagnosticsReport(
             modelInitMs = modelInitMs,
@@ -127,6 +129,8 @@ class EngineDiagnosticsLogger(
             stutterRepairsCount = stutterRepairsCount,
             colorEnhancedFrames = colorEnhancedFrames,
             smoothnessModeLabel = smoothnessModeLabel,
+            dncnnFramesProcessed = dncnnFramesProcessed,
+            dncnnAsyncPrefetchHits = dncnnAsyncPrefetchHits,
             warnings = warnings.toList()
         )
     }

@@ -168,6 +168,68 @@ class ColorEnhancementEngine {
     private var cbBoostMat: Mat? = null
     private var cbSkinMat: Mat? = null
 
+    fun applyWhiteBalanceBgr(
+        bgr: Mat,
+        params: AdaptiveAdjustmentParams
+    ) {
+        if (bgr.empty()) return
+        if (abs(params.wbGainR - 1f) < 0.008f && abs(params.wbGainB - 1f) < 0.008f) return
+        val bgrCh = ArrayList<Mat>(3)
+        try {
+            Core.split(bgr, bgrCh)
+            if (abs(params.wbGainB - 1f) >= 0.008f) {
+                bgrCh[0].convertTo(bgrCh[0], CvType.CV_8UC1, params.wbGainB.toDouble(), 0.0)
+            }
+            if (abs(params.wbGainR - 1f) >= 0.008f) {
+                bgrCh[2].convertTo(bgrCh[2], CvType.CV_8UC1, params.wbGainR.toDouble(), 0.0)
+            }
+            Core.merge(bgrCh, bgr)
+        } finally {
+            bgrCh.forEach { it.release() }
+        }
+    }
+
+    fun applyChromaVibranceOnYCrCb(
+        ycrcb: Mat,
+        crChan: Mat,
+        cbChan: Mat,
+        params: AdaptiveAdjustmentParams
+    ) {
+        val needChromaBoost = params.vibranceGain > 0.015f || abs(params.saturationGain - 1f) > 0.01f
+        if (!needChromaBoost) return
+
+        ensureChromaLuts(params.vibranceGain, params.saturationGain)
+        val fullLut = chromaFullLutMat!!
+        val skinLut = chromaSkinLutMat!!
+
+        if (!params.skinToneProtection) {
+            Core.LUT(crChan, fullLut, crChan)
+            Core.LUT(cbChan, fullLut, cbChan)
+            return
+        }
+
+        val skinMask = skinMaskMat ?: Mat().also { skinMaskMat = it }
+        val nonSkinMask = nonSkinMaskMat ?: Mat().also { nonSkinMaskMat = it }
+        val crB = crBoostMat ?: Mat().also { crBoostMat = it }
+        val crS = crSkinMat ?: Mat().also { crSkinMat = it }
+        val cbB = cbBoostMat ?: Mat().also { cbBoostMat = it }
+        val cbS = cbSkinMat ?: Mat().also { cbSkinMat = it }
+
+        // YCrCb human skin tone locus: Y=[30..235], Cr=[133..173], Cb=[77..127]
+        Core.inRange(ycrcb, Scalar(30.0, 133.0, 77.0), Scalar(235.0, 173.0, 127.0), skinMask)
+        Core.bitwise_not(skinMask, nonSkinMask)
+
+        Core.LUT(crChan, fullLut, crB)
+        Core.LUT(crChan, skinLut, crS)
+        Core.LUT(cbChan, fullLut, cbB)
+        Core.LUT(cbChan, skinLut, cbS)
+
+        crB.copyTo(crChan, nonSkinMask)
+        crS.copyTo(crChan, skinMask)
+        cbB.copyTo(cbChan, nonSkinMask)
+        cbS.copyTo(cbChan, skinMask)
+    }
+
     fun applyFastColorEnhancementBgr(
         bgr: Mat,
         params: AdaptiveAdjustmentParams,
@@ -176,21 +238,7 @@ class ColorEnhancementEngine {
         if (bgr.empty()) return
 
         // 1. Auto White Balance
-        if (abs(params.wbGainR - 1f) >= 0.008f || abs(params.wbGainB - 1f) >= 0.008f) {
-            val bgrCh = ArrayList<Mat>(3)
-            try {
-                Core.split(bgr, bgrCh)
-                if (abs(params.wbGainB - 1f) >= 0.008f) {
-                    bgrCh[0].convertTo(bgrCh[0], CvType.CV_8UC1, params.wbGainB.toDouble(), 0.0)
-                }
-                if (abs(params.wbGainR - 1f) >= 0.008f) {
-                    bgrCh[2].convertTo(bgrCh[2], CvType.CV_8UC1, params.wbGainR.toDouble(), 0.0)
-                }
-                Core.merge(bgrCh, bgr)
-            } finally {
-                bgrCh.forEach { it.release() }
-            }
-        }
+        applyWhiteBalanceBgr(bgr, params)
 
         // 2. YCrCb Luma Tone LUT + Selective Skin-Protected Vibrance LUT
         val needChromaBoost = params.vibranceGain > 0.015f || abs(params.saturationGain - 1f) > 0.01f
@@ -214,35 +262,7 @@ class ColorEnhancementEngine {
             }
 
             if (needChromaBoost) {
-                ensureChromaLuts(params.vibranceGain, params.saturationGain)
-                val fullLut = chromaFullLutMat!!
-                val skinLut = chromaSkinLutMat!!
-
-                if (!params.skinToneProtection) {
-                    Core.LUT(ch[1], fullLut, ch[1])
-                    Core.LUT(ch[2], fullLut, ch[2])
-                } else {
-                    val skinMask = skinMaskMat ?: Mat().also { skinMaskMat = it }
-                    val nonSkinMask = nonSkinMaskMat ?: Mat().also { nonSkinMaskMat = it }
-                    val crB = crBoostMat ?: Mat().also { crBoostMat = it }
-                    val crS = crSkinMat ?: Mat().also { crSkinMat = it }
-                    val cbB = cbBoostMat ?: Mat().also { cbBoostMat = it }
-                    val cbS = cbSkinMat ?: Mat().also { cbSkinMat = it }
-
-                    // YCrCb human skin tone locus: Y=[30..235], Cr=[133..173], Cb=[77..127]
-                    Core.inRange(ycrcb, Scalar(30.0, 133.0, 77.0), Scalar(235.0, 173.0, 127.0), skinMask)
-                    Core.bitwise_not(skinMask, nonSkinMask)
-
-                    Core.LUT(ch[1], fullLut, crB)
-                    Core.LUT(ch[1], skinLut, crS)
-                    Core.LUT(ch[2], fullLut, cbB)
-                    Core.LUT(ch[2], skinLut, cbS)
-
-                    crB.copyTo(ch[1], nonSkinMask)
-                    crS.copyTo(ch[1], skinMask)
-                    cbB.copyTo(ch[2], nonSkinMask)
-                    cbS.copyTo(ch[2], skinMask)
-                }
+                applyChromaVibranceOnYCrCb(ycrcb, ch[1], ch[2], params)
             }
 
             Core.merge(ch, ycrcb)

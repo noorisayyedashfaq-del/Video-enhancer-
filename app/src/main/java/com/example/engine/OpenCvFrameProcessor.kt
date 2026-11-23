@@ -27,6 +27,7 @@ data class FrameProcessResult(
     val facesEnhanced: Int = 0,
     val usedAiDenoise: Boolean = false,
     val dncnnInferenceMs: Long = 0L,
+    val usedAsyncDnCnnPrefetch: Boolean = false,
     val faceAiMs: Long = 0L,
     val lightweightFallbackTriggered: Boolean = false,
     val fallbackReason: String? = null,
@@ -180,7 +181,9 @@ class OpenCvFrameProcessor(
         isCancelled: () -> Boolean,
         onUpscaleTileProgress: (done: Int, total: Int, tileSize: Int) -> Unit = { _, _, _ -> },
         speedDecision: FrameSpeedDecision? = null,
-        modeBudgetFrameMs: Long = AiSpeedPolicy.MAX_ACCEPTABLE_AI_FRAME_MS
+        modeBudgetFrameMs: Long = AiSpeedPolicy.MAX_ACCEPTABLE_AI_FRAME_MS,
+        prefetchedDnCnnToken: OnnxAiInferenceEngine.DnCnnPrefetchToken? = null,
+        onDnCnnStageComplete: () -> Unit = {}
     ): FrameProcessResult {
         val fastGpuMode = forceLightweightFallback ||
             (speedDecision?.fastGpuMode == true) ||
@@ -193,33 +196,14 @@ class OpenCvFrameProcessor(
         var accelLabel = if (fastGpuMode && onnxEngine.isGlesGpuReady) "GLES 3.1 GPU Fast" else onnxEngine.providerLabel
         var facesEnhanced = 0
         var usedAiDenoise = false
+        var usedAsyncDnCnnHit = false
         var dncnnMs = 0L
         var faceAiMs = 0L
         var staticTilesReused = 0
 
-        // 0. Measure thumbnail frame MAD once for duplicate-frame check, scene-cut gating & face keyframing
+        // 0. Measure thumbnail frame MAD for scene-cut gating & face keyframing.
+        // Duplicate-frame whole-frame reuse is disabled so DnCNN processes 100% of frames independently (zero skipping).
         val (_, frameMad) = frameMotionProbe.computeFrameThumbnailAndMad(srcBgr)
-        val cachedRgba = prevEnhancedRgbaMat
-        val canReuseWholeFrame = frameIndex > 0 &&
-            cachedRgba != null &&
-            cachedRgba.cols() == outDims.width &&
-            cachedRgba.rows() == outDims.height &&
-            TemporalReusePolicy.shouldReuseDuplicateFrame(
-                frameMad = frameMad,
-                consecutiveDuplicateReuses = consecutiveDuplicateReuses,
-                hasCachedFrame = true
-            )
-
-        if (canReuseWholeFrame && cachedRgba != null) {
-            consecutiveDuplicateReuses++
-            Utils.matToBitmap(cachedRgba, reusableOutBitmap)
-            return FrameProcessResult(
-                facesEnhanced = prevFaceBoxes.size,
-                usedAiDenoise = params.useAiDenoise && onnxEngine.isDncnnReady && !fastGpuMode,
-                activeAccelerationLabel = accelLabel,
-                usedDuplicateFrameReuse = true
-            )
-        }
         consecutiveDuplicateReuses = 0
         val isSceneCut = frameIndex == 0 || frameMad >= TemporalReusePolicy.SCENE_CUT_MAD_THRESHOLD
 
@@ -256,9 +240,11 @@ class OpenCvFrameProcessor(
                 }
             }
 
-            // 2. Luminance Quality Pass (DnCNN Neural Denoise + Deblock + CLAHE + Shadows/Highlights/Contrast Tone LUT)
-            // Note: on single-pass GPU shader frames, contrast/brightness/highlights run directly inside GLSL below.
-            val allowDnCnnNow = !fastGpuMode && (speedDecision?.allowDnCnn ?: true)
+            // 2. Single-Pass Fused YCrCb Mastering: White Balance + Mandatory Every-Frame DnCNN (Y) + Tone LUT (Y) + Skin-Protected Vibrance (Cr/Cb)
+            val allowDnCnnNow = params.useAiDenoise && onnxEngine.isDncnnReady && (speedDecision?.allowDnCnn ?: true)
+            if (!useSinglePassGpuColorShader) {
+                colorEngine.applyWhiteBalanceBgr(activeMat, params)
+            }
             val ycrcbOutcome = applyFusedYCrCbMastering(
                 bgr = activeMat,
                 params = params,
@@ -266,20 +252,15 @@ class OpenCvFrameProcessor(
                 allowDnCnn = allowDnCnnNow,
                 runHeavyFilters = runHeavyCpuPreFilters,
                 skipToneLutForGpuShader = useSinglePassGpuColorShader,
+                applyChromaInPass = !useSinglePassGpuColorShader,
+                frameIndex = frameIndex,
+                prefetchedDnCnnToken = prefetchedDnCnnToken,
+                onDnCnnStageComplete = onDnCnnStageComplete,
                 logger = logger
             )
-            usedAiDenoise = ycrcbOutcome.first
-            dncnnMs = ycrcbOutcome.second
-
-            // 3. Color Enhancement (White Balance + Skin-Protected Vibrance + Saturation) — ALWAYS runs on every tier!
-            if (!useSinglePassGpuColorShader) {
-                // Run on smaller input canvas BEFORE SR upscaling for maximum speed!
-                colorEngine.applyFastColorEnhancementBgr(
-                    bgr = activeMat,
-                    params = params,
-                    applyToneLut = false // Tone LUT already applied in step 2
-                )
-            }
+            usedAiDenoise = ycrcbOutcome.appliedDnCnn
+            dncnnMs = ycrcbOutcome.dncnnMs
+            usedAsyncDnCnnHit = ycrcbOutcome.usedAsyncPrefetchHit
 
             // 4. Keyframe-Scheduled Adaptive Face AI Detection (gated cleanly by SpeedBudgetGovernor)
             val allowFaceDet = !fastGpuMode && (speedDecision?.allowFaceDetect ?: true)
@@ -423,6 +404,7 @@ class OpenCvFrameProcessor(
             facesEnhanced = facesEnhanced,
             usedAiDenoise = usedAiDenoise,
             dncnnInferenceMs = dncnnMs,
+            usedAsyncDnCnnPrefetch = usedAsyncDnCnnHit,
             faceAiMs = faceAiMs,
             lightweightFallbackTriggered = usedFallback,
             fallbackReason = fallbackReason,
@@ -455,6 +437,12 @@ class OpenCvFrameProcessor(
         bgr.copyTo(prev)
     }
 
+    private data class FusedYCrCbOutcome(
+        val appliedDnCnn: Boolean,
+        val dncnnMs: Long,
+        val usedAsyncPrefetchHit: Boolean
+    )
+
     private fun applyFusedYCrCbMastering(
         bgr: Mat,
         params: AdaptiveAdjustmentParams,
@@ -462,9 +450,14 @@ class OpenCvFrameProcessor(
         allowDnCnn: Boolean,
         runHeavyFilters: Boolean,
         skipToneLutForGpuShader: Boolean,
+        applyChromaInPass: Boolean,
+        frameIndex: Int,
+        prefetchedDnCnnToken: OnnxAiInferenceEngine.DnCnnPrefetchToken?,
+        onDnCnnStageComplete: () -> Unit,
         logger: EngineDiagnosticsLogger?
-    ): Pair<Boolean, Long> {
+    ): FusedYCrCbOutcome {
         val needDnCnn = allowDnCnn && params.useAiDenoise && onnxEngine.isDncnnReady
+        val needChroma = applyChromaInPass && (params.vibranceGain > 0.015f || abs(params.saturationGain - 1f) > 0.01f)
         val needToneLut = !skipToneLutForGpuShader && (
             abs(params.brightnessShift) >= 0.4f ||
                 abs(params.contrastGain - 1f) >= 0.01f ||
@@ -475,30 +468,40 @@ class OpenCvFrameProcessor(
                 params.exposureHighlightCompress >= 0.01f
             )
 
-        if (!needDnCnn && !runHeavyFilters && !needToneLut) {
-            return false to 0L
+        if (!needDnCnn && !runHeavyFilters && !needToneLut && !needChroma) {
+            onDnCnnStageComplete()
+            return FusedYCrCbOutcome(appliedDnCnn = false, dncnnMs = 0L, usedAsyncPrefetchHit = false)
         }
 
         val ycrcb = ycrcbScratch ?: Mat().also { ycrcbScratch = it }
         val channels = ArrayList<Mat>(3)
         var usedDnCnn = false
+        var usedAsyncHit = false
         var dncnnMs = 0L
+        var stageNotified = false
         try {
             Imgproc.cvtColor(bgr, ycrcb, Imgproc.COLOR_BGR2YCrCb)
             Core.split(ycrcb, channels)
             val yChan = channels[0]
 
-            // Real DnCNN Neural Luminance Denoising (single-pass 256x256 when budget permits)
+            // Real DnCNN Neural Luminance Denoising (runs on 100% of frames; zero-copy Slot 0 or prefetched Slot 1)
             if (needDnCnn) {
                 val td0 = System.currentTimeMillis()
-                usedDnCnn = onnxEngine.denoiseLuminanceYWithDnCnn(
+                val outcome = onnxEngine.denoiseLuminanceYWithDnCnnWithPrefetch(
                     yChan = yChan,
                     strength = params.dncnnStrength,
                     isSceneCut = isSceneCut,
+                    frameIndex = frameIndex,
+                    prefetchedToken = prefetchedDnCnnToken,
                     logger = logger
                 )
                 dncnnMs = System.currentTimeMillis() - td0
+                usedDnCnn = outcome.first
+                usedAsyncHit = outcome.second
             }
+            // Release Slot 1 immediately so next frame's DnCNN overlaps with Tone LUT, Chroma, Face AI, SR, & Encode!
+            onDnCnnStageComplete()
+            stageNotified = true
 
             if (runHeavyFilters) {
                 if (params.deblockingStrength > 0.28f) {
@@ -528,6 +531,10 @@ class OpenCvFrameProcessor(
                 Core.LUT(yChan, lut, yChan)
             }
 
+            if (needChroma) {
+                colorEngine.applyChromaVibranceOnYCrCb(ycrcb, channels[1], channels[2], params)
+            }
+
             if (runHeavyFilters && params.flickerReductionAlpha > 0.01f) {
                 val currentMean = Core.mean(yChan).`val`[0]
                 val prev = prevLumaMean
@@ -546,9 +553,12 @@ class OpenCvFrameProcessor(
             Core.merge(channels, ycrcb)
             Imgproc.cvtColor(ycrcb, bgr, Imgproc.COLOR_YCrCb2BGR)
         } finally {
+            if (!stageNotified) {
+                onDnCnnStageComplete()
+            }
             channels.forEach { it.release() }
         }
-        return usedDnCnn to dncnnMs
+        return FusedYCrCbOutcome(appliedDnCnn = usedDnCnn, dncnnMs = dncnnMs, usedAsyncPrefetchHit = usedAsyncHit)
     }
 
     private fun getOrCreateClahe(clipLimit: Double): CLAHE {

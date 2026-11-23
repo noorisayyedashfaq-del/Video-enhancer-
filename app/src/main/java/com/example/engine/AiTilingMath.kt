@@ -369,7 +369,8 @@ class SpeedBudgetGovernor(
     private val presetTileSize: Int,
     private val presetTilesCap: Int,
     measuredSrTileMs: Long,
-    deviceCapacityScore: Int
+    deviceCapacityScore: Int,
+    measuredDnCnnMs: Long = 10L
 ) {
     val maxBudgetMs: Long
     val pacedBudgetMs: Long
@@ -387,28 +388,30 @@ class SpeedBudgetGovernor(
         targetMsPerFrame = pacedBudgetMs.toDouble() / estimatedFrames.coerceAtLeast(1).toDouble()
 
         val estSingleTileMs = measuredSrTileMs.coerceIn(8L, 2_500L)
-        val fastGpuOverheadMs = if (deviceCapacityScore >= 60) 12.0 else 22.0
+        // Double-buffered async DnCNN overlaps with post-processing/encoding (~50% effective critical path)
+        val estDnCnnSerialMs = (measuredDnCnnMs.coerceIn(2L, 120L) * 0.50).roundToInt().toDouble()
+        val fastGpuOverheadMs = (if (deviceCapacityScore >= 60) 12.0 else 22.0) + estDnCnnSerialMs
 
         when {
-            // Fast GPU/NPU fits full multi-tile neural SR cleanly on every frame
+            // Fast GPU/NPU fits full multi-tile neural SR + mandatory per-frame DnCNN within strict budget
             estSingleTileMs * presetTilesCap + fastGpuOverheadMs <= targetMsPerFrame -> {
                 currentTier = SpeedExecutionTier.FULL_NEURAL_PER_FRAME
                 aiKeyframeInterval = 1
             }
-            // Fits 1 compact neural tile on every frame
+            // Fits 1 compact neural SR tile + mandatory per-frame DnCNN on every frame
             estSingleTileMs + fastGpuOverheadMs <= targetMsPerFrame -> {
                 currentTier = SpeedExecutionTier.SINGLE_TILE_NEURAL
                 aiKeyframeInterval = 1
             }
-            // Mid-speed NPU/CPU: run neural SR every K frames (K = 2..6), GLES/SIMD on frames between
-            estSingleTileMs <= targetMsPerFrame * 5.5 -> {
+            // Mid-speed NPU/CPU: run neural SR every K frames (K = 2..6), DnCNN ALWAYS runs on every frame
+            estSingleTileMs + estDnCnnSerialMs <= targetMsPerFrame * 5.5 -> {
                 currentTier = SpeedExecutionTier.KEYFRAME_NEURAL_HYBRID
                 val k = ceil((estSingleTileMs - fastGpuOverheadMs) / (targetMsPerFrame - fastGpuOverheadMs).coerceAtLeast(6.0))
                     .toInt()
                     .coerceIn(2, 6)
                 aiKeyframeInterval = k
             }
-            // Slow device CPU fallback: use GLES 3.1 compute shader / SIMD fast pass on all frames
+            // Slow device CPU fallback: use GLES 3.1 compute shader / SIMD fast SR + mandatory per-frame DnCNN
             else -> {
                 currentTier = SpeedExecutionTier.GPU_SHADER_FAST_PASS
                 aiKeyframeInterval = 9999
@@ -424,10 +427,11 @@ class SpeedBudgetGovernor(
     }
 
     fun decisionForFrame(frameIndex: Int, isSceneCut: Boolean, forceLightweight: Boolean): FrameSpeedDecision {
+        // DnCNN noise/grain reduction runs on 100% of frames in ALL modes and ALL execution tiers (zero frame skipping).
         if (forceLightweight || currentTier == SpeedExecutionTier.GPU_SHADER_FAST_PASS) {
             return FrameSpeedDecision(
                 runNeuralSrNow = false,
-                allowDnCnn = false,
+                allowDnCnn = true,
                 allowFaceDetect = false,
                 allowFaceSr = false,
                 maxTilesForFrame = 0,
@@ -442,11 +446,9 @@ class SpeedBudgetGovernor(
 
         return when (currentTier) {
             SpeedExecutionTier.FULL_NEURAL_PER_FRAME -> {
-                val dnCnnCadence = if (isHighDetailMode) 3 else 6
-                val runDnCnn = (frameIndex % dnCnnCadence == 0 || isSceneCut) && targetMsPerFrame >= 95.0
                 FrameSpeedDecision(
                     runNeuralSrNow = true,
-                    allowDnCnn = runDnCnn,
+                    allowDnCnn = true,
                     allowFaceDetect = isHighDetailMode && targetMsPerFrame >= 140.0,
                     allowFaceSr = mode == com.example.model.EnhancementMode.CLARITY_4X && targetMsPerFrame >= 200.0,
                     maxTilesForFrame = presetTilesCap.coerceIn(1, 4),
@@ -457,7 +459,7 @@ class SpeedBudgetGovernor(
             }
             SpeedExecutionTier.SINGLE_TILE_NEURAL -> FrameSpeedDecision(
                 runNeuralSrNow = true,
-                allowDnCnn = (frameIndex % 6 == 0 || isSceneCut) && targetMsPerFrame >= 105.0,
+                allowDnCnn = true,
                 allowFaceDetect = false,
                 allowFaceSr = false,
                 maxTilesForFrame = 1,
@@ -470,7 +472,7 @@ class SpeedBudgetGovernor(
                 val runNow = (frameIndex % interval == 0) || isSceneCut
                 FrameSpeedDecision(
                     runNeuralSrNow = runNow,
-                    allowDnCnn = runNow && isSceneCut && targetMsPerFrame >= 90.0,
+                    allowDnCnn = true,
                     allowFaceDetect = false,
                     allowFaceSr = false,
                     maxTilesForFrame = 1,
@@ -481,7 +483,7 @@ class SpeedBudgetGovernor(
             }
             SpeedExecutionTier.GPU_SHADER_FAST_PASS -> FrameSpeedDecision(
                 runNeuralSrNow = false,
-                allowDnCnn = false,
+                allowDnCnn = true,
                 allowFaceDetect = false,
                 allowFaceSr = false,
                 maxTilesForFrame = 0,
