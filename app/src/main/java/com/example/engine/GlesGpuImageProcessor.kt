@@ -43,7 +43,10 @@ class GlesGpuImageProcessor {
     private var rgbaScratchMat: Mat? = null
     private var inPixelBuf: ByteBuffer? = null
     private var outPixelBuf: ByteBuffer? = null
-    private var rgbaIoBytes: ByteArray = ByteArray(0)
+    private var inBufMatWrap: Mat? = null
+    private var outBufMatWrap: Mat? = null
+    private var bufWrapW: Int = 0
+    private var bufWrapH: Int = 0
     private var fboIds = IntArray(1)
 
     val isAvailable: Boolean get() = initialized && !probeFailed.get()
@@ -252,21 +255,26 @@ class GlesGpuImageProcessor {
             val inBuf = inPixelBuf?.takeIf { it.capacity() >= neededBytes }
                 ?: ByteBuffer.allocateDirect(neededBytes).order(ByteOrder.nativeOrder()).also {
                     inPixelBuf = it
+                    inBufMatWrap?.release(); inBufMatWrap = null
                 }
             val outBuf = outPixelBuf?.takeIf { it.capacity() >= neededBytes }
                 ?: ByteBuffer.allocateDirect(neededBytes).order(ByteOrder.nativeOrder()).also {
                     outPixelBuf = it
+                    outBufMatWrap?.release(); outBufMatWrap = null
                 }
-            val rawBytes = if (rgbaIoBytes.size >= neededBytes) {
-                rgbaIoBytes
-            } else {
-                ByteArray(neededBytes).also { rgbaIoBytes = it }
+            if (bufWrapW != w || bufWrapH != h || inBufMatWrap == null || outBufMatWrap == null) {
+                inBufMatWrap?.release()
+                outBufMatWrap?.release()
+                inBufMatWrap = Mat(h, w, org.opencv.core.CvType.CV_8UC4, inBuf)
+                outBufMatWrap = Mat(h, w, org.opencv.core.CvType.CV_8UC4, outBuf)
+                bufWrapW = w
+                bufWrapH = h
             }
 
-            rgba.get(0, 0, rawBytes)
-            inBuf.clear()
-            inBuf.put(rawBytes, 0, neededBytes)
-            inBuf.flip()
+            // Direct native C++ Mat -> off-heap DirectByteBuffer copy (eliminates 33MB/frame JVM ByteArray bounce at 4K)
+            rgba.copyTo(inBufMatWrap!!)
+            inBuf.position(0)
+            inBuf.limit(neededBytes)
 
             if (w != allocatedTexW || h != allocatedTexH) {
                 if (texIn != 0 || texOut != 0) {
@@ -322,13 +330,12 @@ class GlesGpuImageProcessor {
             GLES31.glMemoryBarrier(GLES31.GL_FRAMEBUFFER_BARRIER_BIT or GLES31.GL_SHADER_IMAGE_ACCESS_BARRIER_BIT)
 
             GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, fboIds[0])
-            outBuf.clear()
+            outBuf.position(0)
+            outBuf.limit(neededBytes)
             GLES31.glReadPixels(0, 0, w, h, GLES31.GL_RGBA, GLES31.GL_UNSIGNED_BYTE, outBuf)
             GLES31.glBindFramebuffer(GLES31.GL_FRAMEBUFFER, 0)
 
-            outBuf.rewind()
-            outBuf.get(rawBytes, 0, neededBytes)
-            rgba.put(0, 0, rawBytes)
+            outBufMatWrap!!.copyTo(rgba)
 
             EGL14.eglMakeCurrent(eglDisplay, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT)
             true
@@ -374,9 +381,12 @@ class GlesGpuImageProcessor {
         try {
             rgbaScratchMat?.release()
             rgbaScratchMat = null
+            inBufMatWrap?.release(); inBufMatWrap = null
+            outBufMatWrap?.release(); outBufMatWrap = null
+            bufWrapW = 0
+            bufWrapH = 0
             inPixelBuf = null
             outPixelBuf = null
-            rgbaIoBytes = ByteArray(0)
             val disp = eglDisplay
             if (disp != null && disp != EGL14.EGL_NO_DISPLAY) {
                 val ctx = eglContext

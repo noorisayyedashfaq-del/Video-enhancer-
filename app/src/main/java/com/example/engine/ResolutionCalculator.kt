@@ -8,13 +8,19 @@ import com.example.model.VideoMetadata
 import kotlin.math.ceil
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.pow
 import kotlin.math.roundToInt
 
 /**
  * Resolves progressive AI super-resolution output dimensions, smart aspect-preserving
- * tile counts, target bitrate, and codec selection across Clarity 1x - 4x.
+ * tile counts, perceptual sublinear H.264 target bitrate, and codec selection across Clarity 1x - 4x.
  */
 object ResolutionCalculator {
+
+    private const val REFERENCE_HD_AREA = 1280.0 * 720.0
+    private const val H264_HIGH_PROFILE_CABAC_GAIN = 0.82
+    private const val MIN_H264_BITRATE_BPS = 1_200_000
+    private const val MAX_H264_BITRATE_BPS = 36_000_000
 
     fun calculate(
         metadata: VideoMetadata,
@@ -137,7 +143,13 @@ object ResolutionCalculator {
         return if (aligned < 2) 2 else aligned
     }
 
-    private fun computeTargetBitrate(
+    /**
+     * Perceptual sublinear H.264 VBR bitrate computation:
+     * - Accounts for H.264 High Profile CABAC + 8x8 transform + 3s GOP efficiency (~18% smaller than baseline/1s GOP).
+     * - Applies sublinear spatial redundancy scaling above 720p (large 1080p/1440p/4K canvases denoised by DnCNN
+     *   need fewer bits per pixel for equivalent SSIM/VMAF while avoiding 50-65 Mbps bloat).
+     */
+    fun computeTargetBitrate(
         width: Int,
         height: Int,
         fps: Double,
@@ -145,8 +157,26 @@ object ResolutionCalculator {
         useH265: Boolean
     ): Int {
         val clampedFps = fps.coerceIn(15.0, 60.0)
-        val codecEfficiency = if (useH265) 0.78 else 1.0
-        val raw = (width.toDouble() * height.toDouble() * clampedFps * bpp * codecEfficiency).roundToInt()
-        return raw.coerceIn(3_000_000, 65_000_000)
+        val pixels = width.toDouble() * height.toDouble()
+        val areaRatio = (pixels / REFERENCE_HD_AREA).coerceAtLeast(0.18)
+        val perceptualDensityScale = if (areaRatio > 1.0) {
+            areaRatio.pow(-0.22).coerceIn(0.58, 1.0)
+        } else {
+            areaRatio.pow(-0.08).coerceIn(1.0, 1.12)
+        }
+        val codecEfficiency = if (useH265) 0.78 else H264_HIGH_PROFILE_CABAC_GAIN
+        val raw = (pixels * clampedFps * bpp.toDouble() * codecEfficiency * perceptualDensityScale).roundToInt()
+        return raw.coerceIn(MIN_H264_BITRATE_BPS, MAX_H264_BITRATE_BPS)
+    }
+
+    fun computeLegacyLinearBitrateForComparison(
+        width: Int,
+        height: Int,
+        fps: Double,
+        bpp: Float
+    ): Int {
+        val clampedFps = fps.coerceIn(15.0, 60.0)
+        return (width.toDouble() * height.toDouble() * clampedFps * bpp).roundToInt()
+            .coerceIn(3_000_000, 65_000_000)
     }
 }

@@ -142,17 +142,18 @@ class YuNetOnnxRunner(private val env: OrtEnvironment) {
         private set
     private var activeBackendIndex: Int = 0
 
-    // Reusable buffers for ORT YuNet inference (direct buffer -> zero GC)
+    // Reusable buffers for ORT YuNet inference (direct off-heap NCHW slices -> zero GC & zero FloatArray copies)
     private var ortInSize: Pair<Int, Int> = -1 to -1
     private var ortDirectBuf: ByteBuffer? = null
     private var ortFloatBuf: FloatBuffer? = null
-    private var ortPlaneTmp: FloatArray = FloatArray(0)
+    private var ortCachedTensor: OnnxTensor? = null
     private var ortRgbFloatMat: Mat? = null
-    private val ortChannels = ArrayList<Mat>(3)
+    private val ortChannelWraps = ArrayList<Mat>(3)
 
     // Reusable OpenCV scratch Mats
     private var detScaledMat: Mat? = null
     private var detOutMat: Mat? = null
+    private var openCvRowBuf: FloatArray = FloatArray(15)
 
     val currentBackendLabel: String
         get() = activePlan?.let { plan ->
@@ -502,49 +503,54 @@ class YuNetOnnxRunner(private val env: OrtEnvironment) {
         detH: Int
     ): List<Rect> {
         val pixels = detW * detH
+        val shape = longArrayOf(1L, 3L, detH.toLong(), detW.toLong())
         if (ortInSize.first != detW || ortInSize.second != detH || ortDirectBuf == null) {
-            ortInSize = detW to detH
-            val direct = ByteBuffer.allocateDirect(3 * pixels * 4).order(ByteOrder.nativeOrder())
-            ortDirectBuf = direct
-            ortFloatBuf = direct.asFloatBuffer()
-            ortPlaneTmp = FloatArray(pixels)
+            runCatching { ortCachedTensor?.close() }
+            ortCachedTensor = null
+            ortChannelWraps.forEach { it.release() }
+            ortChannelWraps.clear()
             ortRgbFloatMat?.release()
+
+            ortInSize = detW to detH
+            val planeBytes = pixels * 4
+            val direct = ByteBuffer.allocateDirect(3 * planeBytes).order(ByteOrder.nativeOrder())
+            ortDirectBuf = direct
+            val fBuf = direct.asFloatBuffer()
+            ortFloatBuf = fBuf
             ortRgbFloatMat = Mat(detH, detW, CvType.CV_32FC3)
+            for (c in 0 until 3) {
+                val slice = direct.duplicate().apply {
+                    position(c * planeBytes)
+                    limit((c + 1) * planeBytes)
+                }.slice().order(ByteOrder.nativeOrder())
+                ortChannelWraps.add(Mat(detH, detW, CvType.CV_32FC1, slice))
+            }
+            fBuf.clear()
+            ortCachedTensor = OnnxTensor.createTensor(env, fBuf, shape)
         }
 
         val floatMat = ortRgbFloatMat!!
         detBgr.convertTo(floatMat, CvType.CV_32FC3) // YuNet expects BGR [0..255] FP32
-        ortChannels.forEach { it.release() }
-        ortChannels.clear()
-        org.opencv.core.Core.split(floatMat, ortChannels)
+        for (c in 0 until 3) {
+            org.opencv.core.Core.extractChannel(floatMat, ortChannelWraps[c], c)
+        }
 
         val fBuf = ortFloatBuf!!
-        val tmp = ortPlaneTmp
-        fBuf.clear()
-        for (c in 0 until 3) {
-            ortChannels[c].get(0, 0, tmp)
-            fBuf.put(tmp)
-        }
         fBuf.rewind()
-        ortChannels.forEach { it.release() }
-        ortChannels.clear()
-
-        val shape = longArrayOf(1L, 3L, detH.toLong(), detW.toLong())
+        val tensor = ortCachedTensor!!
         val inputName = session.inputNames.first()
-        val outputsMap = HashMap<String, FloatArray>()
+        val outputsMap = HashMap<String, FloatArray>(9)
 
-        OnnxTensor.createTensor(env, fBuf, shape).use { tensor ->
-            session.run(mapOf(inputName to tensor)).use { results ->
-                val outNames = session.outputNames.toList()
-                for (i in outNames.indices) {
-                    val name = outNames[i]
-                    if (name.startsWith("cls_") || name.startsWith("obj_") || name.startsWith("bbox_")) {
-                        val t = results[i] as OnnxTensor
-                        val ob = t.floatBuffer
-                        val arr = FloatArray(ob.remaining())
-                        ob.get(arr)
-                        outputsMap[name] = arr
-                    }
+        session.run(mapOf(inputName to tensor)).use { results ->
+            val outNames = session.outputNames.toList()
+            for (i in outNames.indices) {
+                val name = outNames[i]
+                if (name.startsWith("cls_") || name.startsWith("obj_") || name.startsWith("bbox_")) {
+                    val t = results[i] as OnnxTensor
+                    val ob = t.floatBuffer
+                    val arr = FloatArray(ob.remaining())
+                    ob.get(arr)
+                    outputsMap[name] = arr
                 }
             }
         }
@@ -618,7 +624,11 @@ class YuNetOnnxRunner(private val env: OrtEnvironment) {
 
         val invScaleX = srcW.toDouble() / detW.toDouble()
         val invScaleY = srcH.toDouble() / detH.toDouble()
-        val rowBuf = FloatArray(outFaces.cols().coerceAtLeast(15))
+        val cols = outFaces.cols().coerceAtLeast(15)
+        if (openCvRowBuf.size < cols) {
+            openCvRowBuf = FloatArray(cols)
+        }
+        val rowBuf = openCvRowBuf
         val detected = ArrayList<Pair<Rect, Float>>(rows)
 
         for (r in 0 until rows) {
@@ -640,13 +650,15 @@ class YuNetOnnxRunner(private val env: OrtEnvironment) {
     fun releaseWorkBuffers() {
         detScaledMat?.release(); detScaledMat = null
         detOutMat?.release(); detOutMat = null
+        runCatching { ortCachedTensor?.close() }
+        ortCachedTensor = null
         ortRgbFloatMat?.release(); ortRgbFloatMat = null
-        ortChannels.forEach { it.release() }
-        ortChannels.clear()
+        ortChannelWraps.forEach { it.release() }
+        ortChannelWraps.clear()
         ortInSize = -1 to -1
         ortDirectBuf = null
         ortFloatBuf = null
-        ortPlaneTmp = FloatArray(0)
+        openCvRowBuf = FloatArray(15)
     }
 
     @Synchronized

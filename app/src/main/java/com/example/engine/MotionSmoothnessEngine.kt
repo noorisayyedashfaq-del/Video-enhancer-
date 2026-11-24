@@ -232,6 +232,8 @@ object MotionSmoothMath {
 class MotionSmoothnessEngine {
 
     private var disFlow: DISOpticalFlow? = null
+    private var prevGrayFullTmp: Mat? = null
+    private var nextGrayFullTmp: Mat? = null
     private var prevGraySmall: Mat? = null
     private var nextGraySmall: Mat? = null
     private var flowSmall: Mat? = null
@@ -247,6 +249,7 @@ class MotionSmoothnessEngine {
     private var flowCh = ArrayList<Mat>(2)
     private var jitterPrevFrame: Mat? = null
     private var jitterDiff: Mat? = null
+    private var jitterGrayDiff: Mat? = null
     private var jitterMask: Mat? = null
     private var jitterBlended: Mat? = null
 
@@ -290,17 +293,12 @@ class MotionSmoothnessEngine {
             val fSmall = flowSmall ?: Mat().also { flowSmall = it }
             val fFull = flowFull ?: Mat().also { flowFull = it }
 
-            val pGrayTmp = Mat()
-            val nGrayTmp = Mat()
-            try {
-                Imgproc.cvtColor(prevBgr, pGrayTmp, Imgproc.COLOR_BGR2GRAY)
-                Imgproc.cvtColor(nextBgr, nGrayTmp, Imgproc.COLOR_BGR2GRAY)
-                Imgproc.resize(pGrayTmp, g0, Size(fw.toDouble(), fh.toDouble()), 0.0, 0.0, Imgproc.INTER_AREA)
-                Imgproc.resize(nGrayTmp, g1, Size(fw.toDouble(), fh.toDouble()), 0.0, 0.0, Imgproc.INTER_AREA)
-            } finally {
-                pGrayTmp.release()
-                nGrayTmp.release()
-            }
+            val pGrayTmp = prevGrayFullTmp ?: Mat().also { prevGrayFullTmp = it }
+            val nGrayTmp = nextGrayFullTmp ?: Mat().also { nextGrayFullTmp = it }
+            Imgproc.cvtColor(prevBgr, pGrayTmp, Imgproc.COLOR_BGR2GRAY)
+            Imgproc.cvtColor(nextBgr, nGrayTmp, Imgproc.COLOR_BGR2GRAY)
+            Imgproc.resize(pGrayTmp, g0, Size(fw.toDouble(), fh.toDouble()), 0.0, 0.0, Imgproc.INTER_AREA)
+            Imgproc.resize(nGrayTmp, g1, Size(fw.toDouble(), fh.toDouble()), 0.0, 0.0, Imgproc.INTER_AREA)
 
             val dis = getOrCreateDis()
             if (dis != null) {
@@ -360,21 +358,17 @@ class MotionSmoothnessEngine {
         }
 
         val diff = jitterDiff ?: Mat().also { jitterDiff = it }
-        val grayDiff = Mat()
+        val grayDiff = jitterGrayDiff ?: Mat().also { jitterGrayDiff = it }
         val mask = jitterMask ?: Mat().also { jitterMask = it }
         val blended = jitterBlended ?: Mat().also { jitterBlended = it }
-        try {
-            Core.absdiff(bgr, prev, diff)
-            Imgproc.cvtColor(diff, grayDiff, Imgproc.COLOR_BGR2GRAY)
-            // Only blend tiny flicker differences (< 9 luma levels) so rapid motion never trails/ghosts
-            Imgproc.threshold(grayDiff, mask, 9.0, 255.0, Imgproc.THRESH_BINARY_INV)
-            val alpha = (strength.toDouble() * 0.24).coerceIn(0.05, 0.20)
-            Core.addWeighted(bgr, 1.0 - alpha, prev, alpha, 0.0, blended)
-            blended.copyTo(bgr, mask)
-            bgr.copyTo(prev)
-        } finally {
-            grayDiff.release()
-        }
+        Core.absdiff(bgr, prev, diff)
+        Imgproc.cvtColor(diff, grayDiff, Imgproc.COLOR_BGR2GRAY)
+        // Only blend tiny flicker differences (< 9 luma levels) so rapid motion never trails/ghosts
+        Imgproc.threshold(grayDiff, mask, 9.0, 255.0, Imgproc.THRESH_BINARY_INV)
+        val alpha = (strength.toDouble() * 0.24).coerceIn(0.05, 0.20)
+        Core.addWeighted(bgr, 1.0 - alpha, prev, alpha, 0.0, blended)
+        blended.copyTo(bgr, mask)
+        bgr.copyTo(prev)
     }
 
     private fun ensureIdentityGrids(w: Int, h: Int) {
@@ -403,6 +397,8 @@ class MotionSmoothnessEngine {
     }
 
     fun release() {
+        prevGrayFullTmp?.release(); prevGrayFullTmp = null
+        nextGrayFullTmp?.release(); nextGrayFullTmp = null
         prevGraySmall?.release(); prevGraySmall = null
         nextGraySmall?.release(); nextGraySmall = null
         flowSmall?.release(); flowSmall = null
@@ -419,6 +415,7 @@ class MotionSmoothnessEngine {
         flowCh.clear()
         jitterPrevFrame?.release(); jitterPrevFrame = null
         jitterDiff?.release(); jitterDiff = null
+        jitterGrayDiff?.release(); jitterGrayDiff = null
         jitterMask?.release(); jitterMask = null
         jitterBlended?.release(); jitterBlended = null
         disFlow = null

@@ -152,14 +152,15 @@ class FastVideoFrameDecoder(
     private var yuvBytes = ByteArray(0)
     private var stridedRowScratch = ByteArray(0)
     private var yuvMat: Mat? = null
+    private var unrotatedScratchBgr: Mat? = null
 
     private val poolLock = Any()
-    private val bgrPool = ArrayDeque<Mat>(6)
+    private val bgrPool = ArrayDeque<Mat>(8)
 
     fun recycleMat(mat: Mat?) {
         if (mat == null || mat.empty()) return
         synchronized(poolLock) {
-            if (bgrPool.size < 6) {
+            if (bgrPool.size < 8) {
                 bgrPool.addLast(mat)
             } else {
                 mat.release()
@@ -285,6 +286,8 @@ class FastVideoFrameDecoder(
         } finally {
             yuvMat?.release()
             yuvMat = null
+            unrotatedScratchBgr?.release()
+            unrotatedScratchBgr = null
             yuvBytes = ByteArray(0)
             clearMatPool()
             try {
@@ -432,7 +435,11 @@ class FastVideoFrameDecoder(
             return outBgr
         }
 
-        val unrotatedBgr = Mat(h, w, CvType.CV_8UC3)
+        val unrotatedBgr = unrotatedScratchBgr?.takeIf { it.rows() == h && it.cols() == w }
+            ?: Mat(h, w, CvType.CV_8UC3).also {
+                unrotatedScratchBgr?.release()
+                unrotatedScratchBgr = it
+            }
         Imgproc.cvtColor(localYuv, unrotatedBgr, cvColorCode)
         val rotated = obtainReusableBgrMat(outH, outW)
         val rotCode = when (normRot) {
@@ -441,7 +448,6 @@ class FastVideoFrameDecoder(
             else -> Core.ROTATE_90_COUNTERCLOCKWISE
         }
         Core.rotate(unrotatedBgr, rotated, rotCode)
-        unrotatedBgr.release()
         return rotated
     }
 }

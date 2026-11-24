@@ -42,6 +42,10 @@ class HardwareVideoEncoder(
 
     var activeCodecLabel: String = "H.264"
         private set
+    var activeProfileSummary: String = "Default"
+        private set
+    var keyframeIntervalSec: Int = 3
+        private set
 
     private var outputFrameCounter: Long = 0L
     private var lastMuxedPtsUs: Long = -1L
@@ -70,7 +74,7 @@ class HardwareVideoEncoder(
                     activeCodecLabel = if (mime == MediaFormat.MIMETYPE_VIDEO_HEVC) {
                         if (requireHardware) "H.265 (Hardware)" else "H.265 (Software)"
                     } else {
-                        if (requireHardware) "H.264 (Hardware)" else "H.264 (Software)"
+                        if (requireHardware) "H.264 (Hardware) • $activeProfileSummary" else "H.264 (Software) • $activeProfileSummary"
                     }
                     encodeExecutor = Executors.newSingleThreadExecutor { r ->
                         Thread(r, "ClearKit-HwEncoder").apply { isDaemon = true }
@@ -87,26 +91,72 @@ class HardwareVideoEncoder(
 
     private fun tryConfigure(mime: String, requireHardware: Boolean): Boolean {
         val codecInfo = findMatchingEncoder(mime, requireHardware) ?: return false
-        val format = MediaFormat.createVideoFormat(mime, width, height).apply {
-            setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-            setInteger(MediaFormat.KEY_BIT_RATE, bitrateBps)
-            setInteger(MediaFormat.KEY_FRAME_RATE, fps.roundToInt().coerceIn(15, 60))
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
-            val caps = runCatching { codecInfo.getCapabilitiesForType(mime).encoderCapabilities }.getOrNull()
-            if (caps?.isBitrateModeSupported(MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR) == true) {
-                setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
-            }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                setInteger(MediaFormat.KEY_PRIORITY, 0)
-                setInteger(MediaFormat.KEY_OPERATING_RATE, 120)
-            }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
+        val codecCaps = runCatching { codecInfo.getCapabilitiesForType(mime) }.getOrNull()
+        val encCaps = codecCaps?.encoderCapabilities
+        val highestHighLevel = if (mime == MediaFormat.MIMETYPE_VIDEO_AVC && codecCaps != null) {
+            codecCaps.profileLevels
+                ?.filter { it.profile == MediaCodecInfo.CodecProfileLevel.AVCProfileHigh }
+                ?.maxOfOrNull { it.level }
+        } else {
+            null
+        }
+
+        fun buildFormat(useHighProfile: Boolean, iFrameIntervalSec: Int): MediaFormat {
+            return MediaFormat.createVideoFormat(mime, width, height).apply {
+                setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+                setInteger(MediaFormat.KEY_BIT_RATE, bitrateBps)
+                setInteger(MediaFormat.KEY_FRAME_RATE, fps.roundToInt().coerceIn(15, 60))
+                setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, iFrameIntervalSec)
+                if (encCaps?.isBitrateModeSupported(MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR) == true) {
+                    setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
+                }
+                if (useHighProfile && highestHighLevel != null && mime == MediaFormat.MIMETYPE_VIDEO_AVC) {
+                    setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileHigh)
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && highestHighLevel > 0) {
+                        setInteger(MediaFormat.KEY_LEVEL, highestHighLevel)
+                    }
+                }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    setInteger(MediaFormat.KEY_PRIORITY, 0)
+                    setInteger(MediaFormat.KEY_OPERATING_RATE, 120)
+                }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    // Keep B-frames disabled on Surface input so lockHardwareCanvas() PTS stays strictly monotonic
+                    setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
+                }
             }
         }
 
-        val codec = MediaCodec.createByCodecName(codecInfo.name)
-        codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+        val configs = listOf(
+            (highestHighLevel != null) to 3,
+            false to 3,
+            false to 1
+        ).distinct()
+
+        var configuredCodec: MediaCodec? = null
+        var chosenProfileLabel = "Default • GOP 1s"
+        var chosenGop = 1
+        var lastConfigError: Throwable? = null
+
+        for ((tryHigh, gopSec) in configs) {
+            val attemptCodec = MediaCodec.createByCodecName(codecInfo.name)
+            try {
+                attemptCodec.configure(buildFormat(tryHigh, gopSec), null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                configuredCodec = attemptCodec
+                chosenGop = gopSec
+                chosenProfileLabel = if (tryHigh) {
+                    "High Profile CABAC • GOP ${gopSec}s"
+                } else {
+                    "VBR • GOP ${gopSec}s"
+                }
+                break
+            } catch (t: Throwable) {
+                lastConfigError = t
+                runCatching { attemptCodec.release() }
+            }
+        }
+
+        val codec = configuredCodec ?: throw (lastConfigError ?: IllegalStateException("Codec configure failed"))
         val surface = codec.createInputSurface()
         codec.start()
 
@@ -116,6 +166,8 @@ class HardwareVideoEncoder(
         mediaCodec = codec
         inputSurface = surface
         mediaMuxer = muxer
+        activeProfileSummary = chosenProfileLabel
+        keyframeIntervalSec = chosenGop
         videoTrackIndex = -1
         muxerStarted = false
         outputFrameCounter = 0L

@@ -168,13 +168,17 @@ class OnnxAiInferenceEngine(private val context: Context) {
     private var lastInitDurationMs: Long = 0L
     private var glesGpuAvailable = false
 
-    // Double-buffered direct FloatBuffers for pipelined zero-GC Real-ESRGAN tile packing
+    // Double-buffered direct ByteBuffers + off-heap slice Mats + cached OnnxTensors (zero FloatArray/Tensor churn)
     private var allocTileSize: Int = 0
+    private var tileInByteBufA: ByteBuffer? = null
+    private var tileInByteBufB: ByteBuffer? = null
     private var tileInBufA: FloatBuffer? = null
     private var tileInBufB: FloatBuffer? = null
-    private var tileInPlaneTmpA: FloatArray = FloatArray(0)
-    private var tileInPlaneTmpB: FloatArray = FloatArray(0)
-    private var tileOutPlaneTmp: FloatArray = FloatArray(0)
+    private var tileCachedTensorA: OnnxTensor? = null
+    private var tileCachedTensorB: OnnxTensor? = null
+    private var tileOutDirectByteBuf: ByteBuffer? = null
+    private var tileOutDirectFloatBuf: FloatBuffer? = null
+    private var tileOutPlaneWraps: List<Mat>? = null
     private var tilePrepExecutor: ExecutorService? = null
 
     data class DnCnnPrefetchToken(
@@ -200,6 +204,7 @@ class OnnxAiInferenceEngine(private val context: Context) {
     private val dncnnOutMats = arrayOfNulls<Mat>(2)
     private val dncnnPadMats = arrayOfNulls<Mat>(2)
     private var dncnnAsyncBgrSmall: Mat? = null
+    private var dncnnAsyncGrayTmp: Mat? = null
     private var dncnnAsyncExecutor: ExecutorService? = null
 
     // High-res Q4 fixed-point residual + edge-gated grain suppression scratch Mats (strict fixed CvTypes)
@@ -213,9 +218,8 @@ class OnnxAiInferenceEngine(private val context: Context) {
     private var dncnnFlatMaskU8Mat: Mat? = null
     private var dncnnBlendedU8Mat: Mat? = null
 
-    // Static tile temporal reuse caches
+    // Static tile temporal reuse cache for Real-ESRGAN tiles (DnCNN never skips frames)
     private val srTileCache = StaticTileReuseCache()
-    private val dncnnTileCache = StaticTileReuseCache()
 
     // Reusable OpenCV native C++ scratch Mats
     private var srcRgbMat: Mat? = null
@@ -223,6 +227,8 @@ class OnnxAiInferenceEngine(private val context: Context) {
     private var baseRgb8u: Mat? = null
     private var baseLowBlur8u: Mat? = null
     private var baseHighDetailS16: Mat? = null
+    private var baseS16Tmp: Mat? = null
+    private var blurS16Tmp: Mat? = null
     private var outRgbS16: Mat? = null
     private var tilePaddedMatA: Mat? = null
     private var tilePaddedMatB: Mat? = null
@@ -230,7 +236,6 @@ class OnnxAiInferenceEngine(private val context: Context) {
     private var tileFloatHwcB: Mat? = null
     private var tileChannelsA: List<Mat>? = null
     private var tileChannelsB: List<Mat>? = null
-    private var outFullPlaneMat: Mat? = null
     private var resizedOutChannels: List<Mat>? = null
     private var outResizedFloat: Mat? = null
     private var weightedTileFloat: Mat? = null
@@ -250,12 +255,13 @@ class OnnxAiInferenceEngine(private val context: Context) {
     private var faceSrWeightedF: Mat? = null
     private var faceBlendF: Mat? = null
 
-    // Lightweight OpenCV fallback scratch Mats
+    // Lightweight OpenCV & halo-clamped sharpen scratch Mats
     private var lwBlurMat: Mat? = null
     private var lwDetailMat: Mat? = null
     private var lwBlurFineMat: Mat? = null
     private var lwMinNMat: Mat? = null
     private var lwMaxNMat: Mat? = null
+    private var morphKernel3x3: Mat? = null
 
     // Feather weight Mat cache keyed by tile dimensions & overlap
     private val featherMaskCache = HashMap<Long, Mat>()
@@ -266,7 +272,7 @@ class OnnxAiInferenceEngine(private val context: Context) {
     val providerLabel: String get() = activeProviderDescription
     val benchmarkSummary: String get() = benchmarkDetails
     val initDurationMs: Long get() = lastInitDurationMs
-    val totalStaticTilesReused: Int get() = srTileCache.totalTilesReused + dncnnTileCache.totalTilesReused
+    val totalStaticTilesReused: Int get() = srTileCache.totalTilesReused
 
     @Synchronized
     fun initialize(
@@ -340,7 +346,6 @@ class OnnxAiInferenceEngine(private val context: Context) {
 
     fun resetTemporalCaches() {
         srTileCache.reset()
-        dncnnTileCache.reset()
         runtimeFallbacksCount = 0
     }
 
@@ -422,25 +427,21 @@ class OnnxAiInferenceEngine(private val context: Context) {
                     val padMat1 = dncnnPadMats[1]!!
                     val inFloatMat1 = dncnnInMats[1]!!
                     if (w <= dncnnTileSize && h <= dncnnTileSize) {
-                        val grayTmp = Mat()
-                        try {
-                            Imgproc.cvtColor(preBgr, grayTmp, Imgproc.COLOR_BGR2GRAY)
-                            if (w == dncnnTileSize && h == dncnnTileSize) {
-                                grayTmp.convertTo(inFloatMat1, CvType.CV_32FC1, 1.0 / 255.0)
-                            } else {
-                                Core.copyMakeBorder(
-                                    grayTmp,
-                                    padMat1,
-                                    0,
-                                    dncnnTileSize - h,
-                                    0,
-                                    dncnnTileSize - w,
-                                    Core.BORDER_REFLECT_101
-                                )
-                                padMat1.convertTo(inFloatMat1, CvType.CV_32FC1, 1.0 / 255.0)
-                            }
-                        } finally {
-                            grayTmp.release()
+                        val grayTmp = dncnnAsyncGrayTmp ?: Mat().also { dncnnAsyncGrayTmp = it }
+                        Imgproc.cvtColor(preBgr, grayTmp, Imgproc.COLOR_BGR2GRAY)
+                        if (w == dncnnTileSize && h == dncnnTileSize) {
+                            grayTmp.convertTo(inFloatMat1, CvType.CV_32FC1, 1.0 / 255.0)
+                        } else {
+                            Core.copyMakeBorder(
+                                grayTmp,
+                                padMat1,
+                                0,
+                                dncnnTileSize - h,
+                                0,
+                                dncnnTileSize - w,
+                                Core.BORDER_REFLECT_101
+                            )
+                            padMat1.convertTo(inFloatMat1, CvType.CV_32FC1, 1.0 / 255.0)
                         }
                     } else {
                         // Linear operators (INTER_AREA resize & BGR2GRAY) commute cleanly: 65K pixels instead of 2M!
@@ -757,54 +758,67 @@ class OnnxAiInferenceEngine(private val context: Context) {
             val floatHwc = tileFloatHwcA!!
             val chIn = tileChannelsA!!
             val directBuf = tileInBufA!!
-            val planeTmp = tileInPlaneTmpA
+            val cachedTensor = tileCachedTensorA!!
 
             val inRect = Rect(tile.x, tile.y, tile.width, tile.height)
             val roi = Mat(srSourceRgb, inRect)
-            val validSrW: Int
-            val validSrH: Int
-            if (tile.width <= safeTileSize && tile.height <= safeTileSize) {
-                if (tile.width == safeTileSize && tile.height == safeTileSize) {
-                    roi.copyTo(padMat)
+            val sig = srTileCache.computeTileSignature(roi)
+            var reusedSingle = outResized.cols() == tile.outWidth &&
+                outResized.rows() == tile.outHeight &&
+                srTileCache.tryReuseTileOutput(
+                    tileKey = 0,
+                    currentSig = sig,
+                    isSceneCut = isSceneCut,
+                    dstOutFloat = outResized
+                )
+
+            var tileMs = 1L
+            if (!reusedSingle) {
+                val validSrW: Int
+                val validSrH: Int
+                if (tile.width <= safeTileSize && tile.height <= safeTileSize) {
+                    if (tile.width == safeTileSize && tile.height == safeTileSize) {
+                        roi.copyTo(padMat)
+                    } else {
+                        Core.copyMakeBorder(
+                            roi, padMat,
+                            0, safeTileSize - tile.height,
+                            0, safeTileSize - tile.width,
+                            Core.BORDER_REFLECT_101
+                        )
+                    }
+                    validSrW = tile.width * 4
+                    validSrH = tile.height * 4
                 } else {
-                    Core.copyMakeBorder(
-                        roi, padMat,
-                        0, safeTileSize - tile.height,
-                        0, safeTileSize - tile.width,
-                        Core.BORDER_REFLECT_101
-                    )
+                    Imgproc.resize(roi, padMat, Size(safeTileSize.toDouble(), safeTileSize.toDouble()), 0.0, 0.0, Imgproc.INTER_LINEAR)
+                    validSrW = safeTileSize * 4
+                    validSrH = safeTileSize * 4
                 }
-                validSrW = tile.width * 4
-                validSrH = tile.height * 4
-            } else {
-                Imgproc.resize(roi, padMat, Size(safeTileSize.toDouble(), safeTileSize.toDouble()), 0.0, 0.0, Imgproc.INTER_LINEAR)
-                validSrW = safeTileSize * 4
-                validSrH = safeTileSize * 4
+
+                padMat.convertTo(floatHwc, CvType.CV_32FC3, 1.0 / 255.0)
+                // Write NCHW channels directly into off-heap cached OnnxTensor memory (zero FloatArray copy)
+                for (c in 0 until 3) {
+                    Core.extractChannel(floatHwc, chIn[c], c)
+                }
+                directBuf.rewind()
+
+                val tTile0 = System.currentTimeMillis()
+                val dstSize = Size(tile.outWidth.toDouble(), tile.outHeight.toDouble())
+                runSrTileAndResizeDirect(
+                    inputBuf = directBuf,
+                    cachedTensor = cachedTensor,
+                    shape = fixedShape,
+                    tileSize = safeTileSize,
+                    validSrW = validSrW,
+                    validSrH = validSrH,
+                    dstSize = dstSize,
+                    outResizedHwc = outResized,
+                    logger = logger
+                )
+                tileMs = (System.currentTimeMillis() - tTile0).coerceAtLeast(1L)
+                srTileCache.storeTileOutput(0, sig, outResized)
             }
             roi.release()
-
-            padMat.convertTo(floatHwc, CvType.CV_32FC3, 1.0 / 255.0)
-            Core.split(floatHwc, chIn)
-            directBuf.clear()
-            for (c in 0 until 3) {
-                chIn[c].get(0, 0, planeTmp)
-                directBuf.put(planeTmp)
-            }
-            directBuf.rewind()
-
-            val tTile0 = System.currentTimeMillis()
-            val dstSize = Size(tile.outWidth.toDouble(), tile.outHeight.toDouble())
-            runSrTileAndResizeDirect(
-                inputBuf = directBuf,
-                shape = fixedShape,
-                tileSize = safeTileSize,
-                validSrW = validSrW,
-                validSrH = validSrH,
-                dstSize = dstSize,
-                outResizedHwc = outResized,
-                logger = logger
-            )
-            val tileMs = (System.currentTimeMillis() - tTile0).coerceAtLeast(1L)
             onTileProgress(1, 1, safeTileSize)
 
             outResized.convertTo(outRgb8u!!, CvType.CV_8UC3, 255.0)
@@ -823,7 +837,7 @@ class OnnxAiInferenceEngine(private val context: Context) {
                 aiSharpening = aiSharpening
             )
 
-            val hitLimit = AiSpeedPolicy.shouldEngageLightweightFallback(
+            val hitLimit = !reusedSingle && AiSpeedPolicy.shouldEngageLightweightFallback(
                 measuredTileMs = tileMs,
                 tilesPerFrame = 1,
                 estimatedFrameCount = estimatedTotalFrames,
@@ -838,7 +852,7 @@ class OnnxAiInferenceEngine(private val context: Context) {
                 fallbackReason = if (hitLimit) "Speed budget guard: ${tileMs}ms/tile > ${modeBudgetFrameMs}ms budget" else null,
                 activeAccelerationLabel = activeProviderDescription,
                 faceAiMs = 0L,
-                staticTilesReused = 0
+                staticTilesReused = if (reusedSingle) 1 else 0
             )
         }
 
@@ -873,7 +887,6 @@ class OnnxAiInferenceEngine(private val context: Context) {
             val padMat = if (bufIdx == 0) tilePaddedMatA!! else tilePaddedMatB!!
             val floatHwc = if (bufIdx == 0) tileFloatHwcA!! else tileFloatHwcB!!
             val chIn = if (bufIdx == 0) tileChannelsA!! else tileChannelsB!!
-            val planeTmp = if (bufIdx == 0) tileInPlaneTmpA else tileInPlaneTmpB
             val directBuf = if (bufIdx == 0) tileInBufA!! else tileInBufB!!
 
             val validSrW: Int
@@ -899,11 +912,8 @@ class OnnxAiInferenceEngine(private val context: Context) {
             roi.release()
 
             padMat.convertTo(floatHwc, CvType.CV_32FC3, 1.0 / 255.0)
-            Core.split(floatHwc, chIn)
-            directBuf.clear()
             for (c in 0 until 3) {
-                chIn[c].get(0, 0, planeTmp)
-                directBuf.put(planeTmp)
+                Core.extractChannel(floatHwc, chIn[c], c)
             }
             directBuf.rewind()
             return PreparedTile(
@@ -916,7 +926,9 @@ class OnnxAiInferenceEngine(private val context: Context) {
             )
         }
 
-        val prepExec = tilePrepExecutor ?: Executors.newSingleThreadExecutor().also { tilePrepExecutor = it }
+        val prepExec = tilePrepExecutor ?: Executors.newSingleThreadExecutor { r ->
+            Thread(r, "ClearKit-TilePrep").apply { isDaemon = true }
+        }.also { tilePrepExecutor = it }
         var tileTimingSumMs = 0L
         var timedTiles = 0
         var reusedInFrame = 0
@@ -954,8 +966,10 @@ class OnnxAiInferenceEngine(private val context: Context) {
             } else {
                 val dstSize = Size(tile.outWidth.toDouble(), tile.outHeight.toDouble())
                 val activeBuf = if (prepared.bufIndex == 0) tileInBufA!! else tileInBufB!!
+                val activeTensor = if (prepared.bufIndex == 0) tileCachedTensorA!! else tileCachedTensorB!!
                 runSrTileAndResizeDirect(
                     inputBuf = activeBuf,
+                    cachedTensor = activeTensor,
                     shape = fixedShape,
                     tileSize = safeTileSize,
                     validSrW = prepared.validSrW,
@@ -1117,22 +1131,17 @@ class OnnxAiInferenceEngine(private val context: Context) {
             val baseBlur = baseLowBlur8u ?: Mat().also { baseLowBlur8u = it }
             val highS16 = baseHighDetailS16 ?: Mat().also { baseHighDetailS16 = it }
             val targetS16 = outRgbS16 ?: Mat().also { outRgbS16 = it }
-            val baseS16Tmp = Mat()
-            val blurS16Tmp = Mat()
-            try {
-                Imgproc.GaussianBlur(base, baseBlur, Size(0.0, 0.0), 1.6)
-                base.convertTo(baseS16Tmp, CvType.CV_16SC3)
-                baseBlur.convertTo(blurS16Tmp, CvType.CV_16SC3)
-                Core.subtract(baseS16Tmp, blurS16Tmp, highS16)
+            val bS16 = baseS16Tmp ?: Mat().also { baseS16Tmp = it }
+            val blS16 = blurS16Tmp ?: Mat().also { blurS16Tmp = it }
+            Imgproc.GaussianBlur(base, baseBlur, Size(0.0, 0.0), 1.6)
+            base.convertTo(bS16, CvType.CV_16SC3)
+            baseBlur.convertTo(blS16, CvType.CV_16SC3)
+            Core.subtract(bS16, blS16, highS16)
 
-                targetRgb8u.convertTo(targetS16, CvType.CV_16SC3)
-                val hfGain = (0.45 + detailRecovery * 0.55).coerceIn(0.45, 1.05)
-                Core.scaleAdd(highS16, hfGain, targetS16, targetS16)
-                targetS16.convertTo(targetRgb8u, CvType.CV_8UC3)
-            } finally {
-                baseS16Tmp.release()
-                blurS16Tmp.release()
-            }
+            targetRgb8u.convertTo(targetS16, CvType.CV_16SC3)
+            val hfGain = (0.45 + detailRecovery * 0.55).coerceIn(0.45, 1.05)
+            Core.scaleAdd(highS16, hfGain, targetS16, targetS16)
+            targetS16.convertTo(targetRgb8u, CvType.CV_8UC3)
         }
 
         // Apply Halo-Clamped Multi-Scale Deblur + AI Sharpening (activates previously dead params!)
@@ -1147,18 +1156,16 @@ class OnnxAiInferenceEngine(private val context: Context) {
         val detail = lwDetailMat ?: Mat().also { lwDetailMat = it }
         val minN = lwMinNMat ?: Mat().also { lwMinNMat = it }
         val maxN = lwMaxNMat ?: Mat().also { lwMaxNMat = it }
-        val kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(3.0, 3.0))
-        try {
-            Imgproc.erode(mat8u, minN, kernel)
-            Imgproc.dilate(mat8u, maxN, kernel)
-            Imgproc.GaussianBlur(mat8u, blur, Size(0.0, 0.0), sigma)
-            Core.addWeighted(mat8u, 1.0 + amount, blur, -amount, 0.0, detail)
-            // Clamp overshoot to 3x3 neighborhood bounds to avoid white/black halo ringing
-            Core.max(detail, minN, detail)
-            Core.min(detail, maxN, mat8u)
-        } finally {
-            kernel.release()
+        val kernel = morphKernel3x3 ?: Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(3.0, 3.0)).also {
+            morphKernel3x3 = it
         }
+        Imgproc.erode(mat8u, minN, kernel)
+        Imgproc.dilate(mat8u, maxN, kernel)
+        Imgproc.GaussianBlur(mat8u, blur, Size(0.0, 0.0), sigma)
+        Core.addWeighted(mat8u, 1.0 + amount, blur, -amount, 0.0, detail)
+        // Clamp overshoot to 3x3 neighborhood bounds to avoid white/black halo ringing
+        Core.max(detail, minN, detail)
+        Core.min(detail, maxN, mat8u)
     }
 
     private fun enhanceFaceRegionsWithSr(
@@ -1179,7 +1186,7 @@ class OnnxAiInferenceEngine(private val context: Context) {
         val paddedTile = tilePaddedMatA!!
         val floatTileHwc = tileFloatHwcA!!
         val directBuf = tileInBufA!!
-        val planeTmp = tileInPlaneTmpA
+        val cachedTensor = tileCachedTensorA!!
         val scaleX = outW.toDouble() / inW.toDouble()
         val scaleY = outH.toDouble() / inH.toDouble()
 
@@ -1227,11 +1234,8 @@ class OnnxAiInferenceEngine(private val context: Context) {
             roi.release()
 
             paddedTile.convertTo(floatTileHwc, CvType.CV_32FC3, 1.0 / 255.0)
-            Core.split(floatTileHwc, chIn)
-            directBuf.clear()
             for (c in 0 until 3) {
-                chIn[c].get(0, 0, planeTmp)
-                directBuf.put(planeTmp)
+                Core.extractChannel(floatTileHwc, chIn[c], c)
             }
             directBuf.rewind()
 
@@ -1244,6 +1248,7 @@ class OnnxAiInferenceEngine(private val context: Context) {
 
             runSrTileAndResizeDirect(
                 inputBuf = directBuf,
+                cachedTensor = cachedTensor,
                 shape = fixedShape,
                 tileSize = safeTileSize,
                 validSrW = validSrW,
@@ -1322,6 +1327,7 @@ class OnnxAiInferenceEngine(private val context: Context) {
 
     private fun runSrTileAndResizeDirect(
         inputBuf: FloatBuffer,
+        cachedTensor: OnnxTensor,
         shape: LongArray,
         tileSize: Int,
         validSrW: Int,
@@ -1335,16 +1341,14 @@ class OnnxAiInferenceEngine(private val context: Context) {
             try {
                 val inputName = current.inputNames.first()
                 inputBuf.rewind()
-                OnnxTensor.createTensor(env, inputBuf, shape).use { tensor ->
-                    current.run(mapOf(inputName to tensor)).use { results ->
-                        val outTensor = results[0] as OnnxTensor
-                        val outBuf = outTensor.floatBuffer
-                        val probe = outBuf.get(0)
-                        if (probe.isNaN() || probe.isInfinite()) {
-                            throw IllegalStateException("NaN output from ${backendId.displayLabel}")
-                        }
-                        extractValidPlanesAndResize(outBuf, tileSize, validSrW, validSrH, dstSize, outResizedHwc)
+                current.run(mapOf(inputName to cachedTensor)).use { results ->
+                    val outTensor = results[0] as OnnxTensor
+                    val outBuf = outTensor.floatBuffer
+                    val probe = outBuf.get(0)
+                    if (probe.isNaN() || probe.isInfinite()) {
+                        throw IllegalStateException("NaN output from ${backendId.displayLabel}")
                     }
+                    extractValidPlanesAndResize(outBuf, tileSize, validSrW, validSrH, dstSize, outResizedHwc)
                 }
                 return
             } catch (t: Throwable) {
@@ -1367,7 +1371,8 @@ class OnnxAiInferenceEngine(private val context: Context) {
     ) {
         val outDim = tileSize * 4
         val outPixels = outDim * outDim
-        val fullPlane = outFullPlaneMat!!
+        val dstOutFloats = tileOutDirectFloatBuf!!
+        val outWraps = tileOutPlaneWraps!!
         val smallCh = resizedOutChannels!!
         val safeValidW = validSrW.coerceIn(1, outDim)
         val safeValidH = validSrH.coerceIn(1, outDim)
@@ -1376,10 +1381,21 @@ class OnnxAiInferenceEngine(private val context: Context) {
         val dstH = dstSize.height.roundToInt()
         val exactMatch = (dstW == safeValidW && dstH == safeValidH)
 
+        // Bulk direct-to-direct native FloatBuffer transfer -> OpenCV Mat slices wrap memory directly with zero FloatArray copy!
+        outBuf.position(0)
+        val needed = 3 * outPixels
+        if (outBuf.remaining() > needed) {
+            val slicedSrc = outBuf.slice().apply { limit(needed) }
+            dstOutFloats.clear()
+            dstOutFloats.put(slicedSrc)
+        } else {
+            dstOutFloats.clear()
+            dstOutFloats.put(outBuf)
+        }
+        dstOutFloats.rewind()
+
         for (c in 0 until 3) {
-            outBuf.position(c * outPixels)
-            outBuf.get(tileOutPlaneTmp, 0, outPixels)
-            fullPlane.put(0, 0, tileOutPlaneTmp)
+            val fullPlane = outWraps[c]
             val srcRegion = if (needCrop) Mat(fullPlane, Rect(0, 0, safeValidW, safeValidH)) else fullPlane
             if (exactMatch) {
                 srcRegion.copyTo(smallCh[c])
@@ -1436,27 +1452,63 @@ class OnnxAiInferenceEngine(private val context: Context) {
 
     private fun ensureTileBuffers(tileSize: Int) {
         if (allocTileSize != tileSize) {
-            allocTileSize = tileSize
-            val px = tileSize * tileSize
-            val bytes = 3 * px * 4
-            tileInBufA = ByteBuffer.allocateDirect(bytes).order(ByteOrder.nativeOrder()).asFloatBuffer()
-            tileInBufB = ByteBuffer.allocateDirect(bytes).order(ByteOrder.nativeOrder()).asFloatBuffer()
-            tileInPlaneTmpA = FloatArray(px)
-            tileInPlaneTmpB = FloatArray(px)
-
-            val outDim = tileSize * 4
-            val outPx = outDim * outDim
-            tileOutPlaneTmp = FloatArray(outPx)
-
+            runCatching { tileCachedTensorA?.close() }
+            runCatching { tileCachedTensorB?.close() }
+            tileCachedTensorA = null
+            tileCachedTensorB = null
             tileChannelsA?.forEach { it.release() }
             tileChannelsB?.forEach { it.release() }
+            tileOutPlaneWraps?.forEach { it.release() }
             resizedOutChannels?.forEach { it.release() }
-            tileChannelsA = List(3) { Mat(tileSize, tileSize, CvType.CV_32FC1) }
-            tileChannelsB = List(3) { Mat(tileSize, tileSize, CvType.CV_32FC1) }
-            resizedOutChannels = List(3) { Mat() }
 
-            outFullPlaneMat?.release()
-            outFullPlaneMat = Mat(outDim, outDim, CvType.CV_32FC1)
+            allocTileSize = tileSize
+            val px = tileSize * tileSize
+            val planeBytes = px * 4
+            val inBytes = 3 * planeBytes
+            val inByteA = ByteBuffer.allocateDirect(inBytes).order(ByteOrder.nativeOrder())
+            val inByteB = ByteBuffer.allocateDirect(inBytes).order(ByteOrder.nativeOrder())
+            val fBufA = inByteA.asFloatBuffer()
+            val fBufB = inByteB.asFloatBuffer()
+            tileInByteBufA = inByteA
+            tileInByteBufB = inByteB
+            tileInBufA = fBufA
+            tileInBufB = fBufB
+
+            val shape = longArrayOf(1L, 3L, tileSize.toLong(), tileSize.toLong())
+            fBufA.clear()
+            fBufB.clear()
+            tileCachedTensorA = OnnxTensor.createTensor(env, fBufA, shape)
+            tileCachedTensorB = OnnxTensor.createTensor(env, fBufB, shape)
+
+            tileChannelsA = List(3) { c ->
+                val slice = inByteA.duplicate().apply {
+                    position(c * planeBytes)
+                    limit((c + 1) * planeBytes)
+                }.slice().order(ByteOrder.nativeOrder())
+                Mat(tileSize, tileSize, CvType.CV_32FC1, slice)
+            }
+            tileChannelsB = List(3) { c ->
+                val slice = inByteB.duplicate().apply {
+                    position(c * planeBytes)
+                    limit((c + 1) * planeBytes)
+                }.slice().order(ByteOrder.nativeOrder())
+                Mat(tileSize, tileSize, CvType.CV_32FC1, slice)
+            }
+
+            val outDim = tileSize * 4
+            val outPlaneBytes = outDim * outDim * 4
+            val outByteBuf = ByteBuffer.allocateDirect(3 * outPlaneBytes).order(ByteOrder.nativeOrder())
+            tileOutDirectByteBuf = outByteBuf
+            tileOutDirectFloatBuf = outByteBuf.asFloatBuffer()
+            tileOutPlaneWraps = List(3) { c ->
+                val slice = outByteBuf.duplicate().apply {
+                    position(c * outPlaneBytes)
+                    limit((c + 1) * outPlaneBytes)
+                }.slice().order(ByteOrder.nativeOrder())
+                Mat(outDim, outDim, CvType.CV_32FC1, slice)
+            }
+
+            resizedOutChannels = List(3) { Mat() }
             tilePaddedMatA?.release(); tilePaddedMatA = Mat(tileSize, tileSize, CvType.CV_8UC3)
             tilePaddedMatB?.release(); tilePaddedMatB = Mat(tileSize, tileSize, CvType.CV_8UC3)
             tileFloatHwcA?.release(); tileFloatHwcA = Mat(tileSize, tileSize, CvType.CV_32FC3)
@@ -1597,7 +1649,6 @@ class OnnxAiInferenceEngine(private val context: Context) {
 
     fun releaseWorkBuffers() {
         srTileCache.reset()
-        dncnnTileCache.reset()
         if (yuNetRunnerLazy.isInitialized()) {
             yuNetRunner.releaseWorkBuffers()
         }
@@ -1613,11 +1664,14 @@ class OnnxAiInferenceEngine(private val context: Context) {
         dncnnAsyncExecutor = null
 
         allocTileSize = 0
+        runCatching { tileCachedTensorA?.close() }; tileCachedTensorA = null
+        runCatching { tileCachedTensorB?.close() }; tileCachedTensorB = null
+        tileInByteBufA = null
+        tileInByteBufB = null
         tileInBufA = null
         tileInBufB = null
-        tileInPlaneTmpA = FloatArray(0)
-        tileInPlaneTmpB = FloatArray(0)
-        tileOutPlaneTmp = FloatArray(0)
+        tileOutDirectByteBuf = null
+        tileOutDirectFloatBuf = null
 
         for (s in 0 until 2) {
             runCatching { dncnnCachedInTensors[s]?.close() }
@@ -1631,6 +1685,7 @@ class OnnxAiInferenceEngine(private val context: Context) {
             dncnnOutFloatBufs[s] = null
         }
         dncnnAsyncBgrSmall?.release(); dncnnAsyncBgrSmall = null
+        dncnnAsyncGrayTmp?.release(); dncnnAsyncGrayTmp = null
         dncnnResidualF?.release(); dncnnResidualF = null
         dncnnResQ4Mat256?.release(); dncnnResQ4Mat256 = null
         dncnnResQ4Up?.release(); dncnnResQ4Up = null
@@ -1643,8 +1698,8 @@ class OnnxAiInferenceEngine(private val context: Context) {
 
         tileChannelsA?.forEach { it.release() }; tileChannelsA = null
         tileChannelsB?.forEach { it.release() }; tileChannelsB = null
+        tileOutPlaneWraps?.forEach { it.release() }; tileOutPlaneWraps = null
         resizedOutChannels?.forEach { it.release() }; resizedOutChannels = null
-        outFullPlaneMat?.release(); outFullPlaneMat = null
         tilePaddedMatA?.release(); tilePaddedMatA = null
         tilePaddedMatB?.release(); tilePaddedMatB = null
         tileFloatHwcA?.release(); tileFloatHwcA = null
@@ -1657,6 +1712,8 @@ class OnnxAiInferenceEngine(private val context: Context) {
         baseRgb8u?.release(); baseRgb8u = null
         baseLowBlur8u?.release(); baseLowBlur8u = null
         baseHighDetailS16?.release(); baseHighDetailS16 = null
+        baseS16Tmp?.release(); baseS16Tmp = null
+        blurS16Tmp?.release(); blurS16Tmp = null
         outRgbS16?.release(); outRgbS16 = null
         accumRgbMat?.release(); accumRgbMat = null
         accumWeightMat?.release(); accumWeightMat = null
@@ -1678,6 +1735,7 @@ class OnnxAiInferenceEngine(private val context: Context) {
         lwBlurFineMat?.release(); lwBlurFineMat = null
         lwMinNMat?.release(); lwMinNMat = null
         lwMaxNMat?.release(); lwMaxNMat = null
+        morphKernel3x3?.release(); morphKernel3x3 = null
         clearFeatherCache()
     }
 

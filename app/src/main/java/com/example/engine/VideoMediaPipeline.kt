@@ -291,7 +291,7 @@ class VideoMediaPipeline(
                         "smooth=${if (cadenceInterpolate) "Flow 2x (${encoderFps.roundToInt()}fps)" else "VFR Stabilized (${safeFps.roundToInt()}fps)"}"
                 )
 
-                val channelCap = if (capabilities.availableRamMb > 1400L) 4 else 3
+                val channelCap = if (capabilities.availableRamMb > 1400L) 6 else 4
                 val frameChannel = Channel<DecodedFrame>(capacity = channelCap)
 
                 var totalFacesEnhanced = 0
