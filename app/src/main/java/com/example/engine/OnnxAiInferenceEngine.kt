@@ -687,8 +687,8 @@ class OnnxAiInferenceEngine(private val context: Context) {
     ): TileProcessOutcome {
         val inW = srcBgr.cols()
         val inH = srcBgr.rows()
-        val safeOutW = outW.coerceAtLeast(inW)
-        val safeOutH = outH.coerceAtLeast(inH)
+        val safeOutW = outW.coerceAtLeast(2)
+        val safeOutH = outH.coerceAtLeast(2)
 
         if (forceLightweightFallback || !isRealEsrganReady) {
             val resizedBase = if (inW != safeOutW || inH != safeOutH) {

@@ -357,7 +357,7 @@ class FourPillarEnhancementTest {
 
         // Verify Resolution Scaling + Neural Working Dimensions + Tile Planning
         val out4x = ResolutionCalculator.calculate(meta24fps, EnhancementMode.CLARITY_4X, profiles.getValue(EnhancementMode.CLARITY_4X), caps)
-        assertEquals(3840 to 2160, out4x.width to out4x.height)
+        assertEquals(1920 to 1080, out4x.width to out4x.height)
         val work4x = AiTilingMath.computeNeuralWorkingSize(1280, 720, out4x.width, out4x.height, out4x.aiTileSize, out4x.tilesPerFrame)
         val grid4x = AiTilingMath.planUpscaleTileGrid(work4x.first, work4x.second, out4x.width, out4x.height, out4x.aiTileSize, out4x.tilesPerFrame)
         assertTrue(grid4x.totalTiles in 1..4)

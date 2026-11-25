@@ -34,17 +34,6 @@ object ResolutionCalculator {
         val preferH265 = profile.preferredCodec.equals("H265", ignoreCase = true) &&
             (capabilities?.hardwareH265Supported == true)
 
-        val rawScale = when {
-            profile.preserveOriginalResolution -> 1.0f
-            profile.targetScaleFactor > 1.0f -> profile.targetScaleFactor
-            else -> when (mode) {
-                EnhancementMode.CLARITY_1X -> 1.0f
-                EnhancementMode.CLARITY_2X -> 2.0f
-                EnhancementMode.CLARITY_3X -> 3.0f
-                EnhancementMode.CLARITY_4X -> 4.0f
-            }
-        }
-
         val hardwareMaxLongEdge = (capabilities?.maxEncodeLongEdge ?: 3840).coerceAtLeast(1920)
         val profileMaxLongEdge = if (profile.maxOutputLongEdge > 0) {
             min(profile.maxOutputLongEdge, hardwareMaxLongEdge)
@@ -52,23 +41,40 @@ object ResolutionCalculator {
             hardwareMaxLongEdge
         }
 
-        val inLongEdge = max(evenInW, evenInH)
-        val effectiveScale = if (profile.preserveOriginalResolution || rawScale <= 1.01f) {
-            1.0f
-        } else {
-            val maxAllowedScale = profileMaxLongEdge.toFloat() / inLongEdge.toFloat()
-            min(rawScale, maxAllowedScale).coerceAtLeast(1.0f)
-        }
+        val isPortrait = evenInH > evenInW
+        val outW: Int
+        val outH: Int
+        if (!profile.preserveOriginalResolution && profile.targetLongEdge > 0 && profile.targetShortEdge > 0) {
+            val cappedLongEdge = min(profile.targetLongEdge, profileMaxLongEdge)
+            val edgeScaleDown = cappedLongEdge.toDouble() / profile.targetLongEdge.toDouble()
+            val cappedShortEdge = max(2, (profile.targetShortEdge * edgeScaleDown).roundToInt())
 
-        val outW = if (effectiveScale <= 1.01f) {
-            evenInW
+            val boxW = if (isPortrait) cappedShortEdge else cappedLongEdge
+            val boxH = if (isPortrait) cappedLongEdge else cappedShortEdge
+
+            val fitScale = min(boxW.toDouble() / evenInW.toDouble(), boxH.toDouble() / evenInH.toDouble())
+            outW = makeEvenNearest((evenInW * fitScale).roundToInt())
+            outH = makeEvenNearest((evenInH * fitScale).roundToInt())
         } else {
-            makeEven((evenInW * effectiveScale).roundToInt())
-        }
-        val outH = if (effectiveScale <= 1.01f) {
-            evenInH
-        } else {
-            makeEven((evenInH * effectiveScale).roundToInt())
+            val rawScale = when {
+                profile.preserveOriginalResolution -> 1.0f
+                profile.targetScaleFactor > 1.0f -> profile.targetScaleFactor
+                else -> when (mode) {
+                    EnhancementMode.CLARITY_1X -> 1.0f
+                    EnhancementMode.CLARITY_2X -> 2.0f
+                    EnhancementMode.CLARITY_3X -> 3.0f
+                    EnhancementMode.CLARITY_4X -> 4.0f
+                }
+            }
+            val inLongEdge = max(evenInW, evenInH)
+            val effectiveScale = if (profile.preserveOriginalResolution || rawScale <= 1.01f) {
+                1.0f
+            } else {
+                val maxAllowedScale = profileMaxLongEdge.toFloat() / inLongEdge.toFloat()
+                min(rawScale, maxAllowedScale).coerceAtLeast(1.0f)
+            }
+            outW = if (effectiveScale <= 1.01f) evenInW else makeEven((evenInW * effectiveScale).roundToInt())
+            outH = if (effectiveScale <= 1.01f) evenInH else makeEven((evenInH * effectiveScale).roundToInt())
         }
 
         val actualScaleX = outW.toFloat() / evenInW.toFloat()
@@ -107,7 +113,7 @@ object ResolutionCalculator {
             scaleFactorY = actualScaleY,
             needsAiSuperResolution = profile.useAiSuperResolution && baseTileSize > 0 && neededTiles > 0,
             needsMultiStageUpscaling = actualScale > 2.05f,
-            preserveOriginalResolution = effectiveScale <= 1.01f,
+            preserveOriginalResolution = (outW == evenInW && outH == evenInH),
             targetBitrateBps = bitrate,
             useH265 = preferH265,
             aiTileSize = baseTileSize,
@@ -140,6 +146,11 @@ object ResolutionCalculator {
 
     private fun makeEven(value: Int): Int {
         val aligned = (value / 2) * 2
+        return if (aligned < 2) 2 else aligned
+    }
+
+    private fun makeEvenNearest(value: Int): Int {
+        val aligned = ((value + 1) / 2) * 2
         return if (aligned < 2) 2 else aligned
     }
 

@@ -13,31 +13,31 @@ enum class EnhancementMode(
 ) {
     CLARITY_1X(
         id = "CLARITY_1X",
-        label = "1x",
-        title = "Clarity 1x",
-        shortBadge = "Natural AI • 1x",
-        subtitle = "Natural AI • Original Res"
+        label = "HD",
+        title = "HD",
+        shortBadge = "Natural AI • HD",
+        subtitle = "576×1024 • 1024×576"
     ),
     CLARITY_2X(
         id = "CLARITY_2X",
-        label = "2x",
-        title = "Clarity 2x",
-        shortBadge = "HD AI • 2x",
-        subtitle = "HD AI • 2x Super-Res"
+        label = "HD+",
+        title = "HD+",
+        shortBadge = "HD AI • HD+",
+        subtitle = "648×1152 • 1152×648"
     ),
     CLARITY_3X(
         id = "CLARITY_3X",
-        label = "3x",
-        title = "Clarity 3x",
-        shortBadge = "Ultra AI • 3x",
-        subtitle = "Ultra AI • 3x Super-Res"
+        label = "FHD",
+        title = "FHD",
+        shortBadge = "Ultra AI • FHD",
+        subtitle = "810×1440 • 1440×810"
     ),
     CLARITY_4X(
         id = "CLARITY_4X",
-        label = "4x",
-        title = "Clarity 4x",
-        shortBadge = "Max AI • 4x",
-        subtitle = "Maximum AI • 4x Super-Res"
+        label = "2K",
+        title = "2K",
+        shortBadge = "Max AI • 2K",
+        subtitle = "1080×1920 • 1920×1080"
     )
 }
 

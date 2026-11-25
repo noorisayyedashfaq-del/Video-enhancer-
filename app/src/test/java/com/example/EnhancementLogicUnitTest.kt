@@ -92,21 +92,26 @@ class EnhancementLogicUnitTest {
     )
 
     @Test
-    fun `all 4 Clarity modes apply progressive true super-resolution scaling and bitrate increases`() {
+    fun `all 4 Clarity modes apply progressive target resolutions and bitrate increases`() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val profiles = EnhancementProfileRepository(context).loadProfiles()
         val caps = testCapabilities(maxLongEdge = 3840)
 
-        // Low-res 480x360 progressively upscales: 1x (480x360) -> 2x (960x720) -> 3x (1440x1080) -> 4x (1920x1440)
+        assertEquals("HD", EnhancementMode.CLARITY_1X.label)
+        assertEquals("HD+", EnhancementMode.CLARITY_2X.label)
+        assertEquals("FHD", EnhancementMode.CLARITY_3X.label)
+        assertEquals("2K", EnhancementMode.CLARITY_4X.label)
+
+        // Low-res 4:3 480x360 fits target short/long edges aspect-preservingly: 768x576 -> 864x648 -> 1080x810 -> 1440x1080
         val c1 = ResolutionCalculator.calculate(sampleMetadataLowRes, EnhancementMode.CLARITY_1X, profiles.getValue(EnhancementMode.CLARITY_1X), caps)
         val c2 = ResolutionCalculator.calculate(sampleMetadataLowRes, EnhancementMode.CLARITY_2X, profiles.getValue(EnhancementMode.CLARITY_2X), caps)
         val c3 = ResolutionCalculator.calculate(sampleMetadataLowRes, EnhancementMode.CLARITY_3X, profiles.getValue(EnhancementMode.CLARITY_3X), caps)
         val c4 = ResolutionCalculator.calculate(sampleMetadataLowRes, EnhancementMode.CLARITY_4X, profiles.getValue(EnhancementMode.CLARITY_4X), caps)
 
-        assertEquals(480 to 360, c1.width to c1.height)
-        assertEquals(960 to 720, c2.width to c2.height)
-        assertEquals(1440 to 1080, c3.width to c3.height)
-        assertEquals(1920 to 1440, c4.width to c4.height)
+        assertEquals(768 to 576, c1.width to c1.height)
+        assertEquals(864 to 648, c2.width to c2.height)
+        assertEquals(1080 to 810, c3.width to c3.height)
+        assertEquals(1440 to 1080, c4.width to c4.height)
 
         assertTrue(c1.needsAiSuperResolution && c2.needsAiSuperResolution && c3.needsAiSuperResolution && c4.needsAiSuperResolution)
         assertTrue(c2.targetBitrateBps > c1.targetBitrateBps)
@@ -115,34 +120,38 @@ class EnhancementLogicUnitTest {
         // Small 480x360 should NOT explode into 25 wasteful tiny tiles
         assertTrue("Expected lean tile count <= 6 for 480x360, got ${c4.tilesPerFrame}", c4.tilesPerFrame <= 6)
 
-        // 720p source cleanly scales up to 2560x1440 (2x), 3200x1800 (3x cap), and 3840x2160 4K (4x cap)
+        // 16:9 Landscape outputs: HD (1024x576), HD+ (1152x648), FHD (1440x810), 2K (1920x1080)
+        val hd1 = ResolutionCalculator.calculate(sampleMetadataHd, EnhancementMode.CLARITY_1X, profiles.getValue(EnhancementMode.CLARITY_1X), caps)
         val hd2 = ResolutionCalculator.calculate(sampleMetadataHd, EnhancementMode.CLARITY_2X, profiles.getValue(EnhancementMode.CLARITY_2X), caps)
         val hd3 = ResolutionCalculator.calculate(sampleMetadataHd, EnhancementMode.CLARITY_3X, profiles.getValue(EnhancementMode.CLARITY_3X), caps)
         val hd4 = ResolutionCalculator.calculate(sampleMetadataHd, EnhancementMode.CLARITY_4X, profiles.getValue(EnhancementMode.CLARITY_4X), caps)
 
-        assertEquals(2560 to 1440, hd2.width to hd2.height)
-        assertEquals(3200 to 1800, hd3.width to hd3.height)
-        assertEquals(3840 to 2160, hd4.width to hd4.height)
+        assertEquals(1024 to 576, hd1.width to hd1.height)
+        assertEquals(1152 to 648, hd2.width to hd2.height)
+        assertEquals(1440 to 810, hd3.width to hd3.height)
+        assertEquals(1920 to 1080, hd4.width to hd4.height)
 
-        // Respects lower hardware maxEncodeLongEdge cap when present
+        // Respects hardware maxEncodeLongEdge cap when present
         val cappedCaps = testCapabilities(maxLongEdge = 1920)
         val hd4Capped = ResolutionCalculator.calculate(sampleMetadataHd, EnhancementMode.CLARITY_4X, profiles.getValue(EnhancementMode.CLARITY_4X), cappedCaps)
         assertEquals(1920 to 1080, hd4Capped.width to hd4Capped.height)
     }
 
     @Test
-    fun `portrait video scales aspect-accurately across Clarity 1x to 4x`() {
+    fun `portrait video scales aspect-accurately across HD HD+ FHD and 2K`() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val profiles = EnhancementProfileRepository(context).loadProfiles()
         val caps = testCapabilities(maxLongEdge = 3840)
 
         val p1 = ResolutionCalculator.calculate(sampleMetadataPortrait, EnhancementMode.CLARITY_1X, profiles.getValue(EnhancementMode.CLARITY_1X), caps)
         val p2 = ResolutionCalculator.calculate(sampleMetadataPortrait, EnhancementMode.CLARITY_2X, profiles.getValue(EnhancementMode.CLARITY_2X), caps)
+        val p3 = ResolutionCalculator.calculate(sampleMetadataPortrait, EnhancementMode.CLARITY_3X, profiles.getValue(EnhancementMode.CLARITY_3X), caps)
         val p4 = ResolutionCalculator.calculate(sampleMetadataPortrait, EnhancementMode.CLARITY_4X, profiles.getValue(EnhancementMode.CLARITY_4X), caps)
 
-        assertEquals(360 to 640, p1.width to p1.height)
-        assertEquals(720 to 1280, p2.width to p2.height)
-        assertEquals(1440 to 2560, p4.width to p4.height)
+        assertEquals(576 to 1024, p1.width to p1.height)
+        assertEquals(648 to 1152, p2.width to p2.height)
+        assertEquals(810 to 1440, p3.width to p3.height)
+        assertEquals(1080 to 1920, p4.width to p4.height)
     }
 
     @Test

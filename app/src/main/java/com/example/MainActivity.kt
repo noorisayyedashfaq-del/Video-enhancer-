@@ -226,10 +226,10 @@ class MainActivity : ComponentActivity() {
 
     private fun executeQualityTask(quality: String) {
         when (quality.uppercase()) {
-            "1X", "CLARITY 1X", "CLARITY_1X" -> selectQualityAndOptionallyStart(EnhancementMode.CLARITY_1X)
-            "2X", "CLARITY 2X", "CLARITY_2X" -> selectQualityAndOptionallyStart(EnhancementMode.CLARITY_2X)
-            "3X", "CLARITY 3X", "CLARITY_3X" -> selectQualityAndOptionallyStart(EnhancementMode.CLARITY_3X)
-            "4X", "CLARITY 4X", "CLARITY_4X" -> selectQualityAndOptionallyStart(EnhancementMode.CLARITY_4X)
+            "HD", "1X", "CLARITY 1X", "CLARITY_1X" -> selectQualityAndOptionallyStart(EnhancementMode.CLARITY_1X)
+            "HD+", "2X", "CLARITY 2X", "CLARITY_2X" -> selectQualityAndOptionallyStart(EnhancementMode.CLARITY_2X)
+            "FHD", "3X", "CLARITY 3X", "CLARITY_3X" -> selectQualityAndOptionallyStart(EnhancementMode.CLARITY_3X)
+            "2K", "4X", "CLARITY 4X", "CLARITY_4X" -> selectQualityAndOptionallyStart(EnhancementMode.CLARITY_4X)
             "ENHANCE" -> startEnhancementWithNotificationCheck()
             "DOWNLOAD" -> saveEnhancedVideo()
             "EXPORT" -> exportEnhancedVideoAs()
