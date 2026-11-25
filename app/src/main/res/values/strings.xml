@@ -6,6 +6,7 @@
     <string name="action_start_enhancement">Start Enhancement</string>
     <string name="action_cancel_processing">Cancel</string>
     <string name="action_save_video">Save Enhanced Video</string>
+    <string name="action_settings">Settings</string>
     <string name="action_play">Play</string>
     <string name="action_pause">Pause</string>
     <string name="label_original_preview">Original Video Preview</string>

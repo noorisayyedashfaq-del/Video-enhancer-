@@ -21,3 +21,11 @@ val SubtleSteel = Color(0xFF6B788E)
 val StatusSuccess = Color(0xFF2CE69B)
 val StatusWarning = Color(0xFFFFB020)
 val StatusError = Color(0xFFFF5C6C)
+
+val QualityButtonSurface = Color(0xFF1F2024)
+val QualityButtonBorderIdle = Color(0xFF35383E)
+val QualityButtonForeground = Color(0xFFFFFFFF)
+val QualityGlowCyan = Color(0xFF3EF2E6)
+val QualityGlowMid = Color(0xFFE6FAFF)
+val QualityGlowPurple = Color(0xFFBC7BFF)
+

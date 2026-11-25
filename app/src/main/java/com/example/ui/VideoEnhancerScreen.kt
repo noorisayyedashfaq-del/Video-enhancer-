@@ -33,13 +33,11 @@ import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.ErrorOutline
-import androidx.compose.material.icons.filled.Hd
-import androidx.compose.material.icons.filled.HighQuality
 import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.Movie
-import androidx.compose.material.icons.filled.OfflineBolt
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.SaveAlt
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.VideoLibrary
 import androidx.compose.material3.Button
@@ -65,11 +63,21 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -90,10 +98,15 @@ import com.example.model.VideoMetadata
 import com.example.ui.components.OriginalVideoPreviewPlayer
 import com.example.ui.components.SynchronizedVideoComparison
 import com.example.ui.theme.AmberFourK
-import com.example.ui.theme.AmberFourKContainer
 import com.example.ui.theme.CyanMaster
 import com.example.ui.theme.CyanMasterContainer
 import com.example.ui.theme.MutedSteel
+import com.example.ui.theme.QualityButtonBorderIdle
+import com.example.ui.theme.QualityButtonForeground
+import com.example.ui.theme.QualityButtonSurface
+import com.example.ui.theme.QualityGlowCyan
+import com.example.ui.theme.QualityGlowMid
+import com.example.ui.theme.QualityGlowPurple
 import com.example.ui.theme.StatusError
 import com.example.ui.theme.StatusSuccess
 import com.example.ui.theme.StatusWarning
@@ -144,10 +157,7 @@ fun VideoEnhancerScreen(
                 verticalArrangement = Arrangement.spacedBy(14.dp)
             ) {
                 StudioHeader(
-                    health = uiState.engineHealth,
-                    capabilities = uiState.deviceCapabilities,
-                    isBenchmarking = uiState.isBenchmarkingHardware,
-                    onHardwarePillClick = { showHardwareDialog = true }
+                    onSettingsClick = { showHardwareDialog = true }
                 )
 
                 // Error Banner
@@ -177,7 +187,6 @@ fun VideoEnhancerScreen(
                 // 3. Four Enhancement Buttons: HD, HD+, FHD, 2K (all wired to startWithAd)
                 EnhancementModesSection(
                     selectedMode = uiState.selectedMode,
-                    computedDimensions = uiState.computedOutputDimensions,
                     isProcessing = uiState.isProcessing,
                     onSelectMode = { mode -> onStartWithAd(mode.label) }
                 )
@@ -235,10 +244,7 @@ fun VideoEnhancerScreen(
 
 @Composable
 private fun StudioHeader(
-    health: EngineHealthStatus?,
-    capabilities: DeviceCapabilities?,
-    isBenchmarking: Boolean,
-    onHardwarePillClick: () -> Unit
+    onSettingsClick: () -> Unit
 ) {
     Row(
         modifier = Modifier.fillMaxWidth(),
@@ -273,56 +279,23 @@ private fun StudioHeader(
             }
         }
 
-        val pillLabel = when {
-            isBenchmarking -> "BENCHMARK..."
-            health?.hardwareProfile != null -> health.hardwareProfile.compactSummaryPill()
-            health?.realEsrganModelReady == true -> "OFFLINE AI"
-            else -> "INIT..."
-        }
-
         Surface(
             color = StudioSurfaceElevated,
-            shape = RoundedCornerShape(10.dp),
-            border = BorderStroke(1.dp, CyanMaster.copy(alpha = 0.45f)),
+            shape = RoundedCornerShape(12.dp),
+            border = BorderStroke(1.dp, StudioBorder),
             modifier = Modifier
-                .minimumInteractiveComponentSize()
-                .clip(RoundedCornerShape(10.dp))
-                .clickable(onClick = onHardwarePillClick)
-                .testTag("hardware_diagnostics_button")
+                .size(48.dp)
+                .clip(RoundedCornerShape(12.dp))
+                .clickable(onClick = onSettingsClick)
+                .testTag("settings_button")
         ) {
-            Row(
-                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(6.dp)
-            ) {
-                if (isBenchmarking) {
-                    CircularProgressIndicator(
-                        color = CyanMaster,
-                        strokeWidth = 2.dp,
-                        modifier = Modifier.size(14.dp)
-                    )
-                } else {
-                    Icon(
-                        imageVector = Icons.Default.OfflineBolt,
-                        contentDescription = "Hardware acceleration status",
-                        tint = CyanMaster,
-                        modifier = Modifier.size(16.dp)
-                    )
-                }
-                Text(
-                    text = pillLabel,
-                    style = MaterialTheme.typography.labelSmall,
-                    color = CyanMaster,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
+            Box(contentAlignment = Alignment.Center) {
+                Icon(
+                    imageVector = Icons.Default.Settings,
+                    contentDescription = stringResource(id = R.string.action_settings),
+                    tint = MaterialTheme.colorScheme.onSurface,
+                    modifier = Modifier.size(22.dp)
                 )
-                if (!isBenchmarking && capabilities != null && health?.hardwareProfile == null) {
-                    Text(
-                        text = "• ${capabilities.totalRamMb / 1024}GB",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MutedSteel
-                    )
-                }
             }
         }
     }
@@ -477,31 +450,12 @@ private fun ViewportSection(
                             .border(1.dp, StudioBorder, RoundedCornerShape(12.dp))
                     ) {
                         Image(
-                            painter = painterResource(id = R.drawable.img_studio_banner),
-                            contentDescription = "Offline AI video mastering preview banner",
+                            painter = painterResource(id = R.drawable.img_video_comparison),
+                            contentDescription = "144p to HD video enhancement comparison preview",
                             contentScale = ContentScale.Crop,
+                            alignment = Alignment.Center,
                             modifier = Modifier.fillMaxSize()
                         )
-                        Box(
-                            modifier = Modifier
-                                .fillMaxSize()
-                                .background(
-                                    Brush.verticalGradient(
-                                        listOf(
-                                            StudioObsidian.copy(alpha = 0.35f),
-                                            StudioObsidian.copy(alpha = 0.88f)
-                                        )
-                                    )
-                                ),
-                            contentAlignment = Alignment.BottomStart
-                        ) {
-                            Text(
-                                text = stringResource(R.string.empty_video_prompt),
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = MaterialTheme.colorScheme.onBackground,
-                                modifier = Modifier.padding(16.dp)
-                            )
-                        }
                     }
                 }
             }
@@ -512,90 +466,99 @@ private fun ViewportSection(
 @Composable
 private fun EnhancementModesSection(
     selectedMode: EnhancementMode,
-    computedDimensions: Map<EnhancementMode, OutputDimensions>,
     isProcessing: Boolean,
     onSelectMode: (EnhancementMode) -> Unit
 ) {
-    val rows = EnhancementMode.entries.chunked(2)
-    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+    val neonBorderBrush = remember {
+        Brush.linearGradient(
+            colors = listOf(QualityGlowCyan, QualityGlowMid, QualityGlowPurple)
+        )
+    }
+    val cardShape = RoundedCornerShape(14.dp)
+
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
         Text(
             text = stringResource(R.string.label_enhancement_mode),
             style = MaterialTheme.typography.titleMedium
         )
-        rows.forEach { rowModes ->
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                rowModes.forEach { mode ->
-                    val isSelected = mode == selectedMode
-                    val isMax = mode == EnhancementMode.TWO_K
-                    val isUltra = mode == EnhancementMode.FHD || isMax
-                    val accentColor = if (isMax) AmberFourK else CyanMaster
-                    val containerColor = when {
-                        isSelected && isMax -> AmberFourKContainer
-                        isSelected -> CyanMasterContainer
-                        else -> StudioSlate
-                    }
-                    val dims = computedDimensions[mode]
-                    val tileLabel = dims?.let { "${it.aiTileSize}px • ${it.tilesPerFrame}t" } ?: mode.shortBadge
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            EnhancementMode.entries.forEach { mode ->
+                val isSelected = mode == selectedMode
 
-                    Surface(
-                        color = containerColor,
-                        shape = RoundedCornerShape(14.dp),
-                        border = BorderStroke(
-                            width = if (isSelected) 1.5.dp else 1.dp,
-                            color = if (isSelected) accentColor else StudioBorder
-                        ),
-                        modifier = Modifier
-                            .weight(1f)
-                            .minimumInteractiveComponentSize()
-                            .clip(RoundedCornerShape(14.dp))
-                            .clickable(enabled = !isProcessing) { onSelectMode(mode) }
-                            .testTag("mode_button_${mode.id.lowercase()}")
-                    ) {
-                        Column(
-                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 12.dp),
-                            verticalArrangement = Arrangement.spacedBy(4.dp)
-                        ) {
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Row(
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
-                                ) {
-                                    Icon(
-                                        imageVector = if (isUltra) Icons.Default.HighQuality else Icons.Default.Hd,
-                                        contentDescription = "${mode.title} enhancement mode",
-                                        tint = if (isSelected) accentColor else MutedSteel,
-                                        modifier = Modifier.size(18.dp)
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .aspectRatio(1f)
+                        .minimumInteractiveComponentSize()
+                        .then(
+                            if (isSelected) {
+                                Modifier.drawBehind {
+                                    val cornerPx = 14.dp.toPx()
+                                    val outerPad = 3.dp.toPx()
+                                    drawRoundRect(
+                                        brush = neonBorderBrush,
+                                        topLeft = Offset(-outerPad, -outerPad),
+                                        size = Size(size.width + outerPad * 2f, size.height + outerPad * 2f),
+                                        cornerRadius = CornerRadius(cornerPx + outerPad),
+                                        alpha = 0.22f,
+                                        style = Stroke(width = 6.dp.toPx())
                                     )
-                                    Text(
-                                        text = mode.title,
-                                        style = MaterialTheme.typography.titleSmall,
-                                        fontWeight = FontWeight.Bold,
-                                        color = if (isSelected) accentColor else MaterialTheme.colorScheme.onSurface,
-                                        maxLines = 1
+                                    val innerPad = 1.dp.toPx()
+                                    drawRoundRect(
+                                        brush = neonBorderBrush,
+                                        topLeft = Offset(-innerPad, -innerPad),
+                                        size = Size(size.width + innerPad * 2f, size.height + innerPad * 2f),
+                                        cornerRadius = CornerRadius(cornerPx + innerPad),
+                                        alpha = 0.45f,
+                                        style = Stroke(width = 2.5.dp.toPx())
                                     )
                                 }
-                                Text(
-                                    text = tileLabel,
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = if (isSelected) accentColor else SubtleSteel,
-                                    maxLines = 1
-                                )
+                            } else {
+                                Modifier
                             }
-                            Text(
-                                text = mode.subtitle,
-                                style = MaterialTheme.typography.bodySmall,
-                                color = if (isSelected) MaterialTheme.colorScheme.onSurface else MutedSteel,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
+                        )
+                        .clip(cardShape)
+                        .background(color = QualityButtonSurface, shape = cardShape)
+                        .border(
+                            width = if (isSelected) 2.dp else 1.dp,
+                            brush = if (isSelected) neonBorderBrush else SolidColor(QualityButtonBorderIdle),
+                            shape = cardShape
+                        )
+                        .clickable(
+                            enabled = !isProcessing,
+                            role = Role.Button,
+                            onClick = { onSelectMode(mode) }
+                        )
+                        .semantics {
+                            selected = isSelected
+                            contentDescription = "${mode.label} quality mode"
                         }
+                        .testTag("mode_button_${mode.id.lowercase()}"),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 8.dp)
+                    ) {
+                        Icon(
+                            painter = painterResource(id = R.drawable.ic_quality_clapper),
+                            contentDescription = null,
+                            tint = QualityButtonForeground,
+                            modifier = Modifier.size(30.dp)
+                        )
+                        Text(
+                            text = mode.label,
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = QualityButtonForeground,
+                            maxLines = 1,
+                            softWrap = false,
+                            overflow = TextOverflow.Clip
+                        )
                     }
                 }
             }
