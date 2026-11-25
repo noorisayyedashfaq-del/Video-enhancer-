@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <color name="studio_obsidian">#0B0E14</color>
-    <color name="ic_launcher_bg">#010002</color>
-    <color name="splash_navy_bg">#050B18</color>
+    <color name="ic_launcher_bg">#070D14</color>
+    <color name="splash_navy_bg">#060D12</color>
 </resources>

@@ -37,7 +37,7 @@ import androidx.compose.ui.unit.min
 import com.example.R
 
 /**
- * Branded dark-navy ClearKit launch splash overlay with responsive scaling
+ * Branded dark-obsidian & teal Video Enhancer launch splash overlay with responsive scaling
  * across compact phones, foldables, and tablets.
  */
 @Composable
@@ -54,9 +54,9 @@ fun ClearKitSplashScreen(
                 .background(
                     Brush.verticalGradient(
                         colors = listOf(
-                            Color(0xFF02050E),
-                            Color(0xFF061228),
-                            Color(0xFF030712)
+                            Color(0xFF05090E),
+                            Color(0xFF071A1E),
+                            Color(0xFF05090E)
                         )
                     )
                 )
@@ -67,15 +67,15 @@ fun ClearKitSplashScreen(
             val logoSize = (minSide * 0.44f).coerceIn(136.dp, 220.dp)
             val glowSize = logoSize * 1.45f
 
-            // Subtle blue radial glow accent
+            // Subtle teal radial glow accent matching the dark teal theme
             Box(
                 modifier = Modifier
                     .size(glowSize)
                     .background(
                         Brush.radialGradient(
                             colors = listOf(
-                                Color(0x4400A3FF),
-                                Color(0x180059D4),
+                                Color(0x4400E5C3),
+                                Color(0x18008F7A),
                                 Color.Transparent
                             ),
                             center = Offset.Unspecified
@@ -90,8 +90,8 @@ fun ClearKitSplashScreen(
                 verticalArrangement = Arrangement.Center
             ) {
                 Image(
-                    painter = painterResource(id = R.drawable.img_clearkit_logo),
-                    contentDescription = "ClearKit splash logo",
+                    painter = painterResource(id = R.drawable.video_enhancer_logo),
+                    contentDescription = "Video Enhancer splash logo",
                     contentScale = ContentScale.Fit,
                     modifier = Modifier
                         .size(logoSize)
@@ -112,14 +112,14 @@ fun ClearKitSplashScreen(
                 Text(
                     text = stringResource(id = R.string.studio_subtitle),
                     style = MaterialTheme.typography.bodyMedium,
-                    color = Color(0xFF8FB8FF)
+                    color = Color(0xFF7CE8D8)
                 )
 
                 Spacer(modifier = Modifier.height(28.dp))
 
                 LinearProgressIndicator(
-                    color = Color(0xFF2FA8FF),
-                    trackColor = Color(0xFF102140),
+                    color = Color(0xFF00E5C3),
+                    trackColor = Color(0xFF0E2B2A),
                     modifier = Modifier
                         .width(140.dp)
                         .height(3.dp)

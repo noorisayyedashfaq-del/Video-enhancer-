@@ -13,7 +13,7 @@ import kotlin.math.roundToInt
 
 /**
  * Resolves progressive AI super-resolution output dimensions, smart aspect-preserving
- * tile counts, perceptual sublinear H.264 target bitrate, and codec selection across Clarity 1x - 4x.
+ * tile counts, perceptual sublinear H.264 target bitrate, and codec selection across HD, HD+, FHD, and 2K.
  */
 object ResolutionCalculator {
 
@@ -60,10 +60,10 @@ object ResolutionCalculator {
                 profile.preserveOriginalResolution -> 1.0f
                 profile.targetScaleFactor > 1.0f -> profile.targetScaleFactor
                 else -> when (mode) {
-                    EnhancementMode.CLARITY_1X -> 1.0f
-                    EnhancementMode.CLARITY_2X -> 2.0f
-                    EnhancementMode.CLARITY_3X -> 3.0f
-                    EnhancementMode.CLARITY_4X -> 4.0f
+                    EnhancementMode.HD -> 1.0f
+                    EnhancementMode.HD_PLUS -> 2.0f
+                    EnhancementMode.FHD -> 3.0f
+                    EnhancementMode.TWO_K -> 4.0f
                 }
             }
             val inLongEdge = max(evenInW, evenInH)
@@ -83,18 +83,18 @@ object ResolutionCalculator {
 
         val baseTileSize = (if (profile.aiTileSize > 0) profile.aiTileSize else {
             when (mode) {
-                EnhancementMode.CLARITY_1X, EnhancementMode.CLARITY_2X -> 192
-                EnhancementMode.CLARITY_3X -> 224
-                EnhancementMode.CLARITY_4X -> 256
+                EnhancementMode.HD, EnhancementMode.HD_PLUS -> 192
+                EnhancementMode.FHD -> 224
+                EnhancementMode.TWO_K -> 256
             }
         }).coerceIn(128, 384)
 
         val tileBudgetCap = if (profile.targetTilesPerFrame > 0) profile.targetTilesPerFrame else {
             when (mode) {
-                EnhancementMode.CLARITY_1X -> 1
-                EnhancementMode.CLARITY_2X -> 2
-                EnhancementMode.CLARITY_3X -> 3
-                EnhancementMode.CLARITY_4X -> 4
+                EnhancementMode.HD -> 1
+                EnhancementMode.HD_PLUS -> 2
+                EnhancementMode.FHD -> 3
+                EnhancementMode.TWO_K -> 4
             }
         }
         val neededTiles = computeSmartTileCount(

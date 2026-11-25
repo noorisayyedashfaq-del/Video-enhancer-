@@ -289,7 +289,7 @@ class SmartAutoAdjustmentEngine {
     }
 
     /**
-     * Computes calibrated adaptive adjustment parameters from the fixed Clarity 1x-4x preset
+     * Computes calibrated adaptive adjustment parameters from the fixed HD, HD+, FHD, and 2K preset
      * while preserving natural skin tones, highlight/shadow detail, and avoiding double sharpening.
      */
     fun computeAdaptiveAdjustments(

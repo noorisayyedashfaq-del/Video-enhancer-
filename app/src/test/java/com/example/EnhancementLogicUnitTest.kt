@@ -92,21 +92,21 @@ class EnhancementLogicUnitTest {
     )
 
     @Test
-    fun `all 4 Clarity modes apply progressive target resolutions and bitrate increases`() {
+    fun `all 4 enhancement modes apply progressive target resolutions and bitrate increases`() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val profiles = EnhancementProfileRepository(context).loadProfiles()
         val caps = testCapabilities(maxLongEdge = 3840)
 
-        assertEquals("HD", EnhancementMode.CLARITY_1X.label)
-        assertEquals("HD+", EnhancementMode.CLARITY_2X.label)
-        assertEquals("FHD", EnhancementMode.CLARITY_3X.label)
-        assertEquals("2K", EnhancementMode.CLARITY_4X.label)
+        assertEquals("HD", EnhancementMode.HD.label)
+        assertEquals("HD+", EnhancementMode.HD_PLUS.label)
+        assertEquals("FHD", EnhancementMode.FHD.label)
+        assertEquals("2K", EnhancementMode.TWO_K.label)
 
         // Low-res 4:3 480x360 fits target short/long edges aspect-preservingly: 768x576 -> 864x648 -> 1080x810 -> 1440x1080
-        val c1 = ResolutionCalculator.calculate(sampleMetadataLowRes, EnhancementMode.CLARITY_1X, profiles.getValue(EnhancementMode.CLARITY_1X), caps)
-        val c2 = ResolutionCalculator.calculate(sampleMetadataLowRes, EnhancementMode.CLARITY_2X, profiles.getValue(EnhancementMode.CLARITY_2X), caps)
-        val c3 = ResolutionCalculator.calculate(sampleMetadataLowRes, EnhancementMode.CLARITY_3X, profiles.getValue(EnhancementMode.CLARITY_3X), caps)
-        val c4 = ResolutionCalculator.calculate(sampleMetadataLowRes, EnhancementMode.CLARITY_4X, profiles.getValue(EnhancementMode.CLARITY_4X), caps)
+        val c1 = ResolutionCalculator.calculate(sampleMetadataLowRes, EnhancementMode.HD, profiles.getValue(EnhancementMode.HD), caps)
+        val c2 = ResolutionCalculator.calculate(sampleMetadataLowRes, EnhancementMode.HD_PLUS, profiles.getValue(EnhancementMode.HD_PLUS), caps)
+        val c3 = ResolutionCalculator.calculate(sampleMetadataLowRes, EnhancementMode.FHD, profiles.getValue(EnhancementMode.FHD), caps)
+        val c4 = ResolutionCalculator.calculate(sampleMetadataLowRes, EnhancementMode.TWO_K, profiles.getValue(EnhancementMode.TWO_K), caps)
 
         assertEquals(768 to 576, c1.width to c1.height)
         assertEquals(864 to 648, c2.width to c2.height)
@@ -121,10 +121,10 @@ class EnhancementLogicUnitTest {
         assertTrue("Expected lean tile count <= 6 for 480x360, got ${c4.tilesPerFrame}", c4.tilesPerFrame <= 6)
 
         // 16:9 Landscape outputs: HD (1024x576), HD+ (1152x648), FHD (1440x810), 2K (1920x1080)
-        val hd1 = ResolutionCalculator.calculate(sampleMetadataHd, EnhancementMode.CLARITY_1X, profiles.getValue(EnhancementMode.CLARITY_1X), caps)
-        val hd2 = ResolutionCalculator.calculate(sampleMetadataHd, EnhancementMode.CLARITY_2X, profiles.getValue(EnhancementMode.CLARITY_2X), caps)
-        val hd3 = ResolutionCalculator.calculate(sampleMetadataHd, EnhancementMode.CLARITY_3X, profiles.getValue(EnhancementMode.CLARITY_3X), caps)
-        val hd4 = ResolutionCalculator.calculate(sampleMetadataHd, EnhancementMode.CLARITY_4X, profiles.getValue(EnhancementMode.CLARITY_4X), caps)
+        val hd1 = ResolutionCalculator.calculate(sampleMetadataHd, EnhancementMode.HD, profiles.getValue(EnhancementMode.HD), caps)
+        val hd2 = ResolutionCalculator.calculate(sampleMetadataHd, EnhancementMode.HD_PLUS, profiles.getValue(EnhancementMode.HD_PLUS), caps)
+        val hd3 = ResolutionCalculator.calculate(sampleMetadataHd, EnhancementMode.FHD, profiles.getValue(EnhancementMode.FHD), caps)
+        val hd4 = ResolutionCalculator.calculate(sampleMetadataHd, EnhancementMode.TWO_K, profiles.getValue(EnhancementMode.TWO_K), caps)
 
         assertEquals(1024 to 576, hd1.width to hd1.height)
         assertEquals(1152 to 648, hd2.width to hd2.height)
@@ -133,7 +133,7 @@ class EnhancementLogicUnitTest {
 
         // Respects hardware maxEncodeLongEdge cap when present
         val cappedCaps = testCapabilities(maxLongEdge = 1920)
-        val hd4Capped = ResolutionCalculator.calculate(sampleMetadataHd, EnhancementMode.CLARITY_4X, profiles.getValue(EnhancementMode.CLARITY_4X), cappedCaps)
+        val hd4Capped = ResolutionCalculator.calculate(sampleMetadataHd, EnhancementMode.TWO_K, profiles.getValue(EnhancementMode.TWO_K), cappedCaps)
         assertEquals(1920 to 1080, hd4Capped.width to hd4Capped.height)
     }
 
@@ -143,10 +143,10 @@ class EnhancementLogicUnitTest {
         val profiles = EnhancementProfileRepository(context).loadProfiles()
         val caps = testCapabilities(maxLongEdge = 3840)
 
-        val p1 = ResolutionCalculator.calculate(sampleMetadataPortrait, EnhancementMode.CLARITY_1X, profiles.getValue(EnhancementMode.CLARITY_1X), caps)
-        val p2 = ResolutionCalculator.calculate(sampleMetadataPortrait, EnhancementMode.CLARITY_2X, profiles.getValue(EnhancementMode.CLARITY_2X), caps)
-        val p3 = ResolutionCalculator.calculate(sampleMetadataPortrait, EnhancementMode.CLARITY_3X, profiles.getValue(EnhancementMode.CLARITY_3X), caps)
-        val p4 = ResolutionCalculator.calculate(sampleMetadataPortrait, EnhancementMode.CLARITY_4X, profiles.getValue(EnhancementMode.CLARITY_4X), caps)
+        val p1 = ResolutionCalculator.calculate(sampleMetadataPortrait, EnhancementMode.HD, profiles.getValue(EnhancementMode.HD), caps)
+        val p2 = ResolutionCalculator.calculate(sampleMetadataPortrait, EnhancementMode.HD_PLUS, profiles.getValue(EnhancementMode.HD_PLUS), caps)
+        val p3 = ResolutionCalculator.calculate(sampleMetadataPortrait, EnhancementMode.FHD, profiles.getValue(EnhancementMode.FHD), caps)
+        val p4 = ResolutionCalculator.calculate(sampleMetadataPortrait, EnhancementMode.TWO_K, profiles.getValue(EnhancementMode.TWO_K), caps)
 
         assertEquals(576 to 1024, p1.width to p1.height)
         assertEquals(648 to 1152, p2.width to p2.height)
@@ -227,12 +227,12 @@ class EnhancementLogicUnitTest {
             conditionTags = listOf("High Noise", "Soft / Blurry", "Compression Artifacts")
         )
 
-        val p1 = engine.computeAdaptiveAdjustments(profiles.getValue(EnhancementMode.CLARITY_1X), blurryNoisyCompressed)
-        val p2 = engine.computeAdaptiveAdjustments(profiles.getValue(EnhancementMode.CLARITY_2X), blurryNoisyCompressed)
-        val p3 = engine.computeAdaptiveAdjustments(profiles.getValue(EnhancementMode.CLARITY_3X), blurryNoisyCompressed)
-        val p4 = engine.computeAdaptiveAdjustments(profiles.getValue(EnhancementMode.CLARITY_4X), blurryNoisyCompressed)
+        val p1 = engine.computeAdaptiveAdjustments(profiles.getValue(EnhancementMode.HD), blurryNoisyCompressed)
+        val p2 = engine.computeAdaptiveAdjustments(profiles.getValue(EnhancementMode.HD_PLUS), blurryNoisyCompressed)
+        val p3 = engine.computeAdaptiveAdjustments(profiles.getValue(EnhancementMode.FHD), blurryNoisyCompressed)
+        val p4 = engine.computeAdaptiveAdjustments(profiles.getValue(EnhancementMode.TWO_K), blurryNoisyCompressed)
 
-        // Strict progressive neural enhancement across 1x -> 2x -> 3x -> 4x
+        // Strict progressive neural enhancement across HD -> HD+ -> FHD -> 2K
         assertTrue(p1.aiStrength < p2.aiStrength && p2.aiStrength < p3.aiStrength && p3.aiStrength < p4.aiStrength)
         assertTrue(p1.dncnnStrength < p2.dncnnStrength && p2.dncnnStrength < p3.dncnnStrength && p3.dncnnStrength < p4.dncnnStrength)
         assertTrue(p1.faceEnhanceStrength < p2.faceEnhanceStrength && p2.faceEnhanceStrength < p3.faceEnhanceStrength && p3.faceEnhanceStrength < p4.faceEnhanceStrength)
@@ -241,7 +241,7 @@ class EnhancementLogicUnitTest {
         // Genuine visible yet natural color mastering + active detail recovery & smoothness parameters
         assertTrue("Brightness shift should stay calibrated and non-blown (${p4.brightnessShift})", p4.brightnessShift in 2.5f..5.5f)
         assertTrue("Saturation boost must visibly enrich without clipping (${p4.saturationGain})", p4.saturationGain in 1.10f..1.22f)
-        assertTrue("Vibrance must ramp progressively across 1x->4x", p1.vibranceGain < p4.vibranceGain && p4.vibranceGain in 0.25f..0.65f)
+        assertTrue("Vibrance must ramp progressively across HD->2K", p1.vibranceGain < p4.vibranceGain && p4.vibranceGain in 0.25f..0.65f)
         assertTrue("Detail recovery must ramp progressively", p1.detailRecovery < p2.detailRecovery && p2.detailRecovery < p3.detailRecovery && p3.detailRecovery < p4.detailRecovery)
         assertTrue("Deblur strength must ramp progressively", p1.deblurStrength < p2.deblurStrength && p2.deblurStrength < p3.deblurStrength && p3.deblurStrength < p4.deblurStrength)
         assertTrue("AI sharpening must stay progressive and halo-safe", p1.aiSharpening < p2.aiSharpening && p2.aiSharpening < p3.aiSharpening && p3.aiSharpening < p4.aiSharpening && p4.aiSharpening <= 0.68f)

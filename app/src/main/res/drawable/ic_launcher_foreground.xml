@@ -3,6 +3,6 @@
     <item
         android:width="66dp"
         android:height="66dp"
-        android:drawable="@drawable/img_clearkit_logo"
+        android:drawable="@drawable/video_enhancer_logo"
         android:gravity="center" />
 </layer-list>

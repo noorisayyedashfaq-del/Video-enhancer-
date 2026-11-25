@@ -135,7 +135,7 @@ class FourPillarEnhancementTest {
         )
 
         val params3x = adjuster.computeAdaptiveAdjustments(
-            profiles.getValue(EnhancementMode.CLARITY_3X),
+            profiles.getValue(EnhancementMode.FHD),
             dullWarmClip
         )
 
@@ -204,8 +204,8 @@ class FourPillarEnhancementTest {
         val adjuster = SmartAutoAdjustmentEngine()
 
         // Verify v6 profile tuning and ONNX assets exist cleanly
-        val p1Prof = profiles.getValue(EnhancementMode.CLARITY_1X)
-        val p4Prof = profiles.getValue(EnhancementMode.CLARITY_4X)
+        val p1Prof = profiles.getValue(EnhancementMode.HD)
+        val p4Prof = profiles.getValue(EnhancementMode.TWO_K)
         assertTrue(p1Prof.detailRecoveryPercent < p4Prof.detailRecoveryPercent)
         assertTrue(p1Prof.deblurPercent < p4Prof.deblurPercent)
         assertTrue(p1Prof.aiSharpeningPercent < p4Prof.aiSharpeningPercent)
@@ -226,12 +226,12 @@ class FourPillarEnhancementTest {
             conditionTags = listOf("High Noise", "Soft / Blurry", "Compression Artifacts")
         )
 
-        val adj1 = adjuster.computeAdaptiveAdjustments(profiles.getValue(EnhancementMode.CLARITY_1X), blurrySource)
-        val adj2 = adjuster.computeAdaptiveAdjustments(profiles.getValue(EnhancementMode.CLARITY_2X), blurrySource)
-        val adj3 = adjuster.computeAdaptiveAdjustments(profiles.getValue(EnhancementMode.CLARITY_3X), blurrySource)
-        val adj4 = adjuster.computeAdaptiveAdjustments(profiles.getValue(EnhancementMode.CLARITY_4X), blurrySource)
+        val adj1 = adjuster.computeAdaptiveAdjustments(profiles.getValue(EnhancementMode.HD), blurrySource)
+        val adj2 = adjuster.computeAdaptiveAdjustments(profiles.getValue(EnhancementMode.HD_PLUS), blurrySource)
+        val adj3 = adjuster.computeAdaptiveAdjustments(profiles.getValue(EnhancementMode.FHD), blurrySource)
+        val adj4 = adjuster.computeAdaptiveAdjustments(profiles.getValue(EnhancementMode.TWO_K), blurrySource)
 
-        // All real-detail parameters strictly progress across 1x -> 2x -> 3x -> 4x and remain non-trivial on 1x
+        // All real-detail parameters strictly progress across HD -> HD+ -> FHD -> 2K and remain non-trivial on HD
         assertTrue(adj1.detailRecovery >= 0.45f)
         assertTrue(adj1.deblurStrength >= 0.40f)
         assertTrue(adj1.detailRecovery < adj2.detailRecovery && adj2.detailRecovery < adj3.detailRecovery && adj3.detailRecovery < adj4.detailRecovery)
@@ -240,7 +240,7 @@ class FourPillarEnhancementTest {
 
         // SpeedBudgetGovernor must schedule DnCNN denoising on 100% of frames without frame skipping on FULL_NEURAL & SINGLE_TILE tiers
         val gov4x = SpeedBudgetGovernor(
-            mode = EnhancementMode.CLARITY_4X,
+            mode = EnhancementMode.TWO_K,
             durationMs = 60_000L,
             estimatedFrames = 1800,
             presetTileSize = 256,
@@ -254,7 +254,7 @@ class FourPillarEnhancementTest {
         assertTrue(gov4x.decisionForFrame(3, isSceneCut = false, forceLightweight = false).allowDnCnn)
 
         val govMid2x = SpeedBudgetGovernor(
-            mode = EnhancementMode.CLARITY_2X,
+            mode = EnhancementMode.HD_PLUS,
             durationMs = 60_000L,
             estimatedFrames = 1800,
             presetTileSize = 192,
@@ -356,7 +356,7 @@ class FourPillarEnhancementTest {
         )
 
         // Verify Resolution Scaling + Neural Working Dimensions + Tile Planning
-        val out4x = ResolutionCalculator.calculate(meta24fps, EnhancementMode.CLARITY_4X, profiles.getValue(EnhancementMode.CLARITY_4X), caps)
+        val out4x = ResolutionCalculator.calculate(meta24fps, EnhancementMode.TWO_K, profiles.getValue(EnhancementMode.TWO_K), caps)
         assertEquals(1920 to 1080, out4x.width to out4x.height)
         val work4x = AiTilingMath.computeNeuralWorkingSize(1280, 720, out4x.width, out4x.height, out4x.aiTileSize, out4x.tilesPerFrame)
         val grid4x = AiTilingMath.planUpscaleTileGrid(work4x.first, work4x.second, out4x.width, out4x.height, out4x.aiTileSize, out4x.tilesPerFrame)
@@ -378,10 +378,10 @@ class FourPillarEnhancementTest {
             conditionTags = listOf("Soft / Blurry", "Faded Colors")
         )
 
-        val params = adjuster.computeAdaptiveAdjustments(profiles.getValue(EnhancementMode.CLARITY_4X), analysis)
+        val params = adjuster.computeAdaptiveAdjustments(profiles.getValue(EnhancementMode.TWO_K), analysis)
         val logger = EngineDiagnosticsLogger()
         val governor = SpeedBudgetGovernor(
-            mode = EnhancementMode.CLARITY_4X,
+            mode = EnhancementMode.TWO_K,
             durationMs = meta24fps.durationMs,
             estimatedFrames = meta24fps.estimatedFrameCount,
             presetTileSize = out4x.aiTileSize,
@@ -438,7 +438,7 @@ class FourPillarEnhancementTest {
         println(
             String.format(
                 Locale.US,
-                "[PILLAR4_BENCHMARK] 15->29 frames (96x64 Color+OpticalFlow) completed in %.1f ms (%.2f ms/output-frame); 4K output=%dx%d (%d tiles)",
+                "[PILLAR4_BENCHMARK] 15->29 frames (96x64 Color+OpticalFlow) completed in %.1f ms (%.2f ms/output-frame); 2K output=%dx%d (%d tiles)",
                 elapsedMs, elapsedMs / producedFrames.toDouble(), out4x.width, out4x.height, grid4x.totalTiles
             )
         )

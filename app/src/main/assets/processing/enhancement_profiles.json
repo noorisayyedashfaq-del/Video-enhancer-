@@ -1,8 +1,8 @@
 {
   "version": "6.0-4pillar",
   "modes": {
-    "CLARITY_1X": {
-      "id": "CLARITY_1X",
+    "HD": {
+      "id": "HD",
       "displayName": "HD",
       "description": "Natural AI: vibrant natural color, neural detail, smooth motion at HD (1024x576 / 576x1024)",
       "targetLongEdge": 1024,
@@ -47,8 +47,8 @@
       "preferredCodec": "H264",
       "targetBpp": 0.18
     },
-    "CLARITY_2X": {
-      "id": "CLARITY_2X",
+    "HD_PLUS": {
+      "id": "HD_PLUS",
       "displayName": "HD+",
       "description": "HD+ AI: Real-ESRGAN detail reconstruction, vivid color & flow smoothness at HD+ (1152x648 / 648x1152)",
       "targetLongEdge": 1152,
@@ -93,8 +93,8 @@
       "preferredCodec": "H264",
       "targetBpp": 0.20
     },
-    "CLARITY_3X": {
-      "id": "CLARITY_3X",
+    "FHD": {
+      "id": "FHD",
       "displayName": "FHD",
       "description": "FHD AI: neural texture reconstruction, balanced color & smooth motion at FHD (1440x810 / 810x1440)",
       "targetLongEdge": 1440,
@@ -139,8 +139,8 @@
       "preferredCodec": "H264",
       "targetBpp": 0.22
     },
-    "CLARITY_4X": {
-      "id": "CLARITY_4X",
+    "TWO_K": {
+      "id": "TWO_K",
       "displayName": "2K",
       "description": "2K AI: super-resolution at 2K (1920x1080 / 1080x1920) with full color, detail & motion enhancement",
       "targetLongEdge": 1920,

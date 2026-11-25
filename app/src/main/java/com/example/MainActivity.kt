@@ -163,7 +163,7 @@ class MainActivity : ComponentActivity() {
 
     /**
      * Single common entry point used by all 5 action buttons:
-     * Clarity 1x, 2x, 3x, 4x, and Download / Enhance Video.
+     * HD, HD+, FHD, 2K, and Download / Enhance Video.
      *
      * Guarantees processing/download starts ONLY after an Interstitial Ad is watched and closed.
      */
@@ -226,10 +226,10 @@ class MainActivity : ComponentActivity() {
 
     private fun executeQualityTask(quality: String) {
         when (quality.uppercase()) {
-            "HD", "1X", "CLARITY 1X", "CLARITY_1X" -> selectQualityAndOptionallyStart(EnhancementMode.CLARITY_1X)
-            "HD+", "2X", "CLARITY 2X", "CLARITY_2X" -> selectQualityAndOptionallyStart(EnhancementMode.CLARITY_2X)
-            "FHD", "3X", "CLARITY 3X", "CLARITY_3X" -> selectQualityAndOptionallyStart(EnhancementMode.CLARITY_3X)
-            "2K", "4X", "CLARITY 4X", "CLARITY_4X" -> selectQualityAndOptionallyStart(EnhancementMode.CLARITY_4X)
+            "HD", "1X", "CLARITY 1X", "CLARITY_1X" -> selectQualityAndOptionallyStart(EnhancementMode.HD)
+            "HD+", "HD_PLUS", "2X", "CLARITY 2X", "CLARITY_2X" -> selectQualityAndOptionallyStart(EnhancementMode.HD_PLUS)
+            "FHD", "QHD_2K", "3X", "CLARITY 3X", "CLARITY_3X" -> selectQualityAndOptionallyStart(EnhancementMode.FHD)
+            "2K", "TWO_K", "UHD_4K", "4X", "CLARITY 4X", "CLARITY_4X" -> selectQualityAndOptionallyStart(EnhancementMode.TWO_K)
             "ENHANCE" -> startEnhancementWithNotificationCheck()
             "DOWNLOAD" -> saveEnhancedVideo()
             "EXPORT" -> exportEnhancedVideoAs()

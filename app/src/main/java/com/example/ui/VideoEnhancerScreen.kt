@@ -174,7 +174,7 @@ fun VideoEnhancerScreen(
                     enhancementResult = uiState.enhancementResult
                 )
 
-                // 3. Four Enhancement Buttons: Clarity 1x, 2x, 3x, 4x (all wired to startWithAd)
+                // 3. Four Enhancement Buttons: HD, HD+, FHD, 2K (all wired to startWithAd)
                 EnhancementModesSection(
                     selectedMode = uiState.selectedMode,
                     computedDimensions = uiState.computedOutputDimensions,
@@ -251,13 +251,13 @@ private fun StudioHeader(
             modifier = Modifier.weight(1f)
         ) {
             Image(
-                painter = painterResource(id = R.drawable.img_clearkit_logo),
-                contentDescription = "ClearKit logo",
+                painter = painterResource(id = R.drawable.video_enhancer_logo),
+                contentDescription = "Video Enhancer logo",
                 modifier = Modifier
                     .size(40.dp)
                     .clip(RoundedCornerShape(10.dp))
                     .border(1.dp, StudioBorder, RoundedCornerShape(10.dp)),
-                contentScale = ContentScale.Crop
+                contentScale = ContentScale.Fit
             )
             Column {
                 Text(
@@ -529,8 +529,8 @@ private fun EnhancementModesSection(
             ) {
                 rowModes.forEach { mode ->
                     val isSelected = mode == selectedMode
-                    val isMax = mode == EnhancementMode.CLARITY_4X
-                    val isUltra = mode == EnhancementMode.CLARITY_3X || isMax
+                    val isMax = mode == EnhancementMode.TWO_K
+                    val isUltra = mode == EnhancementMode.FHD || isMax
                     val accentColor = if (isMax) AmberFourK else CyanMaster
                     val containerColor = when {
                         isSelected && isMax -> AmberFourKContainer

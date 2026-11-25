@@ -11,7 +11,7 @@ import kotlin.math.abs
  * Pure motion-gating math for zero-quality-loss Static Tile Temporal Reuse and
  * Keyframe Face Detection Scheduling.
  *
- * Preserves 100% full Clarity 1x-4x neural detail: only reuses an already-computed
+ * Preserves 100% full HD, HD+, FHD, and 2K neural detail: only reuses an already-computed
  * AI output tile when the underlying visual patch is genuinely static across frames,
  * and forces a mandatory full AI refresh every [MAX_CONSECUTIVE_REUSES] frames or on scene cuts.
  */

@@ -9,6 +9,8 @@ import android.content.ComponentCallbacks2
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
@@ -42,6 +44,11 @@ class VideoEnhancementForegroundService : Service() {
     private var lastNotifiedPct: Int = -1
     private var lastNotifiedStage: ProcessingStage? = null
     private var lastNotifyMs: Long = 0L
+    private val notificationLargeIcon: Bitmap? by lazy {
+        runCatching {
+            BitmapFactory.decodeResource(resources, R.drawable.video_enhancer_logo)
+        }.getOrNull()
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -233,6 +240,8 @@ class VideoEnhancementForegroundService : Service() {
 
         return NotificationCompat.Builder(this, CHANNEL_ID_PROGRESS)
             .setSmallIcon(R.mipmap.ic_launcher)
+            .setLargeIcon(notificationLargeIcon)
+            .setColor(0xFF00E5C3.toInt())
             .setContentTitle(getString(R.string.notification_title_processing))
             .setContentText(stageLine)
             .setSubText(subLine)
@@ -263,6 +272,8 @@ class VideoEnhancementForegroundService : Service() {
         )
         val notification = NotificationCompat.Builder(this, CHANNEL_ID_COMPLETE)
             .setSmallIcon(R.mipmap.ic_launcher)
+            .setLargeIcon(notificationLargeIcon)
+            .setColor(0xFF00E5C3.toInt())
             .setContentTitle(title)
             .setContentText(body)
             .setStyle(NotificationCompat.BigTextStyle().bigText(body))

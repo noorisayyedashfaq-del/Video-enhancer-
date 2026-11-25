@@ -4,15 +4,15 @@
         <shape android:shape="rectangle">
             <gradient
                 android:angle="270"
-                android:startColor="#02050E"
-                android:centerColor="#07132B"
-                android:endColor="#030712"
+                android:startColor="#05090E"
+                android:centerColor="#071A1E"
+                android:endColor="#05090E"
                 android:type="linear" />
         </shape>
     </item>
     <item
         android:width="180dp"
         android:height="180dp"
-        android:drawable="@drawable/img_clearkit_logo"
+        android:drawable="@drawable/video_enhancer_logo"
         android:gravity="center" />
 </layer-list>

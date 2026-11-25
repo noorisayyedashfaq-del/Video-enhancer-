@@ -125,14 +125,7 @@ class EnhancementSessionCoordinator private constructor(
     private fun restorePersistedModeAndNotice() {
         try {
             val savedModeId = prefs.getString(KEY_SELECTED_MODE, null)
-            val migratedId = when (savedModeId) {
-                "HD" -> EnhancementMode.CLARITY_1X.id
-                "HD_PLUS" -> EnhancementMode.CLARITY_2X.id
-                "QHD_2K" -> EnhancementMode.CLARITY_3X.id
-                "UHD_4K" -> EnhancementMode.CLARITY_4X.id
-                else -> savedModeId
-            }
-            val restoredMode = EnhancementMode.entries.firstOrNull { it.id == migratedId } ?: EnhancementMode.CLARITY_2X
+            val restoredMode = resolveMigratedMode(savedModeId)
             val interruptedNotice = prefs.getString(KEY_INTERRUPTED_NOTICE, null)
             _uiState.update {
                 it.copy(
@@ -550,6 +543,17 @@ class EnhancementSessionCoordinator private constructor(
         private const val KEY_LAST_PROGRESS = "last_progress"
         private const val KEY_LAST_STAGE = "last_stage"
         private const val KEY_INTERRUPTED_NOTICE = "interrupted_notice"
+
+        internal fun resolveMigratedMode(savedModeId: String?): EnhancementMode {
+            val migratedId = when (savedModeId) {
+                "CLARITY_1X" -> EnhancementMode.HD.id
+                "CLARITY_2X" -> EnhancementMode.HD_PLUS.id
+                "CLARITY_3X", "QHD_2K" -> EnhancementMode.FHD.id
+                "CLARITY_4X", "UHD_4K" -> EnhancementMode.TWO_K.id
+                else -> savedModeId
+            }
+            return EnhancementMode.entries.firstOrNull { it.id == migratedId } ?: EnhancementMode.HD_PLUS
+        }
 
         @Volatile
         private var INSTANCE: EnhancementSessionCoordinator? = null

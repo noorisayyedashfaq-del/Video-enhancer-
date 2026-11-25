@@ -40,10 +40,10 @@ class AppStartupStabilityTest {
         // Main UI interactive controls and splash compose cleanly on cold start
         composeRule.onNodeWithTag("select_video_button").assertExists()
         composeRule.onNodeWithTag("hardware_diagnostics_button").assertExists()
-        composeRule.onNodeWithTag("mode_button_clarity_1x").assertExists()
-        composeRule.onNodeWithTag("mode_button_clarity_2x").assertExists()
-        composeRule.onNodeWithTag("mode_button_clarity_3x").assertExists()
-        composeRule.onNodeWithTag("mode_button_clarity_4x").assertExists()
+        composeRule.onNodeWithTag("mode_button_hd").assertExists()
+        composeRule.onNodeWithTag("mode_button_hd_plus").assertExists()
+        composeRule.onNodeWithTag("mode_button_fhd").assertExists()
+        composeRule.onNodeWithTag("mode_button_two_k").assertExists()
         composeRule.onNodeWithTag("start_enhancement_button").assertExists()
 
         // Advance main looper past splash auto-dismiss (1000ms) and verify home studio controls are visible
@@ -101,10 +101,16 @@ class AppStartupStabilityTest {
         assertNotNull(ContextCompat.getDrawable(context, R.drawable.splash_background))
         assertNotNull(ContextCompat.getDrawable(context, R.drawable.ic_launcher_foreground))
 
-        val logoBitmap = BitmapFactory.decodeResource(context.resources, R.drawable.img_clearkit_logo)
+        val rawHeader = context.resources.openRawResource(R.drawable.video_enhancer_logo).use { input ->
+            ByteArray(12).also { input.read(it) }
+        }
+        assertEquals("RIFF", String(rawHeader, 0, 4, Charsets.US_ASCII))
+        assertEquals("WEBP", String(rawHeader, 8, 4, Charsets.US_ASCII))
+
+        val logoBitmap = BitmapFactory.decodeResource(context.resources, R.drawable.video_enhancer_logo)
         assertNotNull("Logo bitmap should decode", logoBitmap)
         assertTrue("Logo allocation must stay safely below Canvas limit", logoBitmap.allocationByteCount < 16 * 1024 * 1024)
-        assertEquals(1254, logoBitmap.width)
+        assertTrue("Logo bitmap width must be positive", logoBitmap.width > 0)
 
         val bannerBitmap = BitmapFactory.decodeResource(context.resources, R.drawable.img_studio_banner)
         assertNotNull("Banner bitmap should decode", bannerBitmap)

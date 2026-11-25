@@ -109,32 +109,32 @@ class ForegroundServiceAndSpeedTest {
         val frames1Min = 1800 // 60s @ 30fps
 
         // Verify strict 1-minute budgets per mode
-        assertEquals(150_000L, SpeedBudgetGovernor.maxBudgetMsPerMinute(EnhancementMode.CLARITY_1X))
-        assertEquals(300_000L, SpeedBudgetGovernor.maxBudgetMsPerMinute(EnhancementMode.CLARITY_2X))
-        assertEquals(450_000L, SpeedBudgetGovernor.maxBudgetMsPerMinute(EnhancementMode.CLARITY_3X))
-        assertEquals(600_000L, SpeedBudgetGovernor.maxBudgetMsPerMinute(EnhancementMode.CLARITY_4X))
+        assertEquals(150_000L, SpeedBudgetGovernor.maxBudgetMsPerMinute(EnhancementMode.HD))
+        assertEquals(300_000L, SpeedBudgetGovernor.maxBudgetMsPerMinute(EnhancementMode.HD_PLUS))
+        assertEquals(450_000L, SpeedBudgetGovernor.maxBudgetMsPerMinute(EnhancementMode.FHD))
+        assertEquals(600_000L, SpeedBudgetGovernor.maxBudgetMsPerMinute(EnhancementMode.TWO_K))
 
         // 1) Flagship GPU (18ms/tile): fits FULL_NEURAL_PER_FRAME within strict budgets
-        val flagship1x = SpeedBudgetGovernor(EnhancementMode.CLARITY_1X, 60_000L, frames1Min, 192, 1, 18L, 90)
-        val flagship4x = SpeedBudgetGovernor(EnhancementMode.CLARITY_4X, 60_000L, frames1Min, 256, 4, 18L, 90)
+        val flagship1x = SpeedBudgetGovernor(EnhancementMode.HD, 60_000L, frames1Min, 192, 1, 18L, 90)
+        val flagship4x = SpeedBudgetGovernor(EnhancementMode.TWO_K, 60_000L, frames1Min, 256, 4, 18L, 90)
         assertEquals(SpeedExecutionTier.FULL_NEURAL_PER_FRAME, flagship1x.activeTier)
         assertEquals(SpeedExecutionTier.FULL_NEURAL_PER_FRAME, flagship4x.activeTier)
         assertTrue(flagship1x.decisionForFrame(0, isSceneCut = true, forceLightweight = false).runNeuralSrNow)
 
-        // 2) Mid-tier NPU (145ms/tile): uses SINGLE_TILE_NEURAL for 2x/4x and KEYFRAME_NEURAL_HYBRID for tight 1x (150s)
-        val mid1x = SpeedBudgetGovernor(EnhancementMode.CLARITY_1X, 60_000L, frames1Min, 192, 1, 145L, 65)
-        val mid2x = SpeedBudgetGovernor(EnhancementMode.CLARITY_2X, 60_000L, frames1Min, 192, 2, 120L, 65)
+        // 2) Mid-tier NPU (145ms/tile): uses SINGLE_TILE_NEURAL for HD+/2K and KEYFRAME_NEURAL_HYBRID for tight HD (150s)
+        val mid1x = SpeedBudgetGovernor(EnhancementMode.HD, 60_000L, frames1Min, 192, 1, 145L, 65)
+        val mid2x = SpeedBudgetGovernor(EnhancementMode.HD_PLUS, 60_000L, frames1Min, 192, 2, 120L, 65)
         assertEquals(SpeedExecutionTier.KEYFRAME_NEURAL_HYBRID, mid1x.activeTier)
         assertTrue(mid1x.currentKeyframeInterval in 2..6)
         assertEquals(SpeedExecutionTier.SINGLE_TILE_NEURAL, mid2x.activeTier)
 
-        // 3) Slow CPU device (450ms/tile) on 1x/2x: shifts to GPU_SHADER_FAST_PASS immediately so 1m never takes hours
-        val slow1x = SpeedBudgetGovernor(EnhancementMode.CLARITY_1X, 60_000L, frames1Min, 192, 1, 450L, 35)
+        // 3) Slow CPU device (450ms/tile) on HD/HD+: shifts to GPU_SHADER_FAST_PASS immediately so 1m never takes hours
+        val slow1x = SpeedBudgetGovernor(EnhancementMode.HD, 60_000L, frames1Min, 192, 1, 450L, 35)
         assertEquals(SpeedExecutionTier.GPU_SHADER_FAST_PASS, slow1x.activeTier)
         assertTrue(slow1x.decisionForFrame(0, isSceneCut = false, forceLightweight = false).fastGpuMode)
 
-        // 4) Dynamic mid-job thermal throttling simulation on 4x: starts FULL_NEURAL, sees slow frames, steps down cleanly
-        val dynamic4x = SpeedBudgetGovernor(EnhancementMode.CLARITY_4X, 60_000L, frames1Min, 256, 4, 40L, 85)
+        // 4) Dynamic mid-job thermal throttling simulation on 2K: starts FULL_NEURAL, sees slow frames, steps down cleanly
+        val dynamic4x = SpeedBudgetGovernor(EnhancementMode.TWO_K, 60_000L, frames1Min, 256, 4, 40L, 85)
         assertEquals(SpeedExecutionTier.FULL_NEURAL_PER_FRAME, dynamic4x.activeTier)
         for (i in 1..20) {
             dynamic4x.onFrameCompleted(elapsedJobMs = i * 650L, processedFrames = i, totalFrames = frames1Min, lastFrameMs = 650L)
@@ -160,7 +160,7 @@ class ForegroundServiceAndSpeedTest {
 
     @Test
     fun `jvm 1800-frame governor and motion math microbenchmark runs under strict overhead bounds`() {
-        val governor = SpeedBudgetGovernor(EnhancementMode.CLARITY_4X, 60_000L, 1800, 256, 4, 32L, 85)
+        val governor = SpeedBudgetGovernor(EnhancementMode.TWO_K, 60_000L, 1800, 256, 4, 32L, 85)
         val thumbA = ByteArray(48 * 48) { (it and 0xFF).toByte() }
         val thumbB = ByteArray(48 * 48) { ((it + 2) and 0xFF).toByte() }
         val dummyUv = java.nio.ByteBuffer.allocate(320 * 180)
@@ -195,7 +195,7 @@ class ForegroundServiceAndSpeedTest {
             statusDetail = "Frame 45 / 100 • 1920x1080",
             processingSpeedLabel = "8.4 fps"
         )
-        val notification = service.buildProgressNotification(progress, EnhancementMode.CLARITY_3X)
+        val notification = service.buildProgressNotification(progress, EnhancementMode.FHD)
 
         val extras = notification.extras
         assertEquals("ClearKit Video Processing", extras.getCharSequence(NotificationCompat.EXTRA_TITLE)?.toString())
@@ -220,11 +220,30 @@ class ForegroundServiceAndSpeedTest {
         val coordinator = EnhancementSessionCoordinator.getInstance(app)
         coordinator.releaseJobLock()
 
-        coordinator.selectMode(EnhancementMode.CLARITY_4X)
-        assertEquals(EnhancementMode.CLARITY_4X, coordinator.uiState.value.selectedMode)
+        coordinator.selectMode(EnhancementMode.TWO_K)
+        assertEquals(EnhancementMode.TWO_K, coordinator.uiState.value.selectedMode)
 
         assertTrue(coordinator.tryAcquireJobLock())
         assertFalse("Second concurrent lock attempt must fail to prevent duplicate jobs", coordinator.tryAcquireJobLock())
         coordinator.releaseJobLock()
+    }
+
+    @Test
+    fun `persisted legacy mode identifiers migrate cleanly to HD HD_PLUS FHD and TWO_K`() {
+        assertEquals(EnhancementMode.HD, EnhancementSessionCoordinator.resolveMigratedMode("CLARITY_1X"))
+        assertEquals(EnhancementMode.HD_PLUS, EnhancementSessionCoordinator.resolveMigratedMode("CLARITY_2X"))
+        assertEquals(EnhancementMode.FHD, EnhancementSessionCoordinator.resolveMigratedMode("CLARITY_3X"))
+        assertEquals(EnhancementMode.TWO_K, EnhancementSessionCoordinator.resolveMigratedMode("CLARITY_4X"))
+
+        assertEquals(EnhancementMode.FHD, EnhancementSessionCoordinator.resolveMigratedMode("QHD_2K"))
+        assertEquals(EnhancementMode.TWO_K, EnhancementSessionCoordinator.resolveMigratedMode("UHD_4K"))
+
+        assertEquals(EnhancementMode.HD, EnhancementSessionCoordinator.resolveMigratedMode("HD"))
+        assertEquals(EnhancementMode.HD_PLUS, EnhancementSessionCoordinator.resolveMigratedMode("HD_PLUS"))
+        assertEquals(EnhancementMode.FHD, EnhancementSessionCoordinator.resolveMigratedMode("FHD"))
+        assertEquals(EnhancementMode.TWO_K, EnhancementSessionCoordinator.resolveMigratedMode("TWO_K"))
+
+        assertEquals(EnhancementMode.HD_PLUS, EnhancementSessionCoordinator.resolveMigratedMode(null))
+        assertEquals(EnhancementMode.HD_PLUS, EnhancementSessionCoordinator.resolveMigratedMode("UNKNOWN_ID"))
     }
 }

@@ -30,10 +30,10 @@ class ExampleRobolectricTest {
         assertEquals("ClearKit", context.getString(R.string.app_name))
         assertTrue(ContextCompat.getDrawable(context, R.drawable.splash_background) != null)
         assertTrue(ContextCompat.getDrawable(context, R.drawable.ic_launcher_foreground) != null)
-        val logoRes = context.resources.openRawResource(R.drawable.img_clearkit_logo).use {
+        val logoRes = context.resources.openRawResource(R.drawable.video_enhancer_logo).use {
             BitmapFactory.decodeStream(it)
         }
-        assertTrue("ClearKit logo bitmap must decode cleanly", logoRes != null && logoRes.width > 0)
+        assertTrue("Video Enhancer logo bitmap must decode cleanly", logoRes != null && logoRes.width > 0)
 
         val requiredAssets = listOf(
             "ai_models/realesrgan/realesr_general_x4v3.onnx",
@@ -48,11 +48,11 @@ class ExampleRobolectricTest {
             assertTrue("Asset $asset should be non-empty", bytes.isNotEmpty())
         }
 
-        // Verify all four Clarity enhancement presets load with exact colour, AI, and tile config
+        // Verify all four enhancement presets load with exact colour, AI, and tile config
         val profiles = EnhancementProfileRepository(context).loadProfiles()
         assertEquals(4, profiles.size)
 
-        val c1 = profiles.getValue(EnhancementMode.CLARITY_1X)
+        val c1 = profiles.getValue(EnhancementMode.HD)
         assertEquals("HD", c1.displayName)
         assertFalse(c1.preserveOriginalResolution)
         assertEquals(1024, c1.targetLongEdge)
@@ -66,7 +66,7 @@ class ExampleRobolectricTest {
         assertEquals(30f, c1.dncnnStrengthPercent, 0.01f)
         assertEquals(40f, c1.faceEnhancePercent, 0.01f)
 
-        val c2 = profiles.getValue(EnhancementMode.CLARITY_2X)
+        val c2 = profiles.getValue(EnhancementMode.HD_PLUS)
         assertEquals("HD+", c2.displayName)
         assertFalse(c2.preserveOriginalResolution)
         assertEquals(1152, c2.targetLongEdge)
@@ -79,7 +79,7 @@ class ExampleRobolectricTest {
         assertEquals(52f, c2.dncnnStrengthPercent, 0.01f)
         assertEquals(62f, c2.faceEnhancePercent, 0.01f)
 
-        val c3 = profiles.getValue(EnhancementMode.CLARITY_3X)
+        val c3 = profiles.getValue(EnhancementMode.FHD)
         assertEquals("FHD", c3.displayName)
         assertFalse(c3.preserveOriginalResolution)
         assertEquals(1440, c3.targetLongEdge)
@@ -92,7 +92,7 @@ class ExampleRobolectricTest {
         assertEquals(72f, c3.dncnnStrengthPercent, 0.01f)
         assertEquals(78f, c3.faceEnhancePercent, 0.01f)
 
-        val c4 = profiles.getValue(EnhancementMode.CLARITY_4X)
+        val c4 = profiles.getValue(EnhancementMode.TWO_K)
         assertEquals("2K", c4.displayName)
         assertFalse(c4.preserveOriginalResolution)
         assertEquals(1920, c4.targetLongEdge)

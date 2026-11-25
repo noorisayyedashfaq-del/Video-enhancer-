@@ -160,17 +160,17 @@ class DnCnnFullFrameSpeedTest {
     }
 
     @Test
-    fun `benchmark full-frame DnCNN Q4 fusion and async worker overlap across Clarity 1x to 4x`() {
+    fun `benchmark full-frame DnCNN Q4 fusion and async worker overlap across HD to 2K`() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val profiles = EnhancementProfileRepository(context).loadProfiles()
         val exec = Executors.newSingleThreadExecutor { r -> Thread(r, "Bench-DnCNN-Async").apply { isDaemon = true } }
 
         try {
             val modeSpecs = listOf(
-                Triple(EnhancementMode.CLARITY_1X, 1280 to 720, 12L),
-                Triple(EnhancementMode.CLARITY_2X, 1280 to 720, 18L),
-                Triple(EnhancementMode.CLARITY_3X, 1920 to 1080, 26L),
-                Triple(EnhancementMode.CLARITY_4X, 1920 to 1080, 34L)
+                Triple(EnhancementMode.HD, 1280 to 720, 12L),
+                Triple(EnhancementMode.HD_PLUS, 1280 to 720, 18L),
+                Triple(EnhancementMode.FHD, 1920 to 1080, 26L),
+                Triple(EnhancementMode.TWO_K, 1920 to 1080, 34L)
             )
 
             // Warmup JIT for accurate JVM measurements

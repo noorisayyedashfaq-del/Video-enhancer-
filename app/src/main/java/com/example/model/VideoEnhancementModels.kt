@@ -11,29 +11,29 @@ enum class EnhancementMode(
     val shortBadge: String,
     val subtitle: String
 ) {
-    CLARITY_1X(
-        id = "CLARITY_1X",
+    HD(
+        id = "HD",
         label = "HD",
         title = "HD",
         shortBadge = "Natural AI • HD",
         subtitle = "576×1024 • 1024×576"
     ),
-    CLARITY_2X(
-        id = "CLARITY_2X",
+    HD_PLUS(
+        id = "HD_PLUS",
         label = "HD+",
         title = "HD+",
         shortBadge = "HD AI • HD+",
         subtitle = "648×1152 • 1152×648"
     ),
-    CLARITY_3X(
-        id = "CLARITY_3X",
+    FHD(
+        id = "FHD",
         label = "FHD",
         title = "FHD",
         shortBadge = "Ultra AI • FHD",
         subtitle = "810×1440 • 1440×810"
     ),
-    CLARITY_4X(
-        id = "CLARITY_4X",
+    TWO_K(
+        id = "TWO_K",
         label = "2K",
         title = "2K",
         shortBadge = "Max AI • 2K",
@@ -452,7 +452,7 @@ data class MainUiState(
     val deviceCapabilities: DeviceCapabilities? = null,
     val profiles: Map<EnhancementMode, EnhancementProfile> = emptyMap(),
     val selectedVideo: VideoMetadata? = null,
-    val selectedMode: EnhancementMode = EnhancementMode.CLARITY_2X,
+    val selectedMode: EnhancementMode = EnhancementMode.HD_PLUS,
     val computedOutputDimensions: Map<EnhancementMode, OutputDimensions> = emptyMap(),
     val isProcessing: Boolean = false,
     val isBenchmarkingHardware: Boolean = false,

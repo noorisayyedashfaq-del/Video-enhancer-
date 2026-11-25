@@ -93,7 +93,7 @@ class FullOptimizationBenchmarkTest {
     }
 
     @Test
-    fun `sublinear H264 BPP optimization significantly reduces 2x 3x 4x file size while keeping monotonicity and full quality`() {
+    fun `sublinear H264 BPP optimization significantly reduces HD_PLUS FHD TWO_K file size while keeping monotonicity and full quality`() {
         val ctx = ApplicationProvider.getApplicationContext<Context>()
         val profiles = EnhancementProfileRepository(ctx).loadProfiles()
         val caps = testCaps()
@@ -140,7 +140,7 @@ class FullOptimizationBenchmarkTest {
             }
             for (i in 1 until prevBitrates.size) {
                 assertTrue(
-                    "Monotonic bitrate 1x<2x<3x<4x must hold for ${input.displayWidth}x${input.displayHeight}: $prevBitrates",
+                    "Monotonic bitrate HD<HD+<FHD<2K must hold for ${input.displayWidth}x${input.displayHeight}: $prevBitrates",
                     prevBitrates[i] > prevBitrates[i - 1]
                 )
             }
@@ -219,10 +219,10 @@ class FullOptimizationBenchmarkTest {
         assertTrue("Neural working canvas must fit inside maxTilesCap=4", grid.totalTiles in 1..4)
 
         // 1-minute timing targets remain active and properly ordered
-        assertEquals(150_000L, SpeedBudgetGovernor.maxBudgetMsPerMinute(EnhancementMode.CLARITY_1X))
-        assertEquals(300_000L, SpeedBudgetGovernor.maxBudgetMsPerMinute(EnhancementMode.CLARITY_2X))
-        assertEquals(450_000L, SpeedBudgetGovernor.maxBudgetMsPerMinute(EnhancementMode.CLARITY_3X))
-        assertEquals(600_000L, SpeedBudgetGovernor.maxBudgetMsPerMinute(EnhancementMode.CLARITY_4X))
+        assertEquals(150_000L, SpeedBudgetGovernor.maxBudgetMsPerMinute(EnhancementMode.HD))
+        assertEquals(300_000L, SpeedBudgetGovernor.maxBudgetMsPerMinute(EnhancementMode.HD_PLUS))
+        assertEquals(450_000L, SpeedBudgetGovernor.maxBudgetMsPerMinute(EnhancementMode.FHD))
+        assertEquals(600_000L, SpeedBudgetGovernor.maxBudgetMsPerMinute(EnhancementMode.TWO_K))
         assertTrue(SpeedExecutionTier.FULL_NEURAL_PER_FRAME != SpeedExecutionTier.GPU_SHADER_FAST_PASS)
         assertTrue(MotionSmoothMath.shouldInterpolateCadence(24.0, true))
     }

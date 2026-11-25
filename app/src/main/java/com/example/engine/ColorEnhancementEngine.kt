@@ -153,7 +153,7 @@ object ColorMath {
  * Fast native OpenCV color mastering pass used whenever GLES 3.1 compute shader does not handle
  * the frame directly (e.g., neural SR frames without GLES post-pass, or headless/CPU devices).
  * Ensures White Balance, Tone/Brilliance LUT, Selective Vibrance, and Skin-Tone Protection
- * ALWAYS execute on every Clarity 1x-4x mode with zero skipping.
+ * ALWAYS execute on every HD, HD+, FHD, and 2K mode with zero skipping.
  */
 class ColorEnhancementEngine {
 

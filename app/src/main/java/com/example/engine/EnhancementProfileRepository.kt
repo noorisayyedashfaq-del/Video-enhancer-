@@ -31,8 +31,8 @@ class EnhancementProfileRepository(private val context: Context) {
     }
 
     private fun defaultProfiles(): Map<EnhancementMode, EnhancementProfile> = mapOf(
-        EnhancementMode.CLARITY_1X to EnhancementProfile(
-            id = "CLARITY_1X",
+        EnhancementMode.HD to EnhancementProfile(
+            id = "HD",
             displayName = "HD",
             description = "Natural AI: vibrant natural color, neural detail, smooth motion at HD (1024x576 / 576x1024)",
             targetLongEdge = 1024,
@@ -77,8 +77,8 @@ class EnhancementProfileRepository(private val context: Context) {
             preferredCodec = "H264",
             targetBpp = 0.18f
         ),
-        EnhancementMode.CLARITY_2X to EnhancementProfile(
-            id = "CLARITY_2X",
+        EnhancementMode.HD_PLUS to EnhancementProfile(
+            id = "HD_PLUS",
             displayName = "HD+",
             description = "HD+ AI: Real-ESRGAN detail reconstruction, vivid color & flow smoothness at HD+ (1152x648 / 648x1152)",
             targetLongEdge = 1152,
@@ -123,8 +123,8 @@ class EnhancementProfileRepository(private val context: Context) {
             preferredCodec = "H264",
             targetBpp = 0.20f
         ),
-        EnhancementMode.CLARITY_3X to EnhancementProfile(
-            id = "CLARITY_3X",
+        EnhancementMode.FHD to EnhancementProfile(
+            id = "FHD",
             displayName = "FHD",
             description = "FHD AI: neural texture reconstruction, balanced color & smooth motion at FHD (1440x810 / 810x1440)",
             targetLongEdge = 1440,
@@ -169,8 +169,8 @@ class EnhancementProfileRepository(private val context: Context) {
             preferredCodec = "H264",
             targetBpp = 0.22f
         ),
-        EnhancementMode.CLARITY_4X to EnhancementProfile(
-            id = "CLARITY_4X",
+        EnhancementMode.TWO_K to EnhancementProfile(
+            id = "TWO_K",
             displayName = "2K",
             description = "2K AI: super-resolution at 2K (1920x1080 / 1080x1920) with full color, detail & motion enhancement",
             targetLongEdge = 1920,

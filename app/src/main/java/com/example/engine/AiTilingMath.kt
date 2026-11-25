@@ -355,11 +355,11 @@ data class FrameSpeedDecision(
 )
 
 /**
- * Enforces strict per-minute target ceilings across all 4 Clarity modes:
- * - 1x <= 150s (2m 30s)
- * - 2x <= 300s (5m 00s)
- * - 3x <= 450s (7m 30s)
- * - 4x <= 600s (10m 00s)
+ * Enforces strict per-minute target ceilings across all 4 enhancement modes:
+ * - HD <= 150s (2m 30s)
+ * - HD+ <= 300s (5m 00s)
+ * - FHD <= 450s (7m 30s)
+ * - 2K <= 600s (10m 00s)
  * Dynamically tracks real EWMA ms/frame and steps down expensive ops cleanly to stay on budget.
  */
 class SpeedBudgetGovernor(
@@ -441,8 +441,8 @@ class SpeedBudgetGovernor(
             )
         }
 
-        val isHighDetailMode = mode == com.example.model.EnhancementMode.CLARITY_3X ||
-            mode == com.example.model.EnhancementMode.CLARITY_4X
+        val isHighDetailMode = mode == com.example.model.EnhancementMode.FHD ||
+            mode == com.example.model.EnhancementMode.TWO_K
 
         return when (currentTier) {
             SpeedExecutionTier.FULL_NEURAL_PER_FRAME -> {
@@ -450,7 +450,7 @@ class SpeedBudgetGovernor(
                     runNeuralSrNow = true,
                     allowDnCnn = true,
                     allowFaceDetect = isHighDetailMode && targetMsPerFrame >= 140.0,
-                    allowFaceSr = mode == com.example.model.EnhancementMode.CLARITY_4X && targetMsPerFrame >= 200.0,
+                    allowFaceSr = mode == com.example.model.EnhancementMode.TWO_K && targetMsPerFrame >= 200.0,
                     maxTilesForFrame = presetTilesCap.coerceIn(1, 4),
                     tileSizeForFrame = presetTileSize,
                     tier = currentTier,
@@ -529,10 +529,10 @@ class SpeedBudgetGovernor(
 
     companion object {
         fun maxBudgetMsPerMinute(mode: com.example.model.EnhancementMode): Long = when (mode) {
-            com.example.model.EnhancementMode.CLARITY_1X -> 150_000L // 2m 30s
-            com.example.model.EnhancementMode.CLARITY_2X -> 300_000L // 5m 00s
-            com.example.model.EnhancementMode.CLARITY_3X -> 450_000L // 7m 30s
-            com.example.model.EnhancementMode.CLARITY_4X -> 600_000L // 10m 00s
+            com.example.model.EnhancementMode.HD -> 150_000L // 2m 30s
+            com.example.model.EnhancementMode.HD_PLUS -> 300_000L // 5m 00s
+            com.example.model.EnhancementMode.FHD -> 450_000L // 7m 30s
+            com.example.model.EnhancementMode.TWO_K -> 600_000L // 10m 00s
         }
     }
 }
