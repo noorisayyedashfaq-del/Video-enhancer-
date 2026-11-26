@@ -3,8 +3,6 @@ package com.example.engine
 import android.graphics.Bitmap
 import android.media.MediaMetadataRetriever
 import android.os.Build
-import com.arthenica.ffmpegkit.FFmpegKit
-import com.arthenica.ffmpegkit.ReturnCode
 import com.example.model.AdaptiveAdjustmentParams
 import com.example.model.EnhancementProfile
 import com.example.model.VideoMetadata
@@ -50,8 +48,8 @@ class SmartAutoAdjustmentEngine {
 
     /**
      * Fast representative frame sampling directly from [videoFile] before full frame extraction.
-     * Samples up to 5 evenly-spaced keyframes via MediaMetadataRetriever at <= 480px width,
-     * falling back to targeted FFmpeg single-frame seeks if needed, with strict timeout recovery.
+     * Samples up to 3 evenly-spaced keyframes via MediaMetadataRetriever at <= 320px width,
+     * falling back to targeted MediaExtractor + MediaCodec single-frame seeks if needed, with strict timeout recovery.
      */
     suspend fun analyzeVideoRepresentativeFrames(
         videoFile: File,
@@ -126,35 +124,37 @@ class SmartAutoAdjustmentEngine {
                 }
             }
 
-            // Fallback: FFmpeg single-frame targeted seeks (still avoids extracting entire video!)
+            // Fallback: MediaExtractor + MediaCodec targeted keyframe seeks (zero temp disk files)
             if (metricsList.isEmpty()) {
-                val sampleFiles = mutableListOf<File>()
-                val sampleDir = File(tempDir, "analysis_samples").apply { mkdirs() }
-                val durSec = (metadata.durationMs / 1000.0).coerceAtLeast(0.5)
-                val timestamps = listOf(durSec * 0.15, durSec * 0.50, durSec * 0.85)
-                for ((idx, sec) in timestamps.withIndex()) {
-                    val outFile = File(sampleDir, "sample_$idx.jpg")
-                    val cmd = "-y -ss ${String.format(java.util.Locale.US, "%.2f", sec)} -i \"${videoFile.absolutePath}\" -frames:v 1 -vf \"scale='min(480,iw)':-2\" -qscale:v 2 \"${outFile.absolutePath}\""
-                    val session = FFmpegKit.execute(cmd)
-                    if (ReturnCode.isSuccess(session.returnCode) && outFile.exists() && outFile.length() > 0L) {
-                        sampleFiles.add(outFile)
+                val fallbackMats = AndroidMediaToolkit.sampleRepresentativeFramesViaMediaCodec(
+                    videoFile = videoFile,
+                    durationMs = metadata.durationMs,
+                    rotationDegrees = metadata.rotationDegrees,
+                    fractions = listOf(0.15, 0.50, 0.85),
+                    maxAnalyticWidth = 320
+                )
+                try {
+                    for (mat in fallbackMats) {
+                        if (!mat.empty()) {
+                            metricsList.add(analyzeMat(mat))
+                        }
                     }
+                } finally {
+                    fallbackMats.forEach { it.release() }
                 }
-                if (sampleFiles.isNotEmpty()) {
-                    val fallbackAnalysis = analyzeSampleFiles(sampleFiles)
-                    sampleDir.deleteRecursively()
+                if (metricsList.isNotEmpty()) {
+                    val fallbackAnalysis = aggregateMetrics(metricsList)
                     analysisCache[key] = fallbackAnalysis
                     val elapsed = System.currentTimeMillis() - startMs
-                    logger?.info("Representative analysis via FFmpeg seek completed in ${elapsed}ms (${sampleFiles.size} frames)")
+                    logger?.info("Representative analysis via MediaCodec keyframe seek completed in ${elapsed}ms (${metricsList.size} frames)")
                     return@withTimeoutOrNull AnalysisOutcome(
                         analysis = fallbackAnalysis,
                         reusedFromCache = false,
-                        sampledFrames = sampleFiles.size,
+                        sampledFrames = metricsList.size,
                         durationMs = elapsed,
                         warning = warningMsg
                     )
                 }
-                sampleDir.deleteRecursively()
                 warningMsg = (warningMsg?.let { "$it; " } ?: "") + "No sample frames could be decoded; using balanced profile defaults"
                 logger?.warn(warningMsg)
                 val balanced = defaultBalancedAnalysis()

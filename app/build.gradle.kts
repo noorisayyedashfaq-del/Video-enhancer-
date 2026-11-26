@@ -143,7 +143,6 @@ dependencies {
 
   // Offline AI & Video Processing Engines
   implementation(libs.opencv)
-  implementation(libs.ffmpeg.kit.lts)
   implementation(libs.onnxruntime.android)
   implementation(libs.androidx.media3.exoplayer)
   implementation(libs.androidx.media3.ui)

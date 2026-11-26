@@ -95,7 +95,7 @@ class EnhancementSessionCoordinator private constructor(
                         Log.e(TAG, "Pipeline health init failed safely", t)
                         EngineHealthStatus(
                             openCvReady = frameProcessor.isOpenCvReady,
-                            ffmpegReady = false,
+                            mediaCodecReady = false,
                             onnxRuntimeReady = false,
                             realEsrganModelReady = onnxEngine.isRealEsrganReady,
                             dncnnModelReady = onnxEngine.isDncnnReady,

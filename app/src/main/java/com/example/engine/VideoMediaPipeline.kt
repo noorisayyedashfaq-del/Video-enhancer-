@@ -2,13 +2,8 @@ package com.example.engine
 
 import android.content.Context
 import android.graphics.Bitmap
-import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.provider.OpenableColumns
-import com.arthenica.ffmpegkit.FFmpegKit
-import com.arthenica.ffmpegkit.FFmpegSession
-import com.arthenica.ffmpegkit.FFprobeKit
-import com.arthenica.ffmpegkit.ReturnCode
 import com.example.model.DeviceCapabilities
 import com.example.model.EngineHealthStatus
 import com.example.model.EnhancementMode
@@ -26,13 +21,10 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.opencv.core.Mat
-import org.opencv.imgcodecs.Imgcodecs
 import java.io.File
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
-import java.util.concurrent.atomic.AtomicLong
-import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.max
 import kotlin.math.roundToInt
 import kotlin.math.roundToLong
@@ -56,10 +48,6 @@ class VideoMediaPipeline(
 
     fun cancel() {
         cancelled.set(true)
-        try {
-            FFmpegKit.cancel()
-        } catch (_: Throwable) {
-        }
     }
 
     suspend fun initializeAndCheckHealth(
@@ -78,16 +66,16 @@ class VideoMediaPipeline(
                 logger.error("AI Runtime initialization failed", t)
                 diag = "AI Runtime error: ${t.message}"
             }
-            val ffReady = try {
-                com.arthenica.ffmpegkit.FFmpegKitConfig.getVersion() != null
+            val codecReady = try {
+                AndroidMediaToolkit.isMediaCodecSubsystemReady()
             } catch (t: Throwable) {
-                logger.error("FFmpeg initialization failed", t)
-                diag = (diag ?: "") + " FFmpeg error: ${t.message}"
+                logger.error("MediaCodec subsystem check failed", t)
+                diag = (diag ?: "") + " MediaCodec error: ${t.message}"
                 false
             }
             EngineHealthStatus(
                 openCvReady = cvReady,
-                ffmpegReady = ffReady,
+                mediaCodecReady = codecReady,
                 onnxRuntimeReady = ortReady,
                 realEsrganModelReady = onnxEngine.isRealEsrganReady,
                 dncnnModelReady = onnxEngine.isDncnnReady,
@@ -128,14 +116,12 @@ class VideoMediaPipeline(
         outputDir.listFiles()?.forEach { it.delete() }
 
         val inputCopy = File(workDir, "source_input.mp4")
-        val framesDir = File(workDir, "frames").apply { mkdirs() }
         val rawVideoMp4 = File(workDir, "raw_enhanced.mp4")
         val finalMp4 = File(outputDir, "ClearKit_${mode.label}_$sessionId.mp4")
 
         var encoder: HardwareVideoEncoder? = null
         var outputBitmapA: Bitmap? = null
         var outputBitmapB: Bitmap? = null
-        var activeExtractSession: FFmpegSession? = null
         var activeFastDecoder: FastVideoFrameDecoder? = null
 
         runCatching {
@@ -310,7 +296,7 @@ class VideoMediaPipeline(
                 val decodedCountAtomic = AtomicInteger(0)
 
                 coroutineScope {
-                    // Stage 1 Producer: Pooled Zero-Disk NV12/I420 MediaCodec decoder, automatic FFmpeg fallback
+                    // Stage 1 Producer: Pooled Zero-Disk NV12/I420 MediaCodec decoder, automatic Android MediaCodec/MMR fallback
                     val producerJob = launch(Dispatchers.IO) {
                         val decodeStartMs = System.currentTimeMillis()
                         var mediaCodecSucceeded = false
@@ -353,7 +339,7 @@ class VideoMediaPipeline(
                                 return@launch
                             }
                             if (!sentAny) {
-                                logger.warn("MediaCodec zero-copy decoder failed (${t.message}); using FFmpeg fallback")
+                                logger.warn("MediaCodec zero-copy decoder failed (${t.message}); using Android software/MMR fallback")
                             } else {
                                 frameChannel.close(t)
                                 return@launch
@@ -361,19 +347,13 @@ class VideoMediaPipeline(
                         }
 
                         if (!mediaCodecSucceeded && !cancelled.get()) {
-                            logger.decoderBackend = "FFmpegKit Fallback Extractor"
-                            runFfmpegFallbackExtractor(
+                            runAndroidFallbackDecoder(
                                 inputCopy = inputCopy,
-                                framesDir = framesDir,
+                                metadata = metadata,
                                 safeFps = safeFps,
-                                availStorageMb = availStorageMb,
-                                expectedTotalFrames = expectedTotalFrames,
-                                capabilities = capabilities,
                                 logger = logger,
                                 frameChannel = frameChannel,
-                                decodedCountAtomic = decodedCountAtomic,
-                                onSessionCreated = { activeExtractSession = it },
-                                onProgress = onProgress
+                                decodedCountAtomic = decodedCountAtomic
                             )
                         } else {
                             frameChannel.close()
@@ -432,7 +412,7 @@ class VideoMediaPipeline(
                                 delay(if (currentThermalState == ThermalState.CRITICAL) 24L else 12L)
                             }
 
-                            val bgr = item.bgrMat ?: item.diskFile?.let { f -> Imgcodecs.imread(f.absolutePath) } ?: Mat()
+                            val bgr = item.bgrMat ?: Mat()
                             if (bgr.empty()) {
                                 bgr.release()
                                 item.diskFile?.delete()
@@ -815,20 +795,12 @@ class VideoMediaPipeline(
                     diagnostics = diagnostics
                 )
             } catch (interrupted: InterruptedException) {
-                try {
-                    activeExtractSession?.let { FFmpegKit.cancel(it.sessionId) }
-                } catch (_: Exception) {
-                }
                 encoder?.abort()
                 encoder = null
                 finalMp4.delete()
                 throw interrupted
             } catch (t: Throwable) {
                 logger.error("Pipeline failed", t)
-                try {
-                    activeExtractSession?.let { FFmpegKit.cancel(it.sessionId) }
-                } catch (_: Exception) {
-                }
                 encoder?.abort()
                 encoder = null
                 finalMp4.delete()
@@ -844,112 +816,44 @@ class VideoMediaPipeline(
         }
     }
 
-    private suspend fun runFfmpegFallbackExtractor(
+    private fun runAndroidFallbackDecoder(
         inputCopy: File,
-        framesDir: File,
+        metadata: VideoMetadata,
         safeFps: Double,
-        availStorageMb: Long,
-        expectedTotalFrames: Int,
-        capabilities: DeviceCapabilities,
         logger: EngineDiagnosticsLogger,
         frameChannel: Channel<DecodedFrame>,
-        decodedCountAtomic: AtomicInteger,
-        onSessionCreated: (FFmpegSession) -> Unit,
-        onProgress: (ProcessingProgress) -> Unit
+        decodedCountAtomic: AtomicInteger
     ) {
-        val ext = "jpg"
-        val framePattern = File(framesDir, "frame_%06d.$ext").absolutePath
-        val extractCmd = "-y -i \"${inputCopy.absolutePath}\" -vf \"fps=${safeFps}\" -qscale:v 2 -qmin 1 -qmax 3 \"$framePattern\""
-
         val extractionStartMs = System.currentTimeMillis()
-        val extractionDone = AtomicBoolean(false)
-        val extractionFailure = AtomicReference<Throwable?>(null)
-        val lastActivityMs = AtomicLong(System.currentTimeMillis())
-
-        val session = FFmpegKit.executeAsync(
-            extractCmd,
-            { finished ->
-                lastActivityMs.set(System.currentTimeMillis())
-                if (!ReturnCode.isSuccess(finished.returnCode) && !cancelled.get()) {
-                    val errLog = finished.logsAsString?.takeLast(600).orEmpty()
-                    val msg = "FFmpeg frame extraction failed (code ${finished.returnCode}): $errLog"
-                    logger.error(msg)
-                    extractionFailure.compareAndSet(null, IllegalStateException(msg))
-                }
-                logger.extractionMs = System.currentTimeMillis() - extractionStartMs
-                extractionDone.set(true)
-            },
-            { _ -> lastActivityMs.set(System.currentTimeMillis()) },
-            { stats ->
-                lastActivityMs.set(System.currentTimeMillis())
-                if (stats.videoFrameNumber > 0) {
-                    decodedCountAtomic.set(stats.videoFrameNumber)
-                }
-            }
-        )
-        onSessionCreated(session)
-
-        var nextFileNum = 1
-        var stalledEmitted = false
         try {
-            while (!cancelled.get()) {
-                extractionFailure.get()?.let { throw it }
-                val currentFile = File(framesDir, String.format(Locale.US, "frame_%06d.%s", nextFileNum, ext))
-                val nextFile = File(framesDir, String.format(Locale.US, "frame_%06d.%s", nextFileNum + 1, ext))
-
-                val fileReady = currentFile.exists() && currentFile.length() > 0L &&
-                    (nextFile.exists() || extractionDone.get())
-
-                if (fileReady) {
-                    lastActivityMs.set(System.currentTimeMillis())
-                    stalledEmitted = false
-                    val idx = nextFileNum - 1
-                    val estPts = ((idx.toLong() * 1_000_000.0) / safeFps).roundToLong()
-                    frameChannel.send(DecodedFrame(index = idx, diskFile = currentFile, ptsUs = estPts))
-                    nextFileNum++
-                } else if (extractionDone.get()) {
-                    if (currentFile.exists() && currentFile.length() > 0L) {
-                        val idx = nextFileNum - 1
-                        val estPts = ((idx.toLong() * 1_000_000.0) / safeFps).roundToLong()
-                        frameChannel.send(DecodedFrame(index = idx, diskFile = currentFile, ptsUs = estPts))
-                        nextFileNum++
-                    } else {
-                        break
-                    }
-                } else {
-                    val idleMs = System.currentTimeMillis() - lastActivityMs.get()
-                    if (idleMs > 25_000L) {
-                        val stallErr = IllegalStateException("FFmpeg extraction stalled for ${idleMs / 1000}s without new frames.")
-                        logger.error(stallErr.message ?: "FFmpeg stalled", stallErr)
-                        try {
-                            FFmpegKit.cancel(session.sessionId)
-                        } catch (_: Exception) {
+            val (count, backendLabel) = AndroidMediaToolkit.decodeVideoFallbackFrames(
+                videoFile = inputCopy,
+                rotationDegrees = metadata.rotationDegrees,
+                durationMs = metadata.durationMs,
+                safeFps = safeFps,
+                isCancelled = { cancelled.get() },
+                onFrame = { idx, bgrMat, ptsUs ->
+                    decodedCountAtomic.set(idx + 1)
+                    val msg = DecodedFrame(
+                        index = idx,
+                        bgrMat = bgrMat,
+                        ptsUs = ptsUs,
+                        fromDecoderPool = false
+                    )
+                    if (!frameChannel.trySend(msg).isSuccess) {
+                        kotlinx.coroutines.runBlocking {
+                            frameChannel.send(msg)
                         }
-                        throw stallErr
                     }
-                    if (!stalledEmitted && nextFileNum == 1 && idleMs > 600L) {
-                        val extFrames = decodedCountAtomic.get()
-                        onProgress(
-                            ProcessingProgress(
-                                stage = ProcessingStage.EXTRACTING,
-                                processedFrames = extFrames,
-                                totalFrames = expectedTotalFrames,
-                                overallProgress = 0.17f,
-                                statusDetail = "Extracting frame stream ($extFrames / ~$expectedTotalFrames)...",
-                                thermalState = capabilities.thermalState,
-                                activeAcceleration = onnxEngine.providerLabel,
-                                memoryUsageMb = logger.sampleHeapUsedMb()
-                            )
-                        )
-                        stalledEmitted = true
-                    }
-                    delay(15L)
-                }
-            }
-            if (nextFileNum == 1 && !cancelled.get()) {
-                extractionFailure.get()?.let { throw it }
+                },
+                logger = logger
+            )
+            logger.decoderBackend = backendLabel
+            logger.extractionMs = System.currentTimeMillis() - extractionStartMs
+            if (count == 0 && !cancelled.get()) {
                 throw IllegalStateException("No decodable video frames found in source file.")
             }
+            logger.info("$backendLabel decoded $count frames in ${logger.extractionMs}ms")
             frameChannel.close()
         } catch (t: Throwable) {
             frameChannel.close(t)
@@ -963,112 +867,17 @@ class VideoMediaPipeline(
         hasAudio: Boolean,
         logger: EngineDiagnosticsLogger
     ) {
-        if (!hasAudio) {
-            val cmd = "-y -i \"${rawVideoMp4.absolutePath}\" -c:v copy -movflags +faststart \"${finalMp4.absolutePath}\""
-            val session = FFmpegKit.execute(cmd)
-            if (!ReturnCode.isSuccess(session.returnCode) || !finalMp4.exists() || finalMp4.length() == 0L) {
-                logger.warn("FFmpeg faststart copy failed (${session.returnCode}); falling back to direct MP4 copy")
-                rawVideoMp4.copyTo(finalMp4, overwrite = true)
-            }
-            return
-        }
-
-        val copyCmd = "-y -i \"${rawVideoMp4.absolutePath}\" -i \"${originalInput.absolutePath}\" " +
-            "-map 0:v:0 -map 1:a:0 -c:v copy -c:a copy -shortest -movflags +faststart \"${finalMp4.absolutePath}\""
-        val copySession = FFmpegKit.execute(copyCmd)
-        if (ReturnCode.isSuccess(copySession.returnCode) && finalMp4.exists() && finalMp4.length() > 0L) {
-            return
-        }
-
-        if (finalMp4.exists()) finalMp4.delete()
-        val aacCmd = "-y -i \"${rawVideoMp4.absolutePath}\" -i \"${originalInput.absolutePath}\" " +
-            "-map 0:v:0 -map 1:a:0 -c:v copy -c:a aac -b:a 192k -shortest -movflags +faststart \"${finalMp4.absolutePath}\""
-        val aacSession = FFmpegKit.execute(aacCmd)
-        if (!ReturnCode.isSuccess(aacSession.returnCode) || !finalMp4.exists() || finalMp4.length() == 0L) {
-            logger.warn("Audio muxing failed (${aacSession.returnCode}); saving video stream without audio track")
-            rawVideoMp4.copyTo(finalMp4, overwrite = true)
-        }
-    }
-
-    private fun probeLocalFile(uri: Uri, file: File, displayName: String): VideoMetadata {
-        val probeInfo = FFprobeKit.getMediaInformation(file.absolutePath).mediaInformation
-        val retriever = MediaMetadataRetriever()
-        var mmrWidth = 0
-        var mmrHeight = 0
-        var mmrRot = 0
-        var mmrDurMs = 0L
-        try {
-            retriever.setDataSource(file.absolutePath)
-            mmrWidth = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: 0
-            mmrHeight = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: 0
-            mmrRot = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull() ?: 0
-            mmrDurMs = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
-        } catch (_: Exception) {
-        } finally {
-            try {
-                retriever.release()
-            } catch (_: Exception) {
-            }
-        }
-
-        val streams = probeInfo?.streams.orEmpty()
-        val videoStream = streams.firstOrNull { it.type == "video" }
-        val audioStream = streams.firstOrNull { it.type == "audio" }
-
-        val rawW = (videoStream?.width?.toInt() ?: mmrWidth).coerceAtLeast(0)
-        val rawH = (videoStream?.height?.toInt() ?: mmrHeight).coerceAtLeast(0)
-        if (rawW <= 0 || rawH <= 0) {
-            throw IllegalArgumentException("Unsupported or unreadable video file.")
-        }
-
-        val rotation = (mmrRot % 360 + 360) % 360
-        val swapDims = rotation == 90 || rotation == 270
-        val displayW = if (swapDims) rawH else rawW
-        val displayH = if (swapDims) rawW else rawH
-
-        val fps = parseFps(videoStream?.averageFrameRate)
-            ?: parseFps(videoStream?.realFrameRate)
-            ?: 30.0
-        val durationMs = ((probeInfo?.duration?.toDoubleOrNull()?.times(1000.0))?.toLong() ?: mmrDurMs)
-            .coerceAtLeast(100L)
-        val estFrames = ((durationMs / 1000.0) * fps).roundToInt().coerceAtLeast(1)
-
-        val bitrate = probeInfo?.bitrate?.toLongOrNull()
-            ?: videoStream?.bitrate?.toLongOrNull()
-            ?: ((file.length() * 8_000L) / durationMs)
-
-        return VideoMetadata(
-            uri = uri,
-            displayName = displayName,
-            width = rawW,
-            height = rawH,
-            rotationDegrees = rotation,
-            displayWidth = displayW,
-            displayHeight = displayH,
-            fps = fps,
-            durationMs = durationMs,
-            estimatedFrameCount = estFrames,
-            bitrateBps = bitrate,
-            videoCodec = videoStream?.codec ?: "unknown",
-            hasAudio = audioStream != null,
-            audioCodec = audioStream?.codec,
-            audioSampleRate = audioStream?.sampleRate?.toIntOrNull(),
-            audioChannels = null,
-            fileSizeBytes = file.length()
+        AndroidMediaToolkit.muxVideoWithOriginalAudio(
+            rawVideoMp4 = rawVideoMp4,
+            originalInput = originalInput,
+            finalMp4 = finalMp4,
+            hasAudio = hasAudio,
+            logger = logger
         )
     }
 
-    private fun parseFps(rateStr: String?): Double? {
-        if (rateStr.isNullOrBlank()) return null
-        val parts = rateStr.split("/")
-        val fps = if (parts.size == 2) {
-            val num = parts[0].toDoubleOrNull() ?: return null
-            val den = parts[1].toDoubleOrNull() ?: return null
-            if (den <= 0.0) return null else num / den
-        } else {
-            rateStr.toDoubleOrNull() ?: return null
-        }
-        return if (fps in 5.0..120.0) fps else null
+    private fun probeLocalFile(uri: Uri, file: File, displayName: String): VideoMetadata {
+        return AndroidMediaToolkit.probeVideoFile(uri, file, displayName)
     }
 
     private fun copyUriToFile(uri: Uri, dest: File) {

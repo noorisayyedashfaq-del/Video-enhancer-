@@ -1,6 +1,6 @@
 {
   "name": "ClearKit",
-  "description": "Offline AI video enhancer with Real-ESRGAN super-resolution, OpenCV quality analysis, FFmpeg reconstruction, and synchronized before/after comparison.",
+  "description": "Offline AI video enhancer with Real-ESRGAN super-resolution, OpenCV quality analysis, MediaCodec reconstruction, and synchronized before/after comparison.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

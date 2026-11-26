@@ -437,7 +437,7 @@ data class EnhancementResult(
 
 data class EngineHealthStatus(
     val openCvReady: Boolean,
-    val ffmpegReady: Boolean,
+    val mediaCodecReady: Boolean,
     val onnxRuntimeReady: Boolean,
     val realEsrganModelReady: Boolean,
     val dncnnModelReady: Boolean,
